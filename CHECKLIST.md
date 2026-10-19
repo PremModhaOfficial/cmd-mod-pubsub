@@ -228,11 +228,11 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 - [x] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window. (smoke 43: `buildStartupBundle` exposes each component and the rendered text. The roster field is rendered when supplied; the live roster is T9.)
 - [x] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads. (smoke 45: Explore/Plan drop the hierarchy, AGENTS.md and the snapshot; `omitClaudeMd` keeps managed policy only; a path-scoped CLAUDE.md still loads in both cases.)
-- [ ] Resume by agent id; Explore/Plan return no id; `maxTurns` partial; per-invocation model and effort survive resume.
-- [ ] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept.
-- [ ] Auto-compaction and the `compact_boundary` event.
-- [ ] Prompt-cache split for fork and non-fork; `cacheTtl`.
-- Gate: startup-context, resume, compaction, retention, and cache tests pass.
+- [x] Resume by agent id; Explore/Plan return no id; `maxTurns` partial; per-invocation model and effort survive resume. (smoke 81: an agent id on the record/signal/spawn result and no id for Explore; smoke 82: resume by agent id keeps model, effort, `cacheTtl`, window and `maxTurns`; smoke 85-86: a `maxTurn_requests` stop is `partial` and the job resumes its ACP session. e2e step 4 resumes a real job.)
+- [x] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept. (smoke 35: the worker writes `transcripts/<id>.jsonl`, a new session reads it after the fake main transcript is cleared; smoke 83: an expired record, log and transcript go together while a fresh one stays; a non-terminal job is skipped by the transcript sweep as well as the record sweep.)
+- [x] Auto-compaction and the `compact_boundary` event. (smoke 85: the host's `usage_update` crossing the resolved window records and logs `compactBoundary {trigger: 'auto', preTokens}` on the job and the signal, and appends it to the transcript. ACP has no compaction event of its own; the deviation is recorded in the ADR.)
+- [x] Prompt-cache split for fork and non-fork; `cacheTtl`. (smoke 81: a fork records/passes `promptCache: 'shared'`, a non-fork `'own'`; smoke 82: `cacheTtl` survives resume; smoke 35: the adapter logs the cache selection and the TTL as an ACP deviation.)
+- Gate: startup-context, resume, compaction, retention, and cache tests pass. (smoke 81-86 and 35; 86 checks green.)
 
 ## Phase 15: Live messaging, teams, forks, permissions
 

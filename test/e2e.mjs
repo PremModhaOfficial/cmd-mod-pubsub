@@ -169,7 +169,12 @@ try {
 	assert.equal(agentSignal.kind, 'agent');
 	assert.equal(agentSignal.state, 'done');
 	assert.equal(agentSignal.owner, agentRecord.owner);
-	ok(`ACP job completed: jobs/${agentId}.json, logs/${agentId}.log, inbox/ signal`);
+	assert.equal(agentRecord.agentId, agentId, 'the real job carries its agent id');
+	assert.equal(agentSignal.agentId, agentId, 'the real signal carries the agent id');
+	const agentTranscript = join(dir, 'transcripts', `${agentId}.jsonl`);
+	assert.ok(existsSync(agentTranscript), `the transcript exists at ${agentTranscript}`);
+	assert.match(readFileSync(agentTranscript, 'utf8'), /pong/i, 'the transcript holds the real answer');
+	ok(`ACP job completed: jobs/${agentId}.json, logs/${agentId}.log, transcripts/${agentId}.jsonl, inbox/ signal`);
 
 	// 2b. a real live message ------------------------------------------------
 	// The agent is running, idle, or already finished by now; each path is a legal
@@ -252,6 +257,8 @@ try {
 	const resumedLog = readFileSync(join(dir, 'logs', `${resumedId}.log`), 'utf8');
 	assert.equal(resumedRecord.state, 'done', `resumed state ${resumedRecord.state}: ${resumedLog.slice(-800)}`);
 	assert.equal(resumedRecord.resumedFrom, agentId, 'the resume records what it continued');
+	assert.equal(resumedRecord.agentId, resumedId, 'the resumed job has its own agent id');
+	assert.ok(existsSync(join(dir, 'transcripts', `${resumedId}.jsonl`)), 'the resumed job persists its transcript');
 	assert.match(resumedLog, /ping/i, 'the resumed session answered the new instruction');
 	ok(`resumed job completed: jobs/${resumedId}.json, logs/${resumedId}.log`);
 

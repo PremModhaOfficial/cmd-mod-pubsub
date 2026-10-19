@@ -94,7 +94,11 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 
 ## Deviations
 
-- `cacheTtl` and `autoCompactWindow` are not ACP config options. Use host defaults. Record the lost per-subagent control in the parity ledger.
+- `cacheTtl` and `autoCompactWindow` are not ACP config options. Use host defaults. Record the lost per-subagent control in the parity ledger. The mod still resolves both and logs them on the job; a resume carries the recorded values forward.
+- ACP exposes no prompt-cache split. The mod records `promptCache: shared` for a fork (the host fork copies the main cache) and `own` for every other agent, carries it on the spec, and logs it. The actual cache is the host default; the deviation is visible in the log and the record.
+- ACP exposes no `maxTurns` option. The ACP argv carries `--max-turns <n>` (the host accepts the flag; whether it applies it to ACP is a host detail), and the lifecycle reads the `stopReason`: `max_turn_requests` or `max_tokens` marks the result `partial` and keeps the job resumable. The cap is never inferred from tool-call counts.
+- ACP has no compaction event. The adapter treats the host's `usage_update` crossing the resolved `autoCompactWindow` as the boundary: it records `compactBoundary {trigger: 'auto', preTokens}`, appends it to the transcript, and carries it on the signal. No synthetic compaction is performed; the host still owns the summarization.
+- ACP provides no transcript file. The worker appends the `session/update` stream (plus the result and any compact boundary) to `transcripts/<id>.jsonl` in the spool, so the transcript survives a restart and is independent of the main session's transcript. Retention sweeps it with the record and log.
 - `--agents` and `--append-subagent-system-prompt` are not host flags. Use `--mod` and the mod hooks.
   T12 spells them `agents`, `agent`, `append_subagent_system_prompt`, and
   `append_subagent_system_prompt_file`. The environment aliases (`BETTER_SUBAGENTS_AGENT`,
@@ -116,6 +120,7 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 - Adapter queue: design requirement. ACP rejects a concurrent prompt, verified 2026-10-20. T1 tests the queue.
 - `appendSystemPrompt` and `beforeToolCall` inside the ACP server: T1 tests these.
 - `session/load` after an adapter restart: T1 tests this.
+- `session/resume` for a finished or partial agent job: smoke check 35 and 86. `usage_update` boundaries and transcript persistence: smoke 35 and 85. Retention of all three artifacts: smoke 83.
 
 ## Consequences
 
@@ -124,4 +129,4 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 - T4 uses the prompt result for foreground and the detached adapter for background.
 - T5 uses `session/set_mode` and `session/request_permission`.
 - T10 implements the CLI fork, the one-shot `cmd --resume -p` follow-up, and the fork task view. ACP `session/load` is a host risk.
-- T13 uses `session/load` and `session/resume` for resume.
+- T13 uses `session/resume` for resume. ACP `session/load` remains a host risk, not the resume path.
