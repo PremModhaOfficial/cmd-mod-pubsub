@@ -112,6 +112,9 @@ export function makeRuntime(overrides = {}) {
 		alive() {
 			return false;
 		},
+		run() {
+			return {ok: false, stdout: ''};
+		},
 		async sleep() {},
 		...overrides,
 	};
