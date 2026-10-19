@@ -536,9 +536,18 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
         logWrite('[acp] permissionMode ' + spec.permissionMode + ' is not applied in this phase\\n');
       }
     }
+    // The tool set is resolved in the parent: the worker only makes it visible and
+    // never widens it.
+    if (Array.isArray(spec.tools)) {
+      logWrite('[acp] tools ' + spec.tools.length + (spec.tools.length > 0 ? ': ' + spec.tools.join(', ') : '') + '\\n');
+    }
     // Family aliases resolve to the newest model the session offers, matching the
-    // host's catalog order. A full id passes through unchanged.
-    const modelOptions = (configOptions.find(option => option && option.id === 'model')?.options) || [];
+    // host's catalog order. A full id passes through unchanged. When the catalog is
+    // known and blocks the value, the inherited (main) model is used and the
+    // substitution is logged: resolution never silently picks another model.
+    const modelOption = configOptions.find(option => option && option.id === 'model');
+    const modelOptions = (modelOption && modelOption.options) || [];
+    const inheritedModel = modelOption && typeof modelOption.currentValue === 'string' ? modelOption.currentValue : undefined;
     const modelAliases = {sonnet: /sonnet/i, opus: /opus/i, haiku: /haiku/i, fable: /fable/i};
     let modelValue = spec.model;
     if (typeof modelValue === 'string' && modelAliases[modelValue.toLowerCase()]) {
@@ -546,7 +555,13 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       if (match && typeof match.value === 'string') {
         logWrite('[acp] model alias ' + modelValue + ' -> ' + match.value + '\\n');
         modelValue = match.value;
+      } else if (modelOptions.length > 0) {
+        logWrite('[acp] model alias ' + modelValue + ' is not in the allowed catalog; inheriting ' + String(inheritedModel || 'the session default') + '\\n');
+        modelValue = inheritedModel;
       }
+    } else if (typeof modelValue === 'string' && modelOptions.length > 0 && !modelOptions.some(option => option && String(option.value) === modelValue)) {
+      logWrite('[acp] model ' + modelValue + ' is not in the allowed catalog; inheriting ' + String(inheritedModel || 'the session default') + '\\n');
+      modelValue = inheritedModel;
     }
     for (const option of ['model', 'effort']) {
       const value = option === 'model' ? modelValue : spec[option];
@@ -1987,6 +2002,9 @@ export interface WorkerSpecInput {
 	systemPrompt?: string;
 	model?: string;
 	effort?: string;
+	/** The resolved tool capabilities; the worker logs them and never widens them. */
+	tools?: string[];
+	disallowedTools?: string[];
 	permissionMode?: string;
 	maxTurns?: number;
 	timeoutMs?: number;
@@ -2322,6 +2340,381 @@ export function guardToolCall(
 	if (escape === undefined) return undefined;
 	return {block: true, reason: `Blocked: ${escape}. This subagent is isolated in ${roots.worktree}.`};
 }
+// Tool access, model, and effort resolution
+//
+// Resolution happens once, in the parent, before a worker is spawned: the worker
+// spec carries the result, so two jobs built from the same definition cannot
+// disagree. The functions are pure and exported, because each branch below is a
+// documented Claude Code rule and is tested directly.
+//
+// `available` is the tool pool a subagent inherits. The host does not expose its
+// tool list through the mod API, so the built-in part is the documented set; MCP
+// servers are read from the same config files the host reads.
+// ---------------------------------------------------------------------------
+
+export const SUBAGENT_TOOL_UNIVERSE: string[] = [
+	'Agent',
+	'Artifact',
+	'AskUserQuestion',
+	'Bash',
+	'Edit',
+	'EndConversation',
+	'EnterPlanMode',
+	'EnterWorktree',
+	'ExitPlanMode',
+	'ExitWorktree',
+	'Glob',
+	'Grep',
+	'LSP',
+	'ListAgents',
+	'Monitor',
+	'NotebookEdit',
+	'PowerShell',
+	'Read',
+	'ScheduleWakeup',
+	'SendMessage',
+	'Skill',
+	'SubagentHandback',
+	'TaskStop',
+	'TodoWrite',
+	'ToolSearch',
+	'WaitForMcpServers',
+	'WebFetch',
+	'WebSearch',
+	'Workflow',
+	'Write',
+];
+
+// Filter one: removed from every subagent, even when the definition lists them.
+// `ExitPlanMode` is handled separately because plan mode keeps it; `Agent` stays
+// listed and reports the depth error itself.
+export const UNIVERSAL_TOOL_REMOVALS: string[] = [
+	'AskUserQuestion',
+	'EndConversation',
+	'EnterPlanMode',
+	'ScheduleWakeup',
+	'WaitForMcpServers',
+	'Workflow',
+];
+
+// Filter two: the built-in tools a background subagent keeps. Every MCP tool is
+// kept regardless; `ListAgents` is deliberately absent, so it is foreground-only.
+// Teammates on a team additionally keep the task and cron tools (phase 15).
+export const BACKGROUND_BUILTIN_TOOLS: string[] = [
+	'Read',
+	'Grep',
+	'Glob',
+	'LSP',
+	'Bash',
+	'PowerShell',
+	'Edit',
+	'Write',
+	'NotebookEdit',
+	'WebFetch',
+	'WebSearch',
+	'TodoWrite',
+	'Skill',
+	'ToolSearch',
+	'EnterWorktree',
+	'ExitWorktree',
+	'Monitor',
+	'TaskStop',
+	'SendMessage',
+	'Artifact',
+	'SubagentHandback',
+];
+
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+const MCP_PREFIX = 'mcp__';
+
+function unique(values: string[]): string[] {
+	const out: string[] = [];
+	for (const value of values) if (!out.includes(value)) out.push(value);
+	return out;
+}
+
+const isMcpTool = (name: string): boolean => name.startsWith(MCP_PREFIX);
+
+// `Bash(git push *)` names a tool plus a constraint; the whole tool is removed.
+// `mcp__server__*` stays whole because the wildcard is a server, not a tool name.
+export function toolNameOfSpecifier(specifier: string): string {
+	const text = String(specifier ?? '').trim();
+	const open = text.indexOf('(');
+	return (open >= 0 ? text.slice(0, open) : text).trim();
+}
+
+function mcpCapability(server: string): string {
+	return `${MCP_PREFIX}${server}__*`;
+}
+
+function mcpParts(name: string): {server: string; tool?: string} {
+	const rest = name.startsWith(MCP_PREFIX) ? name.slice(MCP_PREFIX.length) : name;
+	const separator = rest.indexOf('__');
+	if (separator < 0) return {server: rest};
+	return {server: rest.slice(0, separator), tool: rest.slice(separator + 2)};
+}
+
+// One specifier -> the concrete capabilities it selects out of the inherited pool.
+// An empty result means the specifier resolved to nothing.
+function expandSpecifier(specifier: string, available: string[], mcpServers: string[]): string[] {
+	const name = toolNameOfSpecifier(specifier);
+	if (name.length === 0) return [];
+	const capabilities = mcpServers.map(mcpCapability);
+	if (name === '*') return [...available, ...capabilities];
+	if (name === `${MCP_PREFIX}*`) return capabilities;
+	if (isMcpTool(name)) {
+		const {server, tool} = mcpParts(name);
+		if (!mcpServers.includes(server)) return [];
+		if (tool === undefined || tool === '*') return [mcpCapability(server)];
+		return [`${MCP_PREFIX}${server}__${tool}`];
+	}
+	return available.includes(name) ? [name] : [];
+}
+
+function withheldBy(specifier: string, capability: string): boolean {
+	const name = toolNameOfSpecifier(specifier);
+	if (name.length === 0) return false;
+	if (name === '*') return true;
+	if (name === `${MCP_PREFIX}*`) return isMcpTool(capability);
+	if (isMcpTool(name)) {
+		if (!isMcpTool(capability)) return false;
+		const wanted = mcpParts(name);
+		const actual = mcpParts(capability);
+		if (wanted.server !== actual.server) return false;
+		if (wanted.tool === undefined || wanted.tool === '*') return true;
+		return actual.tool === wanted.tool;
+	}
+	return capability === name;
+}
+
+export interface ToolFilterInput {
+	/** The inherited tool pool. Defaults to the documented built-in universe. */
+	available?: string[];
+	/** Configured MCP server names; each contributes `mcp__<server>__*`. */
+	mcpServers?: string[];
+	/** A `tools` list. Omitted means inherit. */
+	tools?: string[];
+	/** A `disallowedTools` list. It wins over `tools`. */
+	disallowedTools?: string[];
+	/** `plan` keeps `ExitPlanMode`; every other mode removes it. */
+	permissionMode?: string;
+	/** A background agent keeps every MCP tool and only the allowlisted built-ins. */
+	background?: boolean;
+}
+
+export type ToolFilterResult =
+	| {ok: true; tools: string[]; removed: string[]}
+	| {ok: false; error: string};
+
+export function filterTools(input: ToolFilterInput = {}): ToolFilterResult {
+	const available = unique(input.available ?? SUBAGENT_TOOL_UNIVERSE);
+	const mcpServers = unique(input.mcpServers ?? []);
+	const requested = input.tools === undefined || input.tools.length === 0 ? undefined : input.tools;
+
+	let selected: string[];
+	if (requested === undefined) {
+		// Inherit every tool available to subagents, including every MCP server.
+		selected = [...available, ...mcpServers.map(mcpCapability)];
+	} else {
+		selected = [];
+		for (const specifier of requested) selected.push(...expandSpecifier(specifier, available, mcpServers));
+		selected = unique(selected);
+	}
+
+	for (const specifier of input.disallowedTools ?? []) {
+		selected = selected.filter(capability => !withheldBy(specifier, capability));
+	}
+
+	const removed: string[] = [];
+	const kept = selected.filter(capability => {
+		if (isMcpTool(capability)) return true;
+		if (UNIVERSAL_TOOL_REMOVALS.includes(capability)) {
+			removed.push(capability);
+			return false;
+		}
+		if (capability === 'ExitPlanMode' && input.permissionMode !== 'plan') {
+			removed.push(capability);
+			return false;
+		}
+		if (input.background === true && !BACKGROUND_BUILTIN_TOOLS.includes(capability)) {
+			removed.push(capability);
+			return false;
+		}
+		return true;
+	});
+
+	if (requested !== undefined && kept.length === 0) {
+		// Name the entries, not the derived names: the author must be able to find the
+		// line in the definition.
+		return {ok: false, error: `tools list resolved to no available tool: ${requested.join(', ')}`};
+	}
+	return {ok: true, tools: kept, removed};
+}
+
+function nonEmpty(value: unknown): string | undefined {
+	return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export type ModelSource = 'parameter' | 'definition' | 'environment' | 'main' | 'inherit' | 'forced';
+
+export interface ModelResolutionInput {
+	/** The per-invocation `model` parameter. */
+	requested?: string;
+	/** The definition's `model` frontmatter. */
+	definition?: string;
+	env?: Record<string, string | undefined>;
+	/** The main conversation's model; absent means the child inherits its default. */
+	main?: string;
+}
+
+export interface ModelResolution {
+	model: string | undefined;
+	source: ModelSource;
+}
+
+// Parameter, frontmatter, environment, main. `inherit` (either place) selects the
+// main model outright, so it outranks the environment default. FORCE makes the
+// environment value win over the parameter and the frontmatter.
+export function resolveModel(input: ModelResolutionInput = {}): ModelResolution {
+	const env = input.env ?? {};
+	const envModel =
+		nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
+	const forced =
+		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === '1' ||
+		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === 'true' ||
+		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === '1' ||
+		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === 'true';
+	const main = nonEmpty(input.main);
+	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
+
+	const requested = nonEmpty(input.requested);
+	if (requested === 'inherit') return {model: main, source: 'inherit'};
+	if (requested !== undefined) return {model: requested, source: 'parameter'};
+
+	const definition = nonEmpty(input.definition);
+	if (definition === 'inherit') return {model: main, source: 'inherit'};
+	if (definition !== undefined) return {model: definition, source: 'definition'};
+
+	if (envModel !== undefined) return {model: envModel, source: 'environment'};
+	return {model: main, source: 'main'};
+}
+
+export type EffortSource = 'parameter' | 'definition' | 'environment' | 'none';
+
+export interface EffortResolutionInput {
+	/** The per-invocation `effort` parameter. */
+	requested?: string;
+	/** The definition's `effort` frontmatter. */
+	definition?: string;
+	env?: Record<string, string | undefined>;
+}
+
+export interface EffortResolution {
+	effort: string | undefined;
+	source: EffortSource;
+}
+
+function effortLevel(value: unknown): string | undefined {
+	const level = nonEmpty(value)?.toLowerCase();
+	return level !== undefined && (EFFORT_LEVELS as readonly string[]).includes(level) ? level : undefined;
+}
+
+// Per-invocation, frontmatter, environment. There is no effort inheritance from the
+// main conversation: the runtime default applies when nothing is set.
+export function resolveEffort(input: EffortResolutionInput = {}): EffortResolution {
+	const env = input.env ?? {};
+	const requested = effortLevel(input.requested);
+	if (requested !== undefined) return {effort: requested, source: 'parameter'};
+	const definition = effortLevel(input.definition);
+	if (definition !== undefined) return {effort: definition, source: 'definition'};
+	const fromEnv =
+		effortLevel(env.BETTER_SUBAGENTS_EFFORT_LEVEL) ?? effortLevel(env.CLAUDE_CODE_EFFORT_LEVEL);
+	if (fromEnv !== undefined) return {effort: fromEnv, source: 'environment'};
+	return {effort: undefined, source: 'none'};
+}
+
+export interface LaunchResolutionInput {
+	requestedModel?: string;
+	definitionModel?: string;
+	requestedEffort?: string;
+	definitionEffort?: string;
+	env?: Record<string, string | undefined>;
+	mainModel?: string;
+	tools?: string[];
+	disallowedTools?: string[];
+	permissionMode?: string;
+	background?: boolean;
+	availableTools?: string[];
+	mcpServers?: string[];
+}
+
+export type LaunchResolution =
+	| {
+			ok: true;
+			model: string | undefined;
+			modelSource: ModelSource;
+			effort: string | undefined;
+			effortSource: EffortSource;
+			tools: string[];
+			removed: string[];
+	  }
+	| {ok: false; error: string};
+
+// The one spawn-time resolution: tools, model, and effort from the same inputs, so
+// the spec and the record cannot disagree about what was resolved.
+export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResolution {
+	const tools = filterTools({
+		...(input.availableTools !== undefined ? {available: input.availableTools} : {}),
+		...(input.mcpServers !== undefined ? {mcpServers: input.mcpServers} : {}),
+		...(input.tools !== undefined ? {tools: input.tools} : {}),
+		...(input.disallowedTools !== undefined ? {disallowedTools: input.disallowedTools} : {}),
+		...(input.permissionMode !== undefined ? {permissionMode: input.permissionMode} : {}),
+		...(input.background !== undefined ? {background: input.background} : {}),
+	});
+	if (!tools.ok) return tools;
+	const model = resolveModel({
+		...(input.requestedModel !== undefined ? {requested: input.requestedModel} : {}),
+		...(input.definitionModel !== undefined ? {definition: input.definitionModel} : {}),
+		...(input.env !== undefined ? {env: input.env} : {}),
+		...(input.mainModel !== undefined ? {main: input.mainModel} : {}),
+	});
+	const effort = resolveEffort({
+		...(input.requestedEffort !== undefined ? {requested: input.requestedEffort} : {}),
+		...(input.definitionEffort !== undefined ? {definition: input.definitionEffort} : {}),
+		...(input.env !== undefined ? {env: input.env} : {}),
+	});
+	return {
+		ok: true,
+		model: model.model,
+		modelSource: model.source,
+		effort: effort.effort,
+		effortSource: effort.source,
+		tools: tools.tools,
+		removed: tools.removed,
+	};
+}
+
+// MCP server names come from the host's config files. Discovery is best-effort: a
+// missing or malformed file means "no MCP tools known", never a session error.
+export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
+	const names: string[] = [];
+	for (const dir of dirs.slice(0, 4)) {
+		if (typeof dir !== 'string' || dir.length === 0) continue;
+		try {
+			const parsed = JSON.parse(fs.readFile(join(dir, '.commandcode', 'mcp.json'))) as {
+				mcpServers?: Record<string, {enabled?: boolean} | undefined>;
+			};
+			for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
+				if (name.length === 0 || config?.enabled === false) continue;
+				if (!names.includes(name)) names.push(name);
+			}
+		} catch {
+			/* no MCP config here */
+		}
+	}
+	return names;
+}
 
 // The identity a job record and its signal share. Declared once, so the two
 // shapes cannot drift: the record adds durable bookkeeping, the signal adds the
@@ -2357,6 +2750,8 @@ interface JobRecord extends JobIdentity {
 	parentJobId?: string;
 	agentType?: string;
 	model?: string;
+	tools?: string[];
+	color?: string;
 	maxTurns?: number;
 	timeoutMs?: number;
 	sessionName?: string;
@@ -3552,6 +3947,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						: '';
 			const duration = elapsed.length > 0 ? ` ${elapsed}` : '';
 			const model = typeof job.model === 'string' && job.model.length > 0 ? ` · ${job.model}` : '';
+			const effort = typeof job.effort === 'string' && job.effort.length > 0 ? ` · effort=${job.effort}` : '';
+			const color = typeof job.color === 'string' && job.color.length > 0 ? ` · color=${job.color}` : '';
 			const owner = typeof job.owner === 'string' && job.owner.length > 0 ? ` · ${job.owner.slice(-6)}` : '';
 			const unread = isTerminalState(state) && job.deliveredAt === undefined ? ' · unread' : '';
 			// The type is the resolved definition name (canonical `subagent_type`); the
@@ -3562,7 +3959,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					: job.kind === 'agent'
 						? ' · subagent_type=general-purpose'
 						: '';
-			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${agentType}${model}${owner}${unread}`;
+			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${agentType}${model}${effort}${color}${owner}${unread}`;
 		});
 		const orphanNote = orphaned > 0 ? ` ${orphaned} orphaned signal(s) quarantined.` : '';
 		const filterNote = wanted === undefined ? '' : ` matching ${wanted}`;
@@ -3649,6 +4046,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly model?: string;
 		readonly maxTurns?: number;
 		readonly effort?: string;
+		/** The resolved tool capabilities for an agent job. */
+		readonly tools?: string[];
+		readonly disallowedTools?: string[];
+		readonly color?: string;
 		readonly permissionMode?: string;
 		readonly isolation?: string;
 		/** SIGTERM then SIGKILL after this long; 0 or absent means no timeout */
@@ -3711,6 +4112,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					}
 				: {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
+			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+			...(intent.color !== undefined ? {color: intent.color} : {}),
 			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 			...(intent.effort !== undefined ? {effort: intent.effort} : {}),
 			...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
@@ -3853,6 +4256,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
+				...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+				...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
 				...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 				...(intent.effort !== undefined ? {effort: intent.effort} : {}),
 				...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
@@ -3890,10 +4295,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				for (const job of jobCache.slice(0, PANE_ROWS_MAX)) {
 					const state = canonicalState(job.state);
 					const duration = typeof job.durationMs === 'number' ? ` ${(job.durationMs / 1000).toFixed(1)}s` : '';
+					const color = typeof job.color === 'string' && job.color.length > 0 ? job.color : '';
 					nodes.push({
 						type: 'text',
-						text: `${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}`,
-						color: stateColor(state),
+						text: `${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}${color.length > 0 ? `  ${color}` : ''}`,
+						// The definition color is the agent's identity; the state color is the
+						// fallback, so an uncoloured job still reports its lifecycle.
+						color: color.length > 0 ? color : stateColor(state),
 					});
 				}
 				nodes.push({
@@ -3980,7 +4388,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				'foreground runs are not implemented in this release; omit run_in_background (background is the default)',
 			);
 		}
-		for (const unsupported of ['permission_mode', 'isolation', 'tools']) {
+		for (const unsupported of ['permission_mode', 'isolation']) {
 			if (input[unsupported] === undefined) continue;
 			return badInput(
 				unsupported === 'isolation'
@@ -4011,7 +4419,29 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (!resolved.ok) return badInput(resolved.error);
 			definition = resolved.definition;
 		}
-		const definitionModel = definition?.model === 'inherit' ? undefined : definition?.model;
+		const requestedTools =
+			prompt === undefined ? undefined : (listField(input.tools) ?? definition?.tools);
+		const requestedDisallowed =
+			prompt === undefined ? undefined : (listField(input.disallowed_tools) ?? definition?.disallowedTools);
+		const launch = resolveLaunch({
+			...(model !== undefined ? {requestedModel: model} : {}),
+			...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
+			...(typeof input.effort === 'string' ? {requestedEffort: input.effort} : {}),
+			...(definition?.effort !== undefined ? {definitionEffort: definition.effort} : {}),
+			env: runtime.env,
+			// The mod API exposes no main-model getter: an absent model means the ACP
+			// child inherits the user's configured model, which is the main one.
+			...(requestedTools !== undefined ? {tools: requestedTools} : {}),
+			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
+			...(definition?.permissionMode !== undefined ? {permissionMode: definition.permissionMode} : {}),
+			// The execution mode decides this once foreground runs land; until then every
+			// job is background.
+			background: input.run_in_background !== false,
+			mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
+		});
+		if (!launch.ok) return badInput(launch.error);
+		// Memory definitions auto-enable Read, Write, and Edit.
+		const launchTools = withMemoryTools(launch.tools, definition?.memory);
 		const maxTurns =
 			prompt === undefined
 				? undefined
@@ -4019,7 +4449,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					? Math.round(requestedMaxTurns)
 					: definition?.maxTurns;
 		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
-		const resolvedModel = prompt === undefined ? undefined : model ?? definitionModel;
 		const launched = fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
@@ -4028,10 +4457,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			cwd: runCwd,
 			agentType: definition?.name,
 			systemPrompt: definition?.systemPrompt,
-			startup: startupFor(definition, runCwd, prompt, resolvedModel),
-			model: resolvedModel,
+			startup: startupFor(definition, runCwd, prompt, launch.model),
+			model: prompt === undefined ? undefined : launch.model,
+			tools: prompt === undefined ? undefined : launchTools,
+			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
+			...(definition?.color !== undefined ? {color: definition.color} : {}),
 			maxTurns,
-			effort: definition?.effort,
+			effort: prompt === undefined ? undefined : launch.effort,
 			permissionMode: definition?.permissionMode,
 			isolation: definition?.isolation,
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
@@ -4167,6 +4599,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			systemPrompt: resumeDefinition?.systemPrompt,
 			startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
+			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
 			effort: record.effort,
 			permissionMode: record.permissionMode,
@@ -4221,6 +4655,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						"Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins.",
 				},
 				model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
+				effort: {type: 'string', description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort."},
+				tools: {type: 'string', description: 'Comma-separated tool list (or an array). Only these tools remain; overrides the definition.'},
+				disallowed_tools: {type: 'string', description: 'Comma-separated tool list (or an array) to remove. Wins over tools.'},
 				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
 				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
 				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
@@ -4346,7 +4783,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						? 'valid'
 						: `invalid: ${entry.reason ?? 'unknown'}`;
 			const location = entry.path.length > 0 ? `  ${entry.path}` : '';
-			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${location}`;
+			// What the definition resolves to. Tools are shown as authored so a missing
+			// tool is visible before a spawn fails on it.
+			const settings = [
+				entry.definition?.model !== undefined ? `model=${entry.definition.model}` : '',
+				entry.definition?.effort !== undefined ? `effort=${entry.definition.effort}` : '',
+				entry.definition?.color !== undefined ? `color=${entry.definition.color}` : '',
+				entry.definition?.tools !== undefined ? `tools=${entry.definition.tools.join('+')}` : '',
+			].filter(Boolean).join(' ');
+			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${settings.length > 0 ? ` · ${settings}` : ''}${location}`;
 		});
 		return (
 			`${valid} valid definition(s)${summary.length > 0 ? ` (${summary})` : ''}, ` +
