@@ -93,6 +93,11 @@ const WAIT_MAX_MS = 60 * 1000;
 const WAIT_POLL_MS = 200;
 const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
+// Live messaging. A running agent polls its control/send.jsonl; an agent with no
+// message waits this long for a turn before it exits and a send resumes it.
+const LIVE_POLL_MS = 100;
+const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
+const ROSTER_MAIN = 'main';
 
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
 // body is the worker's system prompt. Project discovery walks up from the working
@@ -1095,6 +1100,50 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 // passed in the environment: no shell interpolation.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Live messaging: the roster
+//
+// A named spawn is addressable. Every agent that has the send tool starts with a
+// snapshot of its siblings, so it can message them without a discovery call. The
+// snapshot lists main and the OTHER named agents only: an unnamed job has no
+// address, and an agent is never its own peer. The newest record for a name wins,
+// so a resumed agent replaces the job it continued.
+// ---------------------------------------------------------------------------
+
+export interface RosterEntry {
+	name?: string;
+	state?: string;
+	jobId?: string;
+}
+
+export function buildRoster(entries: readonly RosterEntry[], selfName?: string): string {
+	const named = new Map<string, RosterEntry>();
+	for (const entry of entries) {
+		const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+		if (name.length === 0 || name === selfName) continue;
+		if (!named.has(name)) named.set(name, entry);
+	}
+	if (named.size === 0) return '';
+	const lines = [
+		'SIBLING ROSTER (snapshot taken at start; address a peer with subagent_send({to, message}))',
+		`${ROSTER_MAIN} — the conversation that started you`,
+	];
+	for (const [name, entry] of named) {
+		const state = typeof entry.state === 'string' && entry.state.length > 0 ? ` (${entry.state})` : '';
+		const job = typeof entry.jobId === 'string' && entry.jobId.length > 0 ? ` job ${entry.jobId}` : '';
+		lines.push(`${name}${state}${job}`);
+	}
+	return lines.join('\n');
+}
+
+// ListAgents is a foreground tool: a foreground agent inherits it when cross-session
+// messaging is on; a background agent does not keep it. One pure predicate, so the
+// tool registration and the tests cannot disagree about visibility.
+export function listAgentsVisible(options: {background?: boolean; crossSessionMessaging?: boolean}): boolean {
+	if (options.crossSessionMessaging === false) return false;
+	return options.background !== true;
+}
+
 export interface WorkerSpecInput {
 	id: string;
 	label: string;
@@ -1120,6 +1169,22 @@ export interface WorkerSpecInput {
 	command?: string;
 	/** Written by the mod when the ACP child loaded it; proves the prompt hook is live. */
 	promptMarkerPath?: string;
+	/** Addressable name (`subagent_spawn.name`); absent for an anonymous agent. */
+	name?: string;
+	/** Rendered sibling snapshot (main + other named agents), taken at spawn. */
+	roster?: string;
+	/** Roster names, for ListAgents and for validating a worker's `to`. */
+	rosterNames?: string[];
+	/** `<spool>/control/<id>`: send.jsonl, cancel, state.json, permission files. */
+	controlDir?: string;
+	/** Accept live messages after the first turn instead of exiting. */
+	live?: boolean;
+	/** How long an idle live agent waits for a message before it exits. */
+	idleMs?: number;
+	/** Poll interval for the control channel. */
+	controlPollMs?: number;
+	/** Resolved by the caller; false means foreground. */
+	background?: boolean;
 }
 
 export interface WorkerSpec extends WorkerSpecInput {
@@ -1167,6 +1232,11 @@ interface JobRecord extends JobIdentity {
 	prompt?: string;
 	cwd?: string;
 	agentType?: string;
+	/** The addressable name from the spawn; absent for an anonymous agent. */
+	name?: string;
+	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
+	 *  own end-of-turn signal is suppressed. */
+	handbackAt?: number;
 	model?: string;
 	maxTurns?: number;
 	timeoutMs?: number;

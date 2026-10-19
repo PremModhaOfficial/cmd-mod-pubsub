@@ -21,7 +21,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod, {jobStates, ledgerFactory} from '../better-sub-agents.ts';
+import mod, {buildRoster, jobStates, ledgerFactory} from '../better-sub-agents.ts';
 import {
 	fail,
 	makeApi,
@@ -1410,6 +1410,31 @@ process.stdin.on('data', (data) => {
 	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
+
+	// 36. the sibling roster -------------------------------------------------
+	// The roster is a snapshot built once at spawn: main plus every OTHER named
+	// agent. Unnamed jobs are not addressable, duplicates collapse to the newest
+	// record, and an agent is never listed as its own sibling.
+	const roster = buildRoster(
+		[
+			{name: 'Tester', state: 'running', jobId: 'j1'},
+			{name: 'Tester', state: 'done', jobId: 'j0'},
+			{name: '', state: 'running', jobId: 'j2'},
+			{state: 'done', jobId: 'j3'},
+			{name: 'Helper', state: 'done', jobId: 'j4'},
+			{name: 'Runner', state: 'running', jobId: 'j5'},
+		],
+		'Tester',
+	);
+	assert.match(roster, /^SIBLING ROSTER/m, 'the roster has a header');
+	assert.match(roster, /\bmain\b/, 'the roster always includes main');
+	assert.match(roster, /Helper/, 'a named sibling is listed');
+	assert.match(roster, /running/, 'a sibling state is listed');
+	assert.ok(!/Tester/.test(roster), 'the agent is not its own sibling');
+	assert.ok(!/j3/.test(roster), 'an unnamed job is not an addressable agent');
+	assert.equal(buildRoster([{name: 'Tester', jobId: 'j1'}], 'Tester'), '', 'no named sibling means no roster');
+	assert.equal(buildRoster([], undefined), '', 'no agents means no roster');
+	ok('buildRoster: main plus named siblings only, self excluded, newest wins');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
