@@ -136,6 +136,72 @@ const ACTIVE_JOB_SCAN_MAX = 500;
 const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
 const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
 
+// ---------------------------------------------------------------------------
+// Output scanning
+//
+// A subagent's report is data, never instructions. Before the text becomes a
+// signal it is scanned once: an imitation of the host's own output gets a
+// backslash (so `<system-reminder>` reads as text), and a tag imitation or a
+// permission-setting mention gets a marker the parent cannot miss. Nothing else
+// is rewritten - a permission mention stays exactly as written.
+//
+// Self-contained on purpose: WORKER_SOURCE embeds this function's source, so the
+// worker and the parent run one rule table (the same contract as signalEnvelope).
+// ---------------------------------------------------------------------------
+
+export interface ScanResult {
+	readonly text: string;
+	readonly matches: string[];
+	readonly marked: boolean;
+}
+
+export function scanOutput(text: string): ScanResult {
+	// Inline the marker and the rule names: this body is embedded in WORKER_SOURCE,
+	// so it cannot read module constants.
+	const marker = '[harness: subagent output matched instruction-shaped pattern(s): ';
+	const settings = [
+		['bypassPermissions', 'bypassPermissions permission setting'],
+		['--dangerously-skip-permissions', '--dangerously-skip-permissions permission setting'],
+	];
+	const matches: string[] = [];
+	let marked = false;
+	let out = String(text ?? '');
+	// A tag imitation is escaped, never removed: the text stays readable and can no
+	// longer be mistaken for host output.
+	out = out.replace(/<\/?system-reminder\b[^>]*>/gi, match => {
+		if (!matches.includes('system-reminder tag')) matches.push('system-reminder tag');
+		marked = true;
+		return '\\' + match;
+	});
+	// A role label only counts at the start of a line, after indentation.
+	out = out.replace(/^([ \t]*)(Human|Assistant):/gm, (_match, space: string, label: string) => {
+		const name = label + ': role label';
+		if (!matches.includes(name)) matches.push(name);
+		return space + '\\' + label + ':';
+	});
+	// A permission-setting mention is reported, not rewritten: rewriting a flag
+	// would hide what the subagent actually said.
+	for (const [needle, name] of settings) {
+		if (out.includes(needle) && !matches.includes(name)) {
+			matches.push(name);
+			marked = true;
+		}
+	}
+	if (marked) out = marker + matches.join(', ') + ']\n' + out;
+	return {text: out, matches, marked};
+}
+
+// The report the parent reads: the worker's own progress lines (`[tool] ...`) are
+// not part of it. They stay in the log for the task view; a tool call is never a
+// result the parent is asked to act on. Shell output is returned as written.
+export function reportText(text: string, kind: string): string {
+	const visible =
+		kind === 'agent'
+			? text.split('\n').filter(line => !/^\[tool[ \]]/.test(line)).join('\n')
+			: text;
+	return scanOutput(visible).text;
+}
+
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
 // containing quotes, `$`, or a newline cannot break the wrapper.
@@ -181,6 +247,20 @@ const readTail = () => {
 // sides therefore construct a signal from the same field list.
 const signalEnvelope = ${signalEnvelope.toString()};
 
+// The scanner is the parent's scanOutput, injected the same way: one rule table.
+const scanOutput = ${scanOutput.toString()};
+
+// The report tail drops the worker's own tool-call progress. Those lines stay in
+// the log for the task view; the parent is never asked to act on a tool call.
+// Shell output is passed through as written.
+const readReportTail = () => {
+  try {
+    const tail = readTail();
+    if (spec.kind !== 'agent') return tail;
+    return tail.split('\\n').filter(line => !/^\\[tool[ \\]]/.test(line)).join('\\n');
+  } catch (e) { return ''; }
+};
+
 let settled = false;
 
 // One constructor for "this job reached this state": the record patch and the
@@ -191,13 +271,18 @@ const settle = (state, detail, code, tail) => {
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
+  // Scan is the last step before the text can reach the parent; the record and
+  // the signal carry the same facts.
+  const scan = scanOutput(detail + (tail ? '\\n\\n' + tail : ''));
   writeRecord({
     state: state,
     exitCode: typeof code === 'number' ? code : undefined,
     finishedAt: finishedAt,
     durationMs: durationMs,
     failureReason: failed ? detail : undefined,
-    awaitingInput: state === 'waiting-input' ? true : undefined
+    awaitingInput: state === 'waiting-input' ? true : undefined,
+    scanned: true,
+    scanMatches: scan.matches
   });
   emit(signalEnvelope({
     id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
@@ -207,11 +292,14 @@ const settle = (state, detail, code, tail) => {
     exitCode: typeof code === 'number' ? code : null,
     finishedAt: finishedAt,
     durationMs: durationMs,
-    body: detail + (tail ? '\\n\\n' + tail : '')
+    body: scan.text,
+    scanned: true,
+    scanMatches: scan.matches
   }));
 };
 
-const fail = (reason, code) => settle('failed', reason, code, '');
+// A failed worker still returns its last output: partial work is never discarded.
+const fail = (reason, code) => settle('failed', reason, code, readReportTail());
 
 let out;
 try {
@@ -294,7 +382,7 @@ const finish = (code, spawnError, signal) => {
         : signal
           ? 'terminated by ' + signal
           : 'exit 0';
-  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
+  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, readReportTail());
 };
 
 if (typeof child.pid === 'number') {
@@ -479,7 +567,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
     clearTimers();
     const stopReason = result && result.stopReason;
-    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readTail());
+    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readReportTail());
     else if (stopReason === 'cancelled') fail('cancelled', null);
     else if (stopReason === 'max_tokens') fail('max tokens reached; result is partial', null);
     else if (stopReason === 'max_turn_requests') fail('max turns reached; result is partial', null);
@@ -1171,6 +1259,9 @@ interface Signal extends JobIdentity {
 	readonly exitCode?: number | null;
 	readonly title?: string;
 	readonly body?: string;
+	/** The report was scanned before it could reach the parent. */
+	readonly scanned?: boolean;
+	readonly scanMatches?: string[];
 }
 
 interface JobRecord extends JobIdentity {
@@ -1199,6 +1290,8 @@ interface JobRecord extends JobIdentity {
 	failureReason?: string;
 	canceledAt?: number;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // The record write a signal implies.
@@ -1209,6 +1302,8 @@ interface JobPatch {
 	durationMs?: number;
 	failureReason?: string;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1331,7 +1426,16 @@ export const jobStates = {
 
 function signalOf(
 	record: JobRecord,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	return signalEnvelope(record, {...result, state: canonicalState(result.state)});
 }
@@ -1341,7 +1445,16 @@ function signalOf(
 // a signal with different fields. Keep the body plain JS and self-contained.
 export function signalEnvelope(
 	record: JobIdentity,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	const label = String(record.label ?? record.id);
 	const state = String(result.state);
@@ -1359,6 +1472,10 @@ export function signalEnvelope(
 		sessionId: record.sessionId,
 		title: result.title ?? `${label} ${state}`,
 		body: result.body,
+		// Omitted when the writer did not scan, so a legacy signal keeps its shape.
+		...(result.scanned === undefined
+			? {}
+			: {scanned: result.scanned === true, scanMatches: result.scanMatches ?? []}),
 	};
 }
 
@@ -1386,6 +1503,10 @@ function patchOf(signal: Signal): JobPatch {
 		patch.state = state;
 		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
 		if (state === 'waiting-input') patch.awaitingInput = true;
+	}
+	if (signal.scanned !== undefined) {
+		patch.scanned = signal.scanned;
+		patch.scanMatches = signal.scanMatches ?? [];
 	}
 	return patch;
 }
@@ -2751,9 +2872,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			state === 'queued' || state === 'running'
 				? `\n(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1000))}s; the result will arrive as a signal)`
 				: '';
+		// Reading the log is still worker output reaching the parent: scan it here too,
+		// and hide the worker's own tool-call progress.
+		const visible = reportText(body, String(record.kind ?? 'command'));
 		return okText(
 			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}${timing}\n\n` +
-				(body.length > 0 ? body : '(no output yet)') +
+				(visible.length > 0 ? visible : '(no output yet)') +
 				note,
 		);
 	}
