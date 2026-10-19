@@ -1,5 +1,8 @@
 # cmd-mod-better-sub-agents
 
+Version 2.0.0. The GitHub repository is still `cmd-mod-pubsub` until the human release gate renames it; the
+package name and the mod file are already `cmd-mod-better-sub-agents`.
+
 A [Command Code](https://github.com/PremModhaOfficial) mod that turns a blocking "fire an agent and wait"
 into **fire-and-forget**: you start a worker, your session carries on immediately, and when the worker
 finishes its result **lands back in the session that fired it** as a separate message on its own.
@@ -100,7 +103,7 @@ Every Claude Code scope is loaded, highest priority first:
 | 3 | `project` | `.commandcode/agents/**/*.md` from the cwd up to the repository root, plus every `--add-dir` directory |
 | 4 | `user` | `~/.commandcode/agents/**/*.md` |
 | 5 | `plugin` | `<plugin root>/<plugin>/agents/**/*.md`; a subfolder becomes `plugin:review:security` |
-| 6 | `builtin` | the four built-ins below, overridable by any definition above |
+| 6 | `builtin` | the six built-ins below, overridable by any definition above |
 
 A same-directory duplicate loads the first file in read order; the rest are reported by `/doctor`.
 A CLI definition is session-only and accepts the same fields as frontmatter except `color` and
@@ -108,8 +111,15 @@ A CLI definition is session-only and accepts the same fields as frontmatter exce
 ignores `hooks`, `mcpServers`, and `permissionMode`, and a plugin file with no name (or unparseable
 frontmatter) still loads under its filename.
 
-Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fallback) and `claude`.
-`general` is accepted as the host-reserved alias for `general-purpose`.
+Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fallback), `claude`,
+`statusline-setup` (Sonnet, `Read`/`Edit`, used by `/statusline`), and `claude-code-guide` (Haiku,
+read and web tools, answers questions about the host). `general` is accepted as the host-reserved alias
+for `general-purpose`. `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS=1` removes Explore and Plan;
+`CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS=1` removes every built-in.
+
+Descriptions are the delegation surface: the model reads them to choose an agent, while the body loads
+only when that agent runs. When the combined descriptions of non-built-in definitions pass the 15,000-token description limit,
+session start warns with the estimated total (four characters per token) and the threshold.
 
 Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
 `skills`, `memory`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`, `mcpServers`, `hooks`,
@@ -519,7 +529,7 @@ state code and would make the `waiting-input` heuristic a unit test, but it need
 
 ```bash
 node test/smoke.mjs   # the unit/behaviour suite: prints PASS, never touches the network
-node test/e2e.mjs     # the real thing: a real printf job, a real ACP job, a real timeout, a resume
+node test/e2e.mjs     # the real thing: a real printf job, two real sessions, a real ACP job, a timeout, a resume
 ```
 
 `test/e2e.mjs` needs `cmd` on PATH (or `COMMANDCODE_BIN`), a signed-in Command Code and network, so CI runs
@@ -528,7 +538,7 @@ only the smoke suite. It prints the spool path it used, and leaves the artifacts
 
 The smoke test imports `better-sub-agents.ts` directly with Node's native TypeScript type stripping and drives it with
 a fake `ModApi` and a fake `Runtime` (both in `test/harness.mjs`) — no dependencies, no build, no network,
-no process. It covers the
+no process. Its 88 checks cover the
 public surface (tools, command, flags, renderer, pane, hooks, timers) and each seam on its own: the runtime
 seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
 the state table's edges, the envelope's record/signal agreement, a foreign signal surviving a failed
@@ -536,8 +546,9 @@ restore, exactly one signal from each spawn-failure mode, the owner token being 
 replaced by `process-<pid>`, and the ledger's retention and restart behaviour. The T13 checks cover the
 agent id and the one-shot refusal, resume by agent id with model/effort/cache/window preserved, the
 fork/own prompt-cache split, transcript persistence across a restart, retention sweeping record + log +
-transcript together, and a `maxTurns` stop that is partial and emits `compact_boundary`. CI runs it on
-Node 24.
+transcript together, and a `maxTurns` stop that is partial and emits `compact_boundary`. The T14 checks
+cover all six built-ins with their restricted tools and both disable switches, plus the 15,000-token
+description-limit warning. The parity ledger in `SPEC.md` names the check behind every row.
 
 ## License
 

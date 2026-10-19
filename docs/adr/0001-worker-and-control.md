@@ -112,6 +112,12 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 - `cmd.addAgent` skips a duplicate name, so a project definition cannot shadow a user definition. Record the precedence gap.
 - ACP has no fork method. The CLI fork plus one-shot `cmd --resume -p` follow-ups is the accepted path. ACP `session/load` is a host risk for prompt completion.
 - The first fork turn is not streamed, and fork follow-ups are one-shot. Mid-turn steering is a Phase 15 gap.
+- `statusline-setup` and `claude-code-guide` are registry built-ins with restricted tools and models. The host's own copies keep their names; the mod does not shadow them through `addAgent`.
+- The 15,000-token description limit warning uses the documented four-characters-per-token estimate because the host API exposes no tokenizer. The warning reports the estimate and the threshold; it does not block a spawn.
+- `@mention` is a typeahead list, not a forced spawn. The mod supplies every valid custom, built-in, plugin-scoped, and named agent; prompt submission and the typeahead widget remain host-owned, so a mention reaches the model as a name.
+- `/compact`, `/clear`, and `/rewind` are host commands with no interception seam. The mod does not act on a fork from those commands, and `/model` and `/fast` do not mutate it.
+- `permissions.deny` for a built-in agent type is host policy. The mod honours `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS` and `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS`, which cover the same intent.
+- Explore thoroughness is carried in the definition body ("Be quick by default; go deeper only when the task needs it"). The host exposes no per-spawn thoroughness option, so there is no separate parameter.
 
 ## Verification
 

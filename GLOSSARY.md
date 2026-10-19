@@ -110,6 +110,14 @@ _Avoid_: default subagent, generic agent
 The built-in catch-all subagent used when no specialized subagent fits.
 _Avoid_: main agent, default agent
 
+**Statusline-setup**:
+The built-in subagent used by `/statusline` to configure the status line. It runs on Sonnet and is restricted to `Read` and `Edit`.
+_Avoid_: status agent, statusline agent
+
+**Claude-code-guide**:
+The built-in subagent that answers questions about the host's features, commands, and configuration. It runs on Haiku and is restricted to read and web tools.
+_Avoid_: help agent, docs agent
+
 ### Invocation
 
 **Delegation**:

@@ -136,6 +136,8 @@ const HOST_RESERVED_AGENT_NAMES: Record<string, true> = {
 	plan: true,
 	review: true,
 	general: true,
+	'statusline-setup': true,
+	'claude-code-guide': true,
 };
 // The mod file the worker passes back to `cmd --mod <file> acp`. ACP is the
 // accepted transport (docs/adr/0001-worker-and-control.md). The host loads a mod
@@ -2359,6 +2361,26 @@ export const BUILTIN_AGENT_DEFINITIONS: AgentDefinition[] = [
 		path: '',
 	},
 	{
+		name: 'statusline-setup',
+		description: 'Configure the status line. Used by /statusline; restricted to settings files.',
+		systemPrompt:
+			'You configure the Command Code status line. Read the current settings, change only the statusLine entry, and report the file you edited. Do not run shell commands.',
+		source: 'builtin',
+		path: '',
+		model: 'sonnet',
+		tools: ['Read', 'Edit'],
+	},
+	{
+		name: 'claude-code-guide',
+		description: "Answer questions about the host's features, commands, and configuration.",
+		systemPrompt:
+			'You answer questions about Command Code: agents, tools, hooks, permissions, MCP, and settings. Read the local documentation first, then the official pages when the local copy is silent. Answer with the exact flag or field name.',
+		source: 'builtin',
+		path: '',
+		model: 'haiku',
+		tools: ['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch'],
+	},
+	{
 		name: FORK_AGENT_TYPE,
 		description:
 			'Fork the current conversation: full history, the main system prompt, tools, model, permissions, and prompt cache. Use it when the task needs the context already in this session.',
@@ -2375,6 +2397,26 @@ export function builtinAgentDefinitions(env: Record<string, string | undefined>)
 		return BUILTIN_AGENT_DEFINITIONS.filter(definition => definition.name !== 'explore' && definition.name !== 'plan');
 	}
 	return [...BUILTIN_AGENT_DEFINITIONS];
+}
+
+// The description limit covers the descriptions the model reads to choose an
+// agent, not the bodies, which load only when the agent runs. There is no
+// tokenizer in the mod, so four characters per token is the documented estimate;
+// the warning names both the estimate and the threshold so a user can see why it
+// fired. Built-ins are excluded: the user cannot shorten them.
+export const DESCRIPTION_LIMIT_TOKENS = 15000;
+
+export function descriptionLimit(
+	definitions: readonly {readonly description?: string; readonly source?: string}[],
+	maxTokens = DESCRIPTION_LIMIT_TOKENS,
+): {tokens: number; maxTokens: number; over: boolean} {
+	let characters = 0;
+	for (const definition of definitions) {
+		if (definition.source === 'builtin') continue;
+		characters += String(definition.description ?? '').length;
+	}
+	const tokens = Math.ceil(characters / 4);
+	return {tokens, maxTokens, over: tokens > maxTokens};
 }
 
 // A CLI definition is the same shape as frontmatter, in JSON. `color` and
@@ -7994,6 +8036,17 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			// Restore (or mint) the owner token before any drain runs.
 			ownerId();
 			registry.refresh();
+			const limit = descriptionLimit(registry.list());
+			if (limit.over) {
+				try {
+					cmd.ui.notify(
+						`agent descriptions are about ${limit.tokens} tokens, over the ${limit.maxTokens}-token description limit; shorten them so the model keeps choosing the right agent`,
+						'warn',
+					);
+				} catch {
+					/* the warning is advisory; a host without notify still runs */
+				}
+			}
 			sweepClaimed();
 			sweepOrphaned();
 			sweepExpired();

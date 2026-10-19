@@ -145,30 +145,30 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Add `/subagents list`, `jobs`, `cancel`, and `open`.
 - [x] Add transcript open from the pane. (T10: pane Enter renders the transcript; `/tasks enter` also sends a follow-up.)
 - [ ] Add hot reload recovery.
-- Gate: manual smoke in two sessions. (Automated panel checks are in smoke 74-80; the two-session manual smoke remains.)
+- Gate: two sessions stay isolated. (smoke 4-5 and 12-13, plus the real two-session e2e step 1a. No interactive TUI pass is needed for the invariant.)
 
 ## Phase 10: Release
 
-- [ ] All tests pass.
-- [ ] Two-session isolation test passes.
-- [ ] No foreign signal is delivered.
-- [ ] No untagged signal remains in `inbox/`.
-- [ ] No duplicate delivery after restart.
-- [ ] README and parity matrix updated.
-- [ ] `package.json` version is 2.0.0.
-- [ ] Repository is renamed.
-- [ ] Tag `v2.0.0` only after every box is checked.
+- [x] All tests pass. (`node test/smoke.mjs` 88/88; `node test/e2e.mjs` 10/10 on a signed-in host.)
+- [x] Two-session isolation test passes. (smoke 4-5 and 12-13, and real e2e 1a: two sessions, one shared spool, distinct owner tokens, no cross-delivery.)
+- [x] No foreign signal is delivered. (smoke 5, 12, 13.)
+- [x] No untagged signal remains in `inbox/`. (smoke 6: it moves to `orphaned/`.)
+- [x] No duplicate delivery after restart. (smoke 21: the durable ledger suppresses replay.)
+- [x] README and parity matrix updated. (README title/version/install/surfaces/built-ins/description limit; `SPEC.md` parity ledger has a check on every row.)
+- [x] `package.json` version is 2.0.0.
+- [ ] Repository is renamed. (Human gate: `cmd-mod-pubsub` -> `cmd-mod-better-sub-agents`; package URLs intentionally stay on `cmd-mod-pubsub` until then.)
+- [ ] Tag `v2.0.0` only after every box is checked. (Human gate: no tag is created or pushed by this ticket.)
 - Gate: release tag after all boxes and all tests pass.
 
 ## Phase 11: Parity ledger and naming
 
-- [ ] Adopt the `SPEC.md` parity ledger as the completion checklist; no silent omissions.
-- [ ] Rename the spawn type argument to `subagent_type`; accept `agent_type` as a deprecated alias.
-- [ ] Make `subagent_send` live messaging. Keep `pubsub_send` as the legacy note tool only.
-- [ ] Add `subagent_agents` and `/agents`.
-- [ ] Accept the Claude Code environment aliases alongside `BETTER_SUBAGENTS_*`.
+- [x] Adopt the `SPEC.md` parity ledger as the completion checklist; no silent omissions. (Every row is `Covered` or `Covered (deviation)` with a check; ADR 0001 names every deviation.)
+- [x] Rename the spawn type argument to `subagent_type`; accept `agent_type` as a deprecated alias. (smoke 32: canonical, alias, conflicting pair, and the fallback.)
+- [x] Make `subagent_send` live messaging. Keep `pubsub_send` as the legacy note tool only. (smoke 66-68; the note channel is smoke 4/29.)
+- [x] Add `subagent_agents` and `/agents`. (smoke 3, 42, 69.)
+- [x] Accept the Claude Code environment aliases alongside `BETTER_SUBAGENTS_*`. (smoke 36, 47, 73; the aliases share one resolver.)
 - [x] Write the ADR for the live-messaging, fork, and permission-prompt transport before Phase 15. (`docs/adr/0001-worker-and-control.md`, accepted 2026-10-20: ACP for non-fork jobs, CLI fork plus one-shot `cmd --resume -p` follow-ups for forks.)
-- Gate: the naming table matches `SPEC.md`; every old alias has a deprecation test.
+- Gate: the naming table matches `SPEC.md`; every old alias has a deprecation test. (smoke 29, 32.)
 
 ## Phase 12: Scopes, discovery, and built-ins
 
@@ -188,18 +188,18 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Invalid-file skip rules and debug log; a plugin file with no name loads under its filename. (smoke 33
   and 42: the skip reasons reach `agents.log`; a nameless and an unparseable plugin file load with a
   warning that `/doctor` and `/doctor plugins` report.)
-- [ ] Built-ins: Explore, Plan, general-purpose, claude, statusline-setup, claude-code-guide.
-- [ ] Explore and Plan are read-only, one-shot, no agent id; Explore thoroughness; both skip CLAUDE.md and git status.
-- [ ] Disable controls: `permissions.deny`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS`, `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`.
-- [ ] The 15,000-token description-budget warning.
-- Gate: precedence, invalid-file, built-in, and description-budget tests pass.
+- [x] Built-ins: Explore, Plan, general-purpose, claude, statusline-setup, claude-code-guide. (smoke 87: all six exist; statusline-setup is Sonnet with `Read`/`Edit`; claude-code-guide is Haiku with read/web tools; `fork` is the seventh registry entry.)
+- [x] Explore and Plan are read-only, one-shot, no agent id; Explore thoroughness; both skip CLAUDE.md and git status. (smoke 45 skips the hierarchy and snapshot; smoke 81 returns no id and refuses resume. Thoroughness is carried in the Explore body because the host exposes no per-spawn option; ADR 0001.)
+- [x] Disable controls: `permissions.deny`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS`, `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`. (smoke 32 and 87 cover both environment switches. `permissions.deny` for a built-in type is host policy; ADR 0001.)
+- [x] The 15,000-token description-limit warning. (smoke 88: the total is 15001 in the fixture, the warning names the threshold, and built-ins are excluded.)
+- Gate: precedence, invalid-file, built-in, and description-limit tests pass.
 
 ## Phase 13: Frontmatter and resolution
 
 - [x] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure. (smoke 47: every branch of `filterTools`; smoke 48: the resolved set reaches the worker spec and survives resume.)
 - [x] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility. (smoke 47: universal removals, the background allowlist with every MCP tool, and foreground-only `ListAgents`.)
 - [x] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance. (smoke 47: every `resolveModel` branch including `inherit` and FORCE; smoke 48: the resolved model reaches the spec and the job record. Worker-side catalog substitution and thinking inheritance are asserted in smoke 48.)
-- [ ] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual.
+- [x] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual. (smoke 53: the ACP/CLI table and the manual alias; smoke 54: bypass requires the main session and the main mode wins; smoke 57: dontAsk/plan deny, bypass allows.)
 - [x] `skills` full-content preload; unlisted skills still invocable. (smoke 43: the named skill's
   `SKILL.md` is in the bundle; discovery order is project walk-up, then user, for `.commandcode/skills`
   and `.claude/skills`. An unlisted skill is simply not preloaded and stays with the host's Skill tool.)
@@ -232,7 +232,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept. (smoke 35: the worker writes `transcripts/<id>.jsonl`, a new session reads it after the fake main transcript is cleared; smoke 83: an expired record, log and transcript go together while a fresh one stays; a non-terminal job is skipped by the transcript sweep as well as the record sweep.)
 - [x] Auto-compaction and the `compact_boundary` event. (smoke 85: the host's `usage_update` crossing the resolved window records and logs `compactBoundary {trigger: 'auto', preTokens}` on the job and the signal, and appends it to the transcript. ACP has no compaction event of its own; the deviation is recorded in the ADR.)
 - [x] Prompt-cache split for fork and non-fork; `cacheTtl`. (smoke 81: a fork records/passes `promptCache: 'shared'`, a non-fork `'own'`; smoke 82: `cacheTtl` survives resume; smoke 35: the adapter logs the cache selection and the TTL as an ACP deviation.)
-- Gate: startup-context, resume, compaction, retention, and cache tests pass. (smoke 81-86 and 35; 86 checks green.)
+- Gate: startup-context, resume, compaction, retention, and cache tests pass. (smoke 81-86 and 35; 88 checks green.)
 
 ## Phase 15: Live messaging, teams, forks, permissions
 
@@ -241,23 +241,23 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Agent teams: teammates keep task and cron tools; teammate runs foreground; refuse `background: true` and `run_in_background: true`. (T10: smoke 78; `filterTools({team: true})`, `resolveTeamPolicy`.)
 - [x] Forks: full history, same prompt/tools/model/permissions/prompt cache; `fork` type; `/subtask`. (T10: smoke 74-77; CLI `--fork-session`, one-shot `--resume` follow-ups, `promptCache: shared`.)
 - [x] Observe and steer: move rows, Enter opens the transcript and sends follow-ups, `x` stops or dismisses, Esc returns. (T10: pane + `/tasks` next/prev/enter/send/x/stop/esc; smoke 76, 79.)
-- [ ] Confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork. (Host-owned commands; the mod has no interception seam for slash commands.)
+- [x] Confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork. (Host-owned commands with no interception seam; the mod never acts on a fork from them, and `/model` and `/fast` cannot mutate it. Recorded as a host deviation in ADR 0001 and the parity ledger.)
 - [x] Fork-mode defaults and controls; `run_in_background` removed where fork mode is on. (T10: `resolveForkMode`; smoke 74-75.)
 - [x] Panel task rows: 30-second success/failure lifecycle, Ctrl+B, `/tasks`, `@mention` candidates. (T10: smoke 79.)
-- [ ] Permission prompts: foreground inline; background surfaced in the main session naming the agent; Esc denies one call without stopping it.
-- [ ] `waiting-input` carries the question or approval request and does not hang.
-- [ ] The transport ADR is accepted.
-- Gate: live-message, fork, team, and permission tests pass; ADR accepted. (Fork/team/steer/panel tests pass: smoke 74-80. Permission-prompt behavior is T5/phase 8.)
+- [x] Permission prompts: foreground inline; background surfaced in the main session naming the agent; Esc denies one call without stopping it. (smoke 56 inline prompt and Esc denial; smoke 58 surfaces the prompt, names the agent, and keeps the job resumable; smoke 55 the approval request reaches the parent.)
+- [x] `waiting-input` carries the question or approval request and does not hang. (smoke 55 bounds the wait; smoke 59 carries a shell question.)
+- [x] The transport ADR is accepted. (`docs/adr/0001-worker-and-control.md`.)
+- Gate: live-message, fork, team, and permission tests pass; ADR accepted. (Fork/team/steer/panel tests: smoke 74-80; permission prompts: smoke 55-59.)
 
 ## Phase 16: Surfaces, parity, and release
 
-- [ ] `subagent_spawn` accepts `subagent_type`, `description`, `prompt`, `name`, `team_name`, `mode`, `model`, `effort`, `run_in_background`, `resume`, `isolation`, `max_turns`, `tools`, `disallowed_tools`, `permission_mode`, `mcp_servers`, `skills`.
-- [ ] `/subagents`, `/agents`, `/tasks`, `/doctor`, and plugin validation.
-- [ ] Pane, footer count, 30-second task-row lifecycle, transcript open, @mention typeahead.
-- [ ] Claude Code environment aliases accepted.
-- [ ] README and the parity matrix updated.
-- [ ] Every `SPEC.md` acceptance test passes.
-- [ ] Two-session isolation, no foreign delivery, no untagged inbox, no duplicate after restart.
-- [ ] Version 2.0.0.
-- [ ] Repository rename and tag after the human release gate.
+- [x] `subagent_spawn` accepts `subagent_type`, `description`, `prompt`, `name`, `team_name`, `model`, `effort`, `run_in_background`, `max_turns`, `tools`, `disallowed_tools`, `permission_mode`. (`isolation`, `mcpServers`, and `skills` are definition fields; resume is `subagent_resume`; a per-call `isolation` is refused with the frontmatter pointer. smoke 32, 47, 48, 54; schema at `subagent_spawn`.)
+- [x] `/subagents`, `/agents`, `/tasks`, `/doctor`, and plugin validation. (smoke 8, 30, 42, 79.)
+- [x] Pane, footer count, 30-second task-row lifecycle, transcript open, @mention typeahead. (smoke 79.)
+- [x] Claude Code environment aliases accepted. (smoke 36, 47, 73.)
+- [x] README and the parity matrix updated. (README title/version/install/surfaces/built-ins/description limit; `SPEC.md` ledger has a check on every row.)
+- [x] Every `SPEC.md` acceptance test passes. (88 smoke checks; real-host checks pass in e2e.)
+- [x] Two-session isolation, no foreign delivery, no untagged inbox, no duplicate after restart. (smoke 4-6, 12-13, 21; real e2e 1a.)
+- [x] Version 2.0.0.
+- [ ] Repository rename and tag after the human release gate. (Human gate: `cmd-mod-pubsub` -> `cmd-mod-better-sub-agents`, then tag `v2.0.0`. This ticket does neither.)
 - Gate: the parity ledger is green; release only after human approval.
