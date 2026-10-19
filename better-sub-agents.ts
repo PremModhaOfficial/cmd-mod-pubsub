@@ -94,8 +94,8 @@ const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
 
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
-// body is the worker's system prompt. Project discovery walks up from the working
-// directory, so the closest `.commandcode/agents/` wins, then user, then built-ins.
+// body is the worker's system prompt. Discovery follows the scope table: managed,
+// CLI, project (closest directory upward, then --add-dir), user, plugin, built-in.
 const AGENT_NAME_MAX = 256;
 const AGENT_SCAN_MAX = 1000;
 const AGENT_SCAN_DEPTH_MAX = 8;
@@ -135,6 +135,13 @@ const MAX_DEPTH_ENV_ALIAS = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH';
 const ACTIVE_JOB_SCAN_MAX = 500;
 const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
 const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
+// Definition scopes. The host has no `--agents`; the CLI scope arrives as
+// `--mod-option agents=<json|path>`. The managed settings directory is the host's
+// organization-wide config root; `agents/` under it beats every other scope.
+const MANAGED_SETTINGS_DEFAULT = join(homedir(), '.commandcode', 'managed');
+const CLI_AGENTS_OPTION = 'agents';
+const ADD_DIRS_OPTION = 'add_dir';
+const PLUGIN_DIRS_OPTION = 'plugin_dir';
 
 // ---------------------------------------------------------------------------
 // Output scanning
@@ -749,6 +756,8 @@ export interface Runtime {
 	readonly cwd: string;
 	/** The user home: `~/.commandcode/agents` lives under it. */
 	readonly home: string;
+	/** Whether a human is driving. A CLI agent file is refused when one is. */
+	readonly interactive: boolean;
 	readonly fs: SpoolFs;
 }
 
@@ -805,6 +814,7 @@ const OS_RUNTIME: Runtime = {
 	env: process.env,
 	cwd: process.cwd(),
 	home: homedir(),
+	interactive: process.stdin.isTTY === true,
 	fs: osSpoolFs(),
 };
 
@@ -824,13 +834,22 @@ function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
 // not the host's. Only `name` and `description` are required; every other T1 field
 // is parsed and carried on the definition even when a later phase applies it.
 //
-// Discovery order is precedence order: project directories from the working
-// directory upward (closest first), then the user directory, then built-ins. The
-// first definition of a name wins. Invalid files never fail the session: they are
-// recorded with a reason, written to agents.log, and reported by `/agents`.
+// Discovery order is precedence order: the managed settings directory, the CLI
+// definitions, project directories from the working directory upward (closest
+// first) and every --add-dir directory, the user directory, plugin roots, and
+// finally the built-ins. The first definition of a name wins. Invalid files never
+// fail the session: they are recorded with a reason, written to agents.log, and
+// reported by `/agents` and `/doctor`.
 // ---------------------------------------------------------------------------
 
-export type AgentScope = 'project' | 'user' | 'builtin';
+// The scopes, highest priority first. The order is the precedence rule: managed
+// wins over CLI, CLI over project, project over user, user over plugin, and every
+// one over a built-in. It is also the display order in `/agents`.
+export const AGENT_SCOPES = ['managed', 'cli', 'project', 'user', 'plugin', 'builtin'] as const;
+
+export type AgentScope = (typeof AGENT_SCOPES)[number];
+
+export type AgentEntryKind = 'valid' | 'invalid' | 'duplicate';
 
 export interface AgentDefinition {
 	name: string;
@@ -838,6 +857,8 @@ export interface AgentDefinition {
 	systemPrompt: string;
 	source: AgentScope;
 	path?: string;
+	/** The plugin whose `agents/` directory provided this definition. */
+	plugin?: string;
 	tools?: string[];
 	disallowedTools?: string[];
 	model?: string;
@@ -858,7 +879,12 @@ export interface AgentEntry {
 	source: AgentScope;
 	path: string;
 	valid: boolean;
+	kind: AgentEntryKind;
 	reason?: string;
+	/** A definition that loaded but has a problem worth reporting (`/doctor`). */
+	warning?: string;
+	/** For a duplicate: the file whose definition was kept. */
+	duplicateOf?: string;
 	definition?: AgentDefinition;
 }
 
@@ -875,6 +901,14 @@ export interface AgentRegistryDeps {
 	readonly home: string;
 	readonly builtins: AgentDefinition[];
 	readonly log: (message: string) => void;
+	/** The managed settings root; `agents/` under it wins every other scope. */
+	readonly managedDir?: string;
+	/** Plugin roots: each child directory is a plugin with an `agents/` directory. */
+	readonly pluginRoots?: string[];
+	/** `--mod-option agents=<json|path>`, plus whether a human is driving. */
+	readonly cli?: {readonly value: string; readonly interactive: boolean};
+	/** `--add-dir` directories: `.commandcode/agents/` under each is project scope. */
+	readonly addDirs?: string[];
 }
 
 export type FrontmatterResult =
@@ -1056,23 +1090,100 @@ function numberField(value: unknown): number | undefined {
 	return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : undefined;
 }
 
+export interface AgentDefinitionOptions {
+	/** A plugin definition: an unparseable file or one without a name still loads. */
+	plugin?: boolean;
+	/** The plugin that owns the file, recorded on the definition. */
+	pluginName?: string;
+	/** The scoped prefix the raw name is appended to, e.g. `my-plugin:review:`. */
+	scopedPrefix?: string;
+	/** The filename stem, used as the name when frontmatter provides none. */
+	fallbackName?: string;
+}
+
+export type AgentDefinitionResult =
+	| {ok: true; definition: AgentDefinition; warning?: string}
+	| {ok: false; reason: string};
+
+/** Every name rule in one place, so a file and a CLI definition agree. */
+function validateAgentName(name: string): string | undefined {
+	if ([...name].length > AGENT_NAME_MAX) return `name: must be at most ${AGENT_NAME_MAX} characters`;
+	if (name.includes(':')) return 'name: must not contain ":" (plugin-scoped identifiers reserve it)';
+	if (name.startsWith('-')) return 'name: must not start with "-"';
+	return undefined;
+}
+
+// The body of a file whose frontmatter did not parse: everything after the closing
+// `---` when one is findable, otherwise the whole file.
+function fallbackBody(source: string): string {
+	const text = source.startsWith('\uFEFF') ? source.slice(1) : source;
+	const lines = text.split('\n');
+	if (lines[0]?.trim() !== '---') return text.trim();
+	for (let index = 1; index < lines.length; index += 1) {
+		if (lines[index].trim() === '---') return lines.slice(index + 1).join('\n').trim();
+	}
+	return text.trim();
+}
+
+function fallbackDescription(body: string, name: string): string {
+	const line = body
+		.split('\n')
+		.map(part => part.trim())
+		.find(part => part.length > 0);
+	return line !== undefined ? line.slice(0, 200) : `Plugin agent ${name}`;
+}
+
+function pluginFallbackDefinition(body: string, path: string, options: AgentDefinitionOptions): AgentDefinition {
+	const raw = options.fallbackName !== undefined && options.fallbackName.length > 0 ? options.fallbackName : 'agent';
+	const name = `${options.scopedPrefix ?? ''}${raw}`;
+	const definition: AgentDefinition = {
+		name,
+		description: fallbackDescription(body, name),
+		systemPrompt: body,
+		source: 'plugin',
+		path,
+	};
+	if (options.pluginName !== undefined) definition.plugin = options.pluginName;
+	return definition;
+}
+
 export function agentDefinitionFromSource(
 	source: string,
 	path: string,
 	scope: AgentScope,
-): {ok: true; definition: AgentDefinition} | {ok: false; reason: string} {
+	options: AgentDefinitionOptions = {},
+): AgentDefinitionResult {
 	const frontmatter = parseFrontmatter(source);
-	if (!frontmatter.ok) return frontmatter;
-	const fields = frontmatter.fields;
-
-	const name = stringField(fields.name) ?? '';
-	if (name.length === 0) return {ok: false, reason: 'name: required'};
-	// Characters, not UTF-16 code units: the limit is on the name a human sees.
-	if ([...name].length > AGENT_NAME_MAX) {
-		return {ok: false, reason: `name: must be at most ${AGENT_NAME_MAX} characters`};
+	if (!frontmatter.ok) {
+		if (options.plugin !== true) return frontmatter;
+		// A plugin contract differs from a project one: the file still loads under
+		// its filename, and the parse failure is reported instead of hidden.
+		return {
+			ok: true,
+			definition: pluginFallbackDefinition(fallbackBody(source), path, options),
+			warning: `frontmatter: ${frontmatter.reason}; loaded under its filename`,
+		};
 	}
-	if (name.includes(':')) return {ok: false, reason: 'name: must not contain ":" (plugin-scoped identifiers reserve it)'};
-	if (name.startsWith('-')) return {ok: false, reason: 'name: must not start with "-"'};
+	const fields = frontmatter.fields;
+	const fallbackDefinition = (warning: string): AgentDefinitionResult => {
+		const definition = pluginFallbackDefinition(frontmatter.body, path, options);
+		// A usable description in an otherwise unusable file is still worth keeping.
+		const parsedDescription = stringField(fields.description);
+		if (parsedDescription !== undefined) definition.description = parsedDescription;
+		return {ok: true, definition, warning};
+	};
+
+	const rawName = stringField(fields.name) ?? '';
+	if (rawName.length === 0) {
+		if (options.plugin !== true) return {ok: false, reason: 'name: required'};
+		return fallbackDefinition('name: required; loaded under its filename');
+	}
+	const nameError = validateAgentName(rawName);
+	if (nameError !== undefined) {
+		if (options.plugin !== true) return {ok: false, reason: nameError};
+		return fallbackDefinition(`${nameError}; loaded under its filename`);
+	}
+	const name = options.scopedPrefix !== undefined ? `${options.scopedPrefix}${rawName}` : rawName;
 	const description = stringField(fields.description);
 	if (description === undefined) return {ok: false, reason: 'description: required'};
 
@@ -1083,6 +1194,7 @@ export function agentDefinitionFromSource(
 		source: scope,
 		path,
 	};
+	if (options.pluginName !== undefined) definition.plugin = options.pluginName;
 	const tools = listField(fields.tools);
 	const disallowed = listField(fields.disallowedTools);
 	const skills = listField(fields.skills);
@@ -1095,7 +1207,8 @@ export function agentDefinitionFromSource(
 	const color = stringField(fields.color);
 	const effort = stringField(fields.effort);
 	if (model !== undefined) definition.model = model;
-	if (permissionMode !== undefined) definition.permissionMode = permissionMode;
+	// A plugin's permissionMode is ignored by contract; the host decides its policy.
+	if (permissionMode !== undefined && options.plugin !== true) definition.permissionMode = permissionMode;
 	if (maxTurns !== undefined) definition.maxTurns = maxTurns;
 	if (skills !== undefined) definition.skills = skills;
 	if (isolation !== undefined) definition.isolation = isolation;
@@ -1165,43 +1278,101 @@ export function builtinAgentDefinitions(env: Record<string, string | undefined>)
 	return [...BUILTIN_AGENT_DEFINITIONS];
 }
 
+// A CLI definition is the same shape as frontmatter, in JSON. `color` and
+// `experimental` are ignored there by contract; the object key is the name, so an
+// inline `{reviewer: {...}}` and an array of `{name: ...}` both work.
+function cliAgentDefinition(
+	rawName: string,
+	spec: Record<string, unknown>,
+	sourcePath: string,
+): {ok: true; definition: AgentDefinition} | {ok: false; reason: string} {
+	const name = rawName.length > 0 ? rawName : (stringField(spec.name) ?? '');
+	if (name.length === 0) return {ok: false, reason: 'name: required'};
+	const nameError = validateAgentName(name);
+	if (nameError !== undefined) return {ok: false, reason: nameError};
+	const description = stringField(spec.description);
+	if (description === undefined) return {ok: false, reason: 'description: required'};
+	const prompt = typeof spec.prompt === 'string' ? spec.prompt : typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+
+	const definition: AgentDefinition = {name, description, systemPrompt: prompt, source: 'cli', path: sourcePath};
+	const tools = listField(spec.tools);
+	const disallowed = listField(spec.disallowedTools);
+	const skills = listField(spec.skills);
+	if (tools !== undefined) definition.tools = tools;
+	if (disallowed !== undefined) definition.disallowedTools = disallowed;
+	if (skills !== undefined) definition.skills = skills;
+	const model = stringField(spec.model);
+	const permissionMode = stringField(spec.permissionMode);
+	const maxTurns = numberField(spec.maxTurns);
+	const isolation = stringField(spec.isolation);
+	const effort = stringField(spec.effort);
+	if (model !== undefined) definition.model = model;
+	if (permissionMode !== undefined) definition.permissionMode = permissionMode;
+	if (maxTurns !== undefined) definition.maxTurns = maxTurns;
+	if (isolation !== undefined) definition.isolation = isolation;
+	if (effort !== undefined) definition.effort = effort;
+	const background = booleanField(spec.background);
+	const omitClaudeMd = booleanField(spec.omitClaudeMd);
+	if (background !== undefined) definition.background = background;
+	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	return {ok: true, definition};
+}
+
 export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 	let entries: AgentEntry[] = [];
-	// Each (file, reason) is logged once per process, so a refresh from `/agents`
+	// Each (file, problem) is logged once per process, so a refresh from `/agents`
 	// cannot flood the debug log with the same skip.
 	const loggedSkips = new Set<string>();
+	// A plugin file that loaded under its filename still carries its problem, which
+	// `/doctor` reports. Keyed by the definition so a precedence skip does not lose it.
+	const definitionWarnings = new WeakMap<AgentDefinition, string>();
 
-	function reportInvalid(entry: AgentEntry): void {
-		const key = `${entry.path}\u0000${entry.reason ?? ''}`;
+	const managedDir = (): string => deps.managedDir ?? join(deps.home, '.commandcode', 'managed');
+
+	function pushEntry(entry: AgentEntry): void {
+		entries.push(entry);
+		const problem = entry.warning ?? entry.reason;
+		if (problem === undefined) return;
+		const key = `${entry.path}\u0000${problem}`;
 		if (loggedSkips.has(key)) return;
 		loggedSkips.add(key);
-		deps.log(`${entry.path}: ${entry.reason ?? 'invalid'}`);
+		deps.log(`${entry.path.length > 0 ? entry.path : entry.name}: ${problem}`);
 	}
 
-	function scanFile(path: string, scope: AgentScope): AgentDefinition | undefined {
+	function scanFile(path: string, scope: AgentScope, options: AgentDefinitionOptions = {}): AgentDefinition | undefined {
 		let source = '';
 		try {
 			source = deps.fs.readFile(path);
 		} catch (error) {
-			const entry: AgentEntry = {
+			pushEntry({
 				name: '',
 				source: scope,
 				path,
 				valid: false,
+				kind: 'invalid',
 				reason: `unreadable: ${String((error as Error)?.message ?? error)}`,
-			};
-			entries.push(entry);
-			reportInvalid(entry);
+			});
 			return undefined;
 		}
-		const parsed = agentDefinitionFromSource(source, path, scope);
+		const parsed = agentDefinitionFromSource(source, path, scope, options);
 		if (!parsed.ok) {
-			const entry: AgentEntry = {name: '', source: scope, path, valid: false, reason: parsed.reason};
-			entries.push(entry);
-			reportInvalid(entry);
+			pushEntry({name: '', source: scope, path, valid: false, kind: 'invalid', reason: parsed.reason});
 			return undefined;
 		}
+		if (parsed.warning !== undefined) definitionWarnings.set(parsed.definition, parsed.warning);
 		return parsed.definition;
+	}
+
+	function pushDuplicate(name: string, scope: AgentScope, path: string, kept: string): void {
+		pushEntry({
+			name,
+			source: scope,
+			path,
+			valid: false,
+			kind: 'duplicate',
+			duplicateOf: kept,
+			reason: `duplicate name "${name}": ${kept} was read first; rename or remove this file`,
+		});
 	}
 
 	// Recursive scan. Subdirectories never change a project or user identity: the
@@ -1213,7 +1384,7 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		scope: AgentScope,
 		depth: number,
 		found: AgentDefinition[],
-		localNames: Set<string>,
+		localNames: Map<string, string>,
 	): void {
 		if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
 		let names: string[] = [];
@@ -1228,19 +1399,12 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 			if (name.toLowerCase().endsWith('.md')) {
 				const definition = scanFile(full, scope);
 				if (definition === undefined) continue;
-				if (localNames.has(definition.name)) {
-					const entry: AgentEntry = {
-						name: definition.name,
-						source: scope,
-						path: full,
-						valid: false,
-						reason: `duplicate name "${definition.name}" (the first definition in this directory wins)`,
-					};
-					entries.push(entry);
-					reportInvalid(entry);
+				const kept = localNames.get(definition.name);
+				if (kept !== undefined) {
+					pushDuplicate(definition.name, scope, full, kept);
 					continue;
 				}
-				localNames.add(definition.name);
+				localNames.set(definition.name, full);
 				found.push(definition);
 				continue;
 			}
@@ -1248,28 +1412,221 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		}
 	}
 
-	// The project dirs from the working directory upward, closest first. Walk-up
+	// A plugin's subdirectory is part of its identifier, so it is scanned with the
+	// trail that builds `plugin:review:security`. Unlike a project, the plugin file
+	// contract loads a nameless or unparseable file under its filename.
+	function scanPluginDir(
+		dir: string,
+		pluginName: string,
+		trail: string[],
+		depth: number,
+		found: AgentDefinition[],
+		localNames: Map<string, string>,
+	): void {
+		if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
+		let children: string[] = [];
+		try {
+			children = deps.fs.readdir(dir).sort();
+		} catch {
+			return;
+		}
+		for (const child of children) {
+			if (entries.length >= AGENT_SCAN_MAX) return;
+			const full = join(dir, child);
+			if (child.toLowerCase().endsWith('.md')) {
+				const definition = scanFile(full, 'plugin', {
+					plugin: true,
+					pluginName,
+					scopedPrefix: `${[pluginName, ...trail].join(':')}:`,
+					fallbackName: child.replace(/\.md$/i, ''),
+				});
+				if (definition === undefined) continue;
+				const kept = localNames.get(definition.name);
+				if (kept !== undefined) {
+					pushDuplicate(definition.name, 'plugin', full, kept);
+					continue;
+				}
+				localNames.set(definition.name, full);
+				found.push(definition);
+				continue;
+			}
+			scanPluginDir(full, pluginName, [...trail, child], depth + 1, found, localNames);
+		}
+	}
+
+	function scanPlugins(root: string, found: AgentDefinition[]): void {
+		if (!deps.fs.exists(root)) return;
+		let pluginNames: string[] = [];
+		try {
+			pluginNames = deps.fs.readdir(root).sort();
+		} catch {
+			return;
+		}
+		for (const pluginName of pluginNames) {
+			// Presence under a plugin root is enablement; the host owns the plugin
+			// manager. Only plugins that ship agents are scanned.
+			const agentsDir = join(root, pluginName, 'agents');
+			if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, new Map());
+		}
+	}
+
+	// The project bases from the working directory upward, closest first. Walk-up
 	// stops at the repository root (the directory holding .git) or the filesystem
 	// root, so a nested `.commandcode/agents` closest to the cwd wins.
-	function projectDirs(): string[] {
-		const dirs: string[] = [];
+	function projectBases(): string[] {
+		const bases: string[] = [];
 		let current = deps.cwd;
 		for (let depth = 0; depth <= 64; depth += 1) {
-			const candidate = join(current, '.commandcode', 'agents');
-			if (deps.fs.exists(candidate)) dirs.push(candidate);
+			bases.push(current);
 			if (deps.fs.exists(join(current, '.git'))) break;
 			const parent = dirname(current);
 			if (parent === current) break;
 			current = parent;
 		}
-		return dirs;
+		return bases;
+	}
+
+	function pluginRoots(): string[] {
+		const roots = [...(deps.pluginRoots ?? [])];
+		roots.push(join(managedDir(), 'plugins'));
+		for (const base of projectBases()) roots.push(join(base, '.commandcode', 'plugins'));
+		roots.push(join(deps.home, '.commandcode', 'plugins'));
+		return roots;
+	}
+
+	// `--mod-option agents=<inline JSON | JSON file path>`. A file is refused in an
+	// interactive session: a definition a human cannot see at launch cannot be
+	// reviewed, so the session must pass inline JSON instead.
+	function scanCli(found: AgentDefinition[]): void {
+		const value = (deps.cli?.value ?? '').trim();
+		if (value.length === 0) return;
+		let text = value;
+		let sourcePath = 'cli';
+		if (!value.startsWith('{') && !value.startsWith('[')) {
+			const file = value.startsWith('@') ? value.slice(1) : value;
+			if (deps.cli?.interactive === true) {
+				pushEntry({
+					name: '',
+					source: 'cli',
+					path: file,
+					valid: false,
+					kind: 'invalid',
+					reason: 'an interactive session cannot load --mod-option agents from a file; pass inline JSON',
+				});
+				return;
+			}
+			try {
+				text = deps.fs.readFile(file);
+			} catch (error) {
+				pushEntry({
+					name: '',
+					source: 'cli',
+					path: file,
+					valid: false,
+					kind: 'invalid',
+					reason: `unreadable: ${String((error as Error)?.message ?? error)}`,
+				});
+				return;
+			}
+			sourcePath = file;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			pushEntry({
+				name: '',
+				source: 'cli',
+				path: sourcePath,
+				valid: false,
+				kind: 'invalid',
+				reason: `agents JSON: ${String((error as Error)?.message ?? error)}`,
+			});
+			return;
+		}
+		const specs: {name: string; spec: Record<string, unknown>}[] = [];
+		if (Array.isArray(parsed)) {
+			for (const item of parsed) {
+				if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+					pushEntry({
+						name: '',
+						source: 'cli',
+						path: sourcePath,
+						valid: false,
+						kind: 'invalid',
+						reason: 'agents JSON: every array item must be an object',
+					});
+					continue;
+				}
+				const record = item as Record<string, unknown>;
+				specs.push({name: typeof record.name === 'string' ? record.name : '', spec: record});
+			}
+		} else if (parsed !== null && typeof parsed === 'object') {
+			for (const [name, item] of Object.entries(parsed)) {
+				if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+					pushEntry({
+						name,
+						source: 'cli',
+						path: sourcePath,
+						valid: false,
+						kind: 'invalid',
+						reason: 'agents JSON: every definition must be an object',
+					});
+					continue;
+				}
+				specs.push({name, spec: item as Record<string, unknown>});
+			}
+		} else {
+			pushEntry({
+				name: '',
+				source: 'cli',
+				path: sourcePath,
+				valid: false,
+				kind: 'invalid',
+				reason: 'agents JSON: expected an object of definitions or an array',
+			});
+			return;
+		}
+
+		const localNames = new Map<string, string>();
+		for (const {name, spec} of specs) {
+			const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
+			if (!parsedDefinition.ok) {
+				pushEntry({
+					name,
+					source: 'cli',
+					path: sourcePath,
+					valid: false,
+					kind: 'invalid',
+					reason: parsedDefinition.reason,
+				});
+				continue;
+			}
+			const kept = localNames.get(parsedDefinition.definition.name);
+			if (kept !== undefined) {
+				pushDuplicate(parsedDefinition.definition.name, 'cli', sourcePath, kept);
+				continue;
+			}
+			localNames.set(parsedDefinition.definition.name, sourcePath);
+			found.push(parsedDefinition.definition);
+		}
 	}
 
 	function refresh(): void {
 		entries = [];
 		const found: AgentDefinition[] = [];
-		for (const dir of projectDirs()) scanDir(dir, 'project', 0, found, new Set());
-		scanDir(join(deps.home, '.commandcode', 'agents'), 'user', 0, found, new Set());
+		// Precedence order, highest first: a managed definition wins over CLI, CLI over
+		// project, project over user, user over plugin, and every one over a built-in.
+		scanDir(join(managedDir(), 'agents'), 'managed', 0, found, new Map());
+		scanCli(found);
+		for (const base of projectBases()) {
+			scanDir(join(base, '.commandcode', 'agents'), 'project', 0, found, new Map());
+		}
+		for (const dir of deps.addDirs ?? []) {
+			scanDir(join(dir, '.commandcode', 'agents'), 'project', 0, found, new Map());
+		}
+		scanDir(join(deps.home, '.commandcode', 'agents'), 'user', 0, found, new Map());
+		for (const root of pluginRoots()) scanPlugins(root, found);
 		found.push(...deps.builtins);
 
 		// Precedence, not an error: the first loaded definition of a name wins. A
@@ -1278,11 +1635,14 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		for (const definition of found) {
 			if (seen.has(definition.name)) continue;
 			seen.add(definition.name);
+			const warning = definitionWarnings.get(definition);
 			entries.push({
 				name: definition.name,
 				source: definition.source,
 				path: definition.path ?? '',
 				valid: true,
+				kind: 'valid',
+				...(warning !== undefined ? {warning} : {}),
 				definition,
 			});
 		}
@@ -1960,6 +2320,27 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		default: 'steer',
 		description: 'Deprecated alias for subagent_deliver.',
 	});
+	cmd.addFlag('managed_dir', {
+		type: 'string',
+		default: MANAGED_SETTINGS_DEFAULT,
+		description: 'Managed settings directory; agents/ under it wins every other scope.',
+	});
+	cmd.addFlag(CLI_AGENTS_OPTION, {
+		type: 'string',
+		default: '',
+		description:
+			'Session-only agent definitions as inline JSON, or a JSON file path in a non-interactive session (--mod-option agents=...).',
+	});
+	cmd.addFlag(ADD_DIRS_OPTION, {
+		type: 'string',
+		default: '',
+		description: 'Comma-separated extra directories; .commandcode/agents/ under each is project scope (--add-dir).',
+	});
+	cmd.addFlag(PLUGIN_DIRS_OPTION, {
+		type: 'string',
+		default: '',
+		description: 'Comma-separated plugin roots; every child directory with an agents/ dir is a plugin.',
+	});
 
 	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
 	// A flag still sitting on its default is not an override; anything else is.
@@ -1970,6 +2351,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (old.length > 0 && old !== legacyDefault) return old;
 		return value.length > 0 ? value : legacyDefault;
 	};
+	const splitFlag = (name: string): string[] =>
+		readFlag(name)
+			.split(',')
+			.map(value => value.trim())
+			.filter(value => value.length > 0);
 	const root = pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT);
 	const inboxDir = join(root, 'inbox');
 	const claimedDir = join(root, 'claimed');
@@ -2008,6 +2394,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		cwd: runtime.cwd,
 		home: runtime.home,
 		builtins: builtinAgentDefinitions(runtime.env),
+		managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+		addDirs: splitFlag(ADD_DIRS_OPTION),
+		pluginRoots: splitFlag(PLUGIN_DIRS_OPTION),
+		cli: {value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true},
 		log: message => {
 			try {
 				spool.appendFile(join(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}\n`);
@@ -3376,28 +3766,84 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			wanted.length === 0
 				? entries
 				: entries.filter(entry => entry.name.toLowerCase() === wanted || entry.path.toLowerCase().includes(wanted));
-		const counts: Record<string, number> = {project: 0, user: 0, builtin: 0};
+		const counts: Partial<Record<AgentScope, number>> = {};
 		let valid = 0;
 		for (const entry of entries) {
 			if (!entry.valid) continue;
 			valid += 1;
 			counts[entry.source] = (counts[entry.source] ?? 0) + 1;
 		}
+		// Scope order, so the summary reads the way precedence does.
+		const summary = AGENT_SCOPES.filter(scope => (counts[scope] ?? 0) > 0)
+			.map(scope => `${counts[scope]} ${scope === 'builtin' ? 'built-in' : scope}`)
+			.join(', ');
 		const lines = shown.map(entry => {
 			const flags: string[] = [];
 			if (entry.definition?.readOnly === true) flags.push('read-only');
 			if (entry.definition?.oneShot === true) flags.push('one-shot');
+			if (entry.definition?.plugin !== undefined) flags.push(`plugin ${entry.definition.plugin}`);
 			if (entry.source !== 'builtin' && Object.hasOwn(HOST_RESERVED_AGENT_NAMES, entry.name)) {
 				flags.push('shadows a host-reserved name');
 			}
-			const state = entry.valid ? 'valid' : `invalid: ${entry.reason ?? 'unknown'}`;
+			if (entry.warning !== undefined) flags.push(`warning: ${entry.warning}`);
+			const state =
+				entry.kind === 'duplicate'
+					? `duplicate: ${entry.reason ?? 'unknown'}`
+					: entry.valid
+						? 'valid'
+						: `invalid: ${entry.reason ?? 'unknown'}`;
 			const location = entry.path.length > 0 ? `  ${entry.path}` : '';
 			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${location}`;
 		});
 		return (
-			`${valid} valid definition(s) (${counts.project} project, ${counts.user} user, ${counts.builtin} built-in), ` +
+			`${valid} valid definition(s)${summary.length > 0 ? ` (${summary})` : ''}, ` +
 			`${entries.length - valid} invalid.\n` +
 			(lines.length > 0 ? lines.join('\n') : '  (none)')
+		);
+	}
+
+	// `/doctor` is the diagnosis surface: every duplicate with the file that was
+	// kept, every invalid file, and every plugin file that loaded under its
+	// filename because its frontmatter could not be read.
+	function doctorText(filter?: string): string {
+		registry.refresh();
+		const entries = registry.entries();
+		if (String(filter ?? '').trim().toLowerCase() === 'plugins') {
+			const pluginEntries = entries.filter(entry => entry.source === 'plugin');
+			const problems = pluginEntries.filter(entry => !entry.valid || entry.warning !== undefined);
+			const lines = pluginEntries.map(entry => {
+				const state =
+					entry.kind === 'valid'
+						? entry.warning !== undefined
+							? `warning: ${entry.warning}`
+							: 'valid'
+						: `${entry.kind}: ${entry.reason ?? 'unknown'}`;
+				return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${state}  ${entry.path}`;
+			});
+			return (
+				`plugin validation: ${pluginEntries.length} file(s), ${problems.length} problem(s)\n` +
+				(lines.length > 0 ? lines.join('\n') : '  (no plugin agents)')
+			);
+		}
+		const duplicates = entries.filter(entry => entry.kind === 'duplicate');
+		const invalid = entries.filter(entry => entry.kind === 'invalid');
+		const warnings = entries.filter(entry => entry.valid && entry.warning !== undefined);
+		const pluginAgents = entries
+			.filter(entry => entry.source === 'plugin' && entry.valid && entry.definition !== undefined)
+			.map(entry => entry.name);
+		const lines: string[] = [];
+		for (const entry of duplicates) {
+			lines.push(`  duplicate ${entry.name}: kept ${entry.duplicateOf ?? '?'}, skipped ${entry.path} - rename or remove one`);
+		}
+		for (const entry of invalid) {
+			lines.push(`  invalid ${entry.path.length > 0 ? entry.path : entry.name}: ${entry.reason ?? 'unknown'}`);
+		}
+		for (const entry of warnings) lines.push(`  warning ${entry.path}: ${entry.warning}`);
+		if (pluginAgents.length > 0) lines.push(`  plugin agents: ${pluginAgents.join(', ')}`);
+		const summary = `${duplicates.length} duplicate(s), ${invalid.length} invalid, ${warnings.length} warning(s)`;
+		return (
+			`subagents doctor: ${lines.length > 0 ? summary : 'ok'}\n` +
+			(lines.length > 0 ? lines.join('\n') : '  no duplicate or invalid definitions')
 		);
 	}
 
@@ -3434,6 +3880,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		description: 'List subagent definitions: scope, validity, and the file that provides each one',
 		argumentHint: '[name|path]',
 		handler: ({args}: {args?: string}) => ({message: agentsText(args)}),
+	});
+	cmd.addCommand({
+		name: 'doctor',
+		description: 'Report duplicate, invalid, and plugin agent definitions, with the fix for each one',
+		argumentHint: '[plugins]',
+		handler: ({args}: {args?: string}) => ({message: doctorText(args)}),
 	});
 
 	// ------------------------------------------------------------------ lifecycle
