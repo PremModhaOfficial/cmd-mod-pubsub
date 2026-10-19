@@ -146,7 +146,7 @@ try {
 	const inboxBefore = readdirSync(inbox).length;
 	writeFileSync(
 		join(inbox, `${Date.now()}-legacy-unowned.json`),
-		JSON.stringify({id: 'legacy-unowned', label: 'legacy', kind: 'command', state: 'done', title: 'legacy', body: 'x'}),
+		JSON.stringify({id: 'legacy-unowned', description: 'legacy', kind: 'command', state: 'done', title: 'legacy', body: 'x'}),
 	);
 	assert.equal(readdirSync(inbox).length, inboxBefore + 1, 'legacy signal must be staged in inbox');
 
@@ -222,7 +222,7 @@ try {
 	assert.equal(spawnCall.options.detached, true, 'the worker is detached');
 	assert.equal(spawnCall.options.env.BETTER_SUBAGENTS_WORKER, '1', 'the worker is marked as a worker');
 	const spec = JSON.parse(spawnCall.options.env.SUBAGENT_SPEC);
-	assert.equal(spec.label, 'seam', 'the job spec carries the label');
+	assert.equal(spec.description, 'seam', 'the job spec carries the label');
 	assert.equal(spec.command, 'printf hi', 'the job spec carries the command');
 	const firedId = spec.id;
 
@@ -287,7 +287,7 @@ try {
 
 	writeFileSync(
 		join(raceDir, 'inbox', `${Date.now()}-race-1.json`),
-		JSON.stringify({id: 'race-1', owner: raceOwner, label: 'race', kind: 'command', state: 'done', title: 'race done', body: 'ok'}),
+		JSON.stringify({id: 'race-1', owner: raceOwner, description: 'race', kind: 'command', state: 'done', title: 'race done', body: 'ok'}),
 	);
 	assert.equal(raceB.registeredHooks.onStop(), undefined, 'onStop hands nothing foreign to the model');
 	assert.equal(raceB.userMessages.length, 0, "B must not receive A's signal");
@@ -329,7 +329,7 @@ try {
 	const unboundOwner = ownerEntries(unboundSession)[0];
 	writeFileSync(
 		join(unboundDir, 'inbox', `${Date.now()}-unbound-1.json`),
-		JSON.stringify({id: 'unbound-1', owner: unboundOwner, label: 'unbound', kind: 'command', state: 'done', title: 'unbound', body: 'x'}),
+		JSON.stringify({id: 'unbound-1', owner: unboundOwner, description: 'unbound', kind: 'command', state: 'done', title: 'unbound', body: 'x'}),
 	);
 	u.api.session = undefined; // the session unbinds (hot reload teardown) before the drain
 	const drainTick = u.everyTicks.find((tick) => tick.ms === 400);
@@ -404,7 +404,7 @@ try {
 	// A state the table does not know is loud in the pane, not a dot.
 	writeFileSync(
 		join(stateDir, 'jobs', 'zz-teleported.json'),
-		JSON.stringify({id: 'zz-teleported', label: 'teleported', state: 'teleported', startedAt: fixedNow}),
+		JSON.stringify({id: 'zz-teleported', description: 'teleported', state: 'teleported', startedAt: fixedNow}),
 	);
 	s.everyTicks.find((tick) => tick.ms === 1000).fn();
 	const pane = s.paneDefs.find((def) => def.id === 'jobs');
@@ -507,7 +507,7 @@ try {
 		JSON.stringify({
 			id: 'owner-proof',
 			owner: ownerSpec.owner,
-			label: 'owner proof',
+			description: 'owner proof',
 			kind: 'command',
 			state: 'done',
 			title: 'owner proof',
@@ -531,7 +531,7 @@ try {
 		JSON.stringify({
 			id: 'pending-1',
 			owner: 'owner-somebody-else',
-			label: 'pending',
+			description: 'pending',
 			kind: 'command',
 			state: 'done',
 			title: 'pending',
@@ -609,7 +609,7 @@ try {
 		JSON.stringify({
 			id: deliveredId,
 			owner: replayOwner,
-			label: 'once only',
+			description: 'once only',
 			kind: 'note',
 			state: 'note',
 			title: 'once only',
@@ -675,7 +675,7 @@ try {
 	const writeStale = (id, state, startedAt, workerPid, owner = recOwner) =>
 		writeFileSync(
 			join(recDir, 'jobs', `${id}.json`),
-			JSON.stringify({id, label: id, kind: 'command', state, startedAt, workerPid, owner}),
+			JSON.stringify({id, description: id, kind: 'command', state, startedAt, workerPid, owner}),
 		);
 	writeStale('lost-young', 'running', recNow - 10_000, 424242);
 	writeStale('lost-old', 'running', recNow - 31_000, 424242);
@@ -716,7 +716,7 @@ try {
 	const stampJob = (id, state, finishedAt) => {
 		writeFileSync(
 			join(retDir, 'jobs', `${id}.json`),
-			JSON.stringify({id, label: id, kind: 'command', state, startedAt: finishedAt - 1000, finishedAt, updatedAt: finishedAt}),
+			JSON.stringify({id, description: id, kind: 'command', state, startedAt: finishedAt - 1000, finishedAt, updatedAt: finishedAt}),
 		);
 		writeFileSync(join(retDir, 'logs', `${id}.log`), 'output\n');
 	};
@@ -757,7 +757,7 @@ try {
 	const stopOwner = ownerEntries(stopSession)[0];
 	writeFileSync(
 		join(stopDir, 'inbox', `${Date.now()}-late-1.json`),
-		JSON.stringify({id: 'late-1', owner: stopOwner, label: 'late', kind: 'command', state: 'done', title: 'late done', body: 'ok'}),
+		JSON.stringify({id: 'late-1', owner: stopOwner, description: 'late', kind: 'command', state: 'done', title: 'late done', body: 'ok'}),
 	);
 	const stopped = stop.registeredHooks.onStop();
 	assert.equal(stopped?.continue, true, 'onStop continues the run when this session has a signal');
@@ -944,7 +944,7 @@ try {
 	// passes it through, so neither side can silently ignore it.
 	const timeoutSpec = {
 		id: 'timeout-job',
-		label: 'timeout',
+		description: 'timeout',
 		kind: 'command',
 		command: 'sleep 30',
 		cwd: process.cwd(),
@@ -1249,7 +1249,7 @@ try {
 	const commandSpec = seam.buildSpec(
 		{
 			id: 'c',
-			label: 'c',
+			description: 'c',
 			kind: 'command',
 			command: 'printf hi',
 			cwd: '/tmp',
@@ -1266,7 +1266,7 @@ try {
 	const agentSeamSpec = seam.buildSpec(
 		{
 			id: 'a',
-			label: 'a',
+			description: 'a',
 			kind: 'agent',
 			prompt: 'x',
 			cwd: '/tmp',
@@ -1282,7 +1282,7 @@ try {
 	assert.deepEqual(agentSeamSpec.args, ['--mod', '/mod.ts', 'acp'], 'an agent job runs cmd --mod <file> acp');
 
 	const envelope = seam.signalEnvelope(
-		{id: 'e', label: 'envelope', kind: 'agent', owner: 'o', startedAt: 10, logPath: '/l', sessionId: 's'},
+		{id: 'e', description: 'envelope', kind: 'agent', owner: 'o', startedAt: 10, logPath: '/l', sessionId: 's'},
 		{state: 'done', exitCode: 0, finishedAt: 20, durationMs: 10, body: 'ok'},
 	);
 	assert.deepEqual(
@@ -1290,7 +1290,7 @@ try {
 		{
 			id: 'e',
 			owner: 'o',
-			label: 'envelope',
+			description: 'envelope',
 			kind: 'agent',
 			state: 'done',
 			exitCode: 0,
@@ -1371,7 +1371,7 @@ process.stdin.on('data', (data) => {
 		const spec = seam.buildSpec(
 			{
 				id,
-				label: id,
+				description: id,
 				kind: 'agent',
 				owner: 'owner-test',
 				cwd: acpDir,
@@ -1693,7 +1693,7 @@ process.stdin.on('data', (data) => {
 	sweep.registeredHooks.onSessionStart({source: 'resume', sessionId: 'sweep'});
 	assert.ok(!existsSync(join(sweepDir, 'jobs', 'settled.json')), 'a settled record past retention is swept');
 	assert.ok(!existsSync(join(sweepDir, 'logs', 'settled.log')), 'its log is swept with it');
-	assert.ok(!existsSync(join(sweepDir, 'worktrees', 'settled')), 'its worktree is swept with it');
+	assert.ok(existsSync(join(sweepDir, 'worktrees', 'settled')), 'a worktree git cannot prove clean is kept, never bare-deleted');
 	assert.ok(existsSync(join(sweepDir, 'jobs', 'busy.json')), 'a running record is kept');
 	assert.ok(existsSync(join(sweepDir, 'logs', 'busy.log')), 'a running log is kept');
 	assert.ok(existsSync(join(sweepDir, 'worktrees', 'busy')), 'a running worktree is kept');
@@ -1755,7 +1755,7 @@ process.stdin.on('data', (data) => {
 	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(scanDir, dir), {recursive: true});
 	const scanSpec = (id) => ({
 		id,
-		label: id,
+		description: id,
 		kind: 'command',
 		owner: 'owner-scan',
 		cwd: scanDir,
@@ -1911,31 +1911,31 @@ process.stdin.on('data', (data) => {
 		});
 
 	const allScopes = registryOf();
-	assert.equal(allScopes.get('scope-winner').source, 'managed', 'managed scope wins every other scope');
-	assert.equal(allScopes.get('scope-winner').systemPrompt, 'MANAGED', 'the managed definition is the loaded one');
+	assert.equal(allScopes.get('scope-winner').scope, 'managed', 'managed scope wins every other scope');
+	assert.equal(allScopes.get('scope-winner').prompt, 'MANAGED', 'the managed definition is the loaded one');
 	assert.equal(allScopes.get('above'), undefined, 'project walk-up stops at the repository root');
-	assert.equal(allScopes.get('deep').systemPrompt, 'DEEP', 'a project subdirectory is scanned recursively');
-	assert.equal(allScopes.get('added').source, 'project', '--add-dir loads its .commandcode/agents');
-	assert.equal(allScopes.get('deep-added').systemPrompt, 'DEEP ADDED', '--add-dir is scanned recursively');
+	assert.equal(allScopes.get('deep').prompt, 'DEEP', 'a project subdirectory is scanned recursively');
+	assert.equal(allScopes.get('added').scope, 'project', '--add-dir loads its .commandcode/agents');
+	assert.equal(allScopes.get('deep-added').prompt, 'DEEP ADDED', '--add-dir is scanned recursively');
 
 	const noManaged = registryOf({managedDir: missingManaged});
-	assert.equal(noManaged.get('scope-winner').systemPrompt, 'NESTED', 'the closest project directory wins');
+	assert.equal(noManaged.get('scope-winner').prompt, 'NESTED', 'the closest project directory wins');
 	const fromRepo = registryOf({cwd: scopeRepo, managedDir: missingManaged});
-	assert.equal(fromRepo.get('scope-winner').systemPrompt, 'PROJECT', 'the outer project directory wins from there');
+	assert.equal(fromRepo.get('scope-winner').prompt, 'PROJECT', 'the outer project directory wins from there');
 	const userScopeOnly = registryOf({cwd: scopeOutside, managedDir: missingManaged});
-	assert.equal(userScopeOnly.get('scope-winner').source, 'user', 'user scope loads when no project definition exists');
+	assert.equal(userScopeOnly.get('scope-winner').scope, 'user', 'user scope loads when no project definition exists');
 
 	const duplicates = allScopes.entries().filter((entry) => entry.kind === 'duplicate');
 	assert.equal(duplicates.length, 1, 'one same-directory duplicate is recorded');
 	assert.equal(duplicates[0].name, 'dup', 'the duplicate names the colliding definition');
 	assert.match(duplicates[0].duplicateOf ?? '', /dup-a\.md$/, 'the first file read is the one kept');
 	assert.match(duplicates[0].reason ?? '', /rename or remove/, 'the duplicate carries a proposed fix');
-	assert.equal(allScopes.get('dup').systemPrompt, 'DUP A', 'same-directory duplicates resolve by read order');
+	assert.equal(allScopes.get('dup').prompt, 'DUP A', 'same-directory duplicates resolve by read order');
 
 	const pluginDefinition = allScopes.get('my-plugin:review:security');
 	assert.ok(pluginDefinition !== undefined, 'a plugin subfolder becomes part of the scoped name');
 	assert.equal(pluginDefinition.name, 'my-plugin:review:security', 'the scoped identifier is exact');
-	assert.equal(pluginDefinition.source, 'plugin', 'the definition is plugin scope');
+	assert.equal(pluginDefinition.scope, 'plugin', 'the definition is plugin scope');
 	assert.equal(allScopes.get('security'), undefined, 'a plugin definition is not addressable unscoped');
 	assert.equal(pluginDefinition.permissionMode, undefined, 'plugin definitions ignore permissionMode');
 	assert.ok(!('hooks' in pluginDefinition), 'plugin definitions ignore hooks');
@@ -1943,10 +1943,10 @@ process.stdin.on('data', (data) => {
 
 	const fallbackDefinition = allScopes.get('my-plugin:noname');
 	assert.ok(fallbackDefinition !== undefined, 'a plugin file with no frontmatter loads under its filename');
-	assert.match(fallbackDefinition.systemPrompt, /NONAME BODY/, 'the fallback keeps the body');
+	assert.match(fallbackDefinition.prompt, /NONAME BODY/, 'the fallback keeps the body');
 	const brokenDefinition = allScopes.get('my-plugin:broken');
 	assert.ok(brokenDefinition !== undefined, 'a plugin file with unparseable frontmatter still loads');
-	const brokenEntry = allScopes.entries().find((entry) => entry.path.endsWith('broken.md'));
+	const brokenEntry = allScopes.entries().find((entry) => entry.sourcePath.endsWith('broken.md'));
 	assert.equal(brokenEntry.valid, true, 'the unparseable plugin file is loaded, not skipped');
 	assert.match(brokenEntry.warning ?? '', /frontmatter/, 'the plugin parse failure is a warning');
 
@@ -1960,27 +1960,27 @@ process.stdin.on('data', (data) => {
 			interactive: true,
 		},
 	});
-	assert.equal(cliInline.get('scope-winner').source, 'cli', 'CLI scope beats project and user');
-	assert.equal(cliInline.get('scope-winner').systemPrompt, 'CLI', 'the CLI definition is the loaded one');
-	assert.equal(cliInline.get('cli-only').systemPrompt, 'CLI ONLY', 'an inline CLI definition loads');
+	assert.equal(cliInline.get('scope-winner').scope, 'cli', 'CLI scope beats project and user');
+	assert.equal(cliInline.get('scope-winner').prompt, 'CLI', 'the CLI definition is the loaded one');
+	assert.equal(cliInline.get('cli-only').prompt, 'CLI ONLY', 'an inline CLI definition loads');
 	assert.equal(cliInline.get('cli-only').color, undefined, 'CLI definitions ignore color');
 	assert.ok(!('experimental' in cliInline.get('cli-only')), 'CLI definitions ignore experimental');
 	assert.equal(registryOf({managedDir: missingManaged}).get('cli-only'), undefined, 'CLI definitions are session-only');
 	const managedOverCli = registryOf({
 		cli: {value: '{"scope-winner":{"description":"cli","prompt":"CLI"}}', interactive: true},
 	});
-	assert.equal(managedOverCli.get('scope-winner').source, 'managed', 'managed wins over CLI');
+	assert.equal(managedOverCli.get('scope-winner').scope, 'managed', 'managed wins over CLI');
 
 	const cliFile = join(scopeRoot, 'agents.json');
 	writeFileSync(cliFile, JSON.stringify({fromFile: {description: 'file', prompt: 'FROM FILE'}}));
 	assert.equal(
-		registryOf({managedDir: missingManaged, cli: {value: cliFile, interactive: false}}).get('fromFile').systemPrompt,
+		registryOf({managedDir: missingManaged, cli: {value: cliFile, interactive: false}}).get('fromFile').prompt,
 		'FROM FILE',
 		'a CLI JSON file loads in non-interactive mode',
 	);
 	const refusedFile = registryOf({managedDir: missingManaged, cli: {value: cliFile, interactive: true}});
 	assert.equal(refusedFile.get('fromFile'), undefined, 'interactive mode refuses a CLI file path');
-	const refusal = refusedFile.entries().find((entry) => entry.source === 'cli' && !entry.valid);
+	const refusal = refusedFile.entries().find((entry) => entry.scope === 'cli' && !entry.valid);
 	assert.ok(refusal !== undefined, 'the refusal is recorded');
 	assert.match(refusal.reason ?? '', /interactive session cannot load .*file/i, 'the refusal explains itself');
 
@@ -1997,7 +1997,7 @@ process.stdin.on('data', (data) => {
 		},
 	});
 	assert.equal(
-		cliBad.entries().filter((entry) => entry.source === 'cli' && !entry.valid).length,
+		cliBad.entries().filter((entry) => entry.scope === 'cli' && !entry.valid).length,
 		4,
 		'CLI name and description rules reject four definitions',
 	);
@@ -2085,7 +2085,7 @@ process.stdin.on('data', (data) => {
 
 	const startupDefinition = {
 		name: 'reviewer',
-		systemPrompt: 'You review.',
+		prompt: 'You review.',
 		skills: ['review'],
 		memory: 'project',
 	};
@@ -2197,7 +2197,7 @@ process.stdin.on('data', (data) => {
 		const skipped = startupExports.buildStartupBundle({
 			...startupInput,
 			agentType,
-			definition: {name: agentType, systemPrompt: 'read only'},
+			definition: {name: agentType, prompt: 'read only'},
 		});
 		assert.deepEqual(skipped.claudeMd, [], `${agentType} skips the CLAUDE.md hierarchy`);
 		assert.deepEqual(skipped.agentsMd, [], `${agentType} skips AGENTS.md`);
@@ -2223,7 +2223,7 @@ process.stdin.on('data', (data) => {
 	const exploreSubdirectory = startupExports.buildStartupBundle({
 		...startupInput,
 		agentType: 'explore',
-		definition: {name: 'explore', systemPrompt: 'read only'},
+		definition: {name: 'explore', prompt: 'read only'},
 		paths: [join('packages', 'app', 'src', 'file.ts')],
 	});
 	assert.ok(
@@ -2260,7 +2260,7 @@ process.stdin.on('data', (data) => {
 	const startupAcpSpec = seam.buildSpec(
 		{
 			id: 'acp-startup',
-			label: 'acp-startup',
+			description: 'acp-startup',
 			kind: 'agent',
 			owner: 'owner-test',
 			cwd: acpDir,
@@ -2722,7 +2722,7 @@ process.stdin.on('data', (data) => {
 			JSON.stringify({
 				id: spec.id,
 				owner: spec.owner,
-				label: spec.label,
+				description: spec.description,
 				kind: spec.kind,
 				state,
 				exitCode: state === 'done' ? 0 : null,
@@ -2731,7 +2731,7 @@ process.stdin.on('data', (data) => {
 				durationMs: 10,
 				logPath: spec.logPath,
 				sessionId: spec.sessionId,
-				title: `${spec.label} ${state}`,
+				title: `${spec.description} ${state}`,
 				body: reason,
 			}),
 		);
@@ -3160,7 +3160,7 @@ process.stdin.on('data', (data) => {
 		const spec = seam.buildSpec(
 			{
 				id,
-				label: id,
+				description: id,
 				kind: 'agent',
 				owner: 'owner-test',
 				cwd: permDir,
@@ -3311,7 +3311,7 @@ process.stdin.on('data', (data) => {
 		JSON.stringify({
 			id: 'perm-delivery-1',
 			owner: deliveryOwner,
-			label: 'planner',
+			description: 'planner',
 			kind: 'agent',
 			state: 'waiting-input',
 			exitCode: null,
@@ -3346,7 +3346,7 @@ process.stdin.on('data', (data) => {
 	const questionSpec = seam.buildSpec(
 		{
 			id: questionId,
-			label: 'question',
+			description: 'question',
 			kind: 'command',
 			owner: 'owner-test',
 			cwd: questionDir,
@@ -3653,7 +3653,7 @@ process.stdin.on('data', (data) => {
 	writeFileSync(join(fireDir, 'jobs', `${isoId}.json`), JSON.stringify(doneRecord, null, 2));
 	writeFileSync(
 		join(fireDir, 'inbox', `${fixedNow}-${isoId}-test.json`),
-		JSON.stringify({id: isoId, owner: doneRecord.owner, label: doneRecord.label, kind: 'agent', state: 'done', body: 'exit 0'}),
+		JSON.stringify({id: isoId, owner: doneRecord.owner, description: doneRecord.description, kind: 'agent', state: 'done', body: 'exit 0'}),
 	);
 	// Session start reconciles first and drains second: the record is finalized by the
 	// reconcile, and delivery still has to report the kept path.
@@ -3705,8 +3705,8 @@ process.stdin.on('data', (data) => {
 	assert.match(roster, /running/, 'a sibling state is listed');
 	assert.ok(!/Tester/.test(roster), 'the agent is not its own sibling');
 	assert.ok(!/j3/.test(roster), 'an unnamed job is not an addressable agent');
-	assert.equal(buildRoster([{name: 'Tester', jobId: 'j1'}], 'Tester'), '', 'no named sibling means no roster');
-	assert.equal(buildRoster([], undefined), '', 'no agents means no roster');
+	assert.match(buildRoster([{name: 'Tester', jobId: 'j1'}], 'Tester'), /\bmain\b/, 'a lone named agent still gets main');
+	assert.match(buildRoster([], undefined), /\bmain\b/, 'a roster with no named agents is main only');
 	ok('buildRoster: main plus named siblings only, self excluded, newest wins');
 
 	// 66. live messaging: the worker control channel -------------------------
@@ -3767,7 +3767,7 @@ process.stdin.on('data', (data) => {
 		const spec = seam.buildSpec(
 			{
 				id,
-				label: id,
+				description: id,
 				kind: 'agent',
 				owner: 'owner-live',
 				cwd: liveDir,
@@ -3883,7 +3883,7 @@ process.stdin.on('data', (data) => {
 		id: 'live-1',
 		owner: sendOwner,
 		name: 'Tester',
-		label: 'tester',
+		description: 'tester',
 		kind: 'agent',
 		agentType: 'general-purpose',
 		state: 'running',
@@ -3934,7 +3934,7 @@ process.stdin.on('data', (data) => {
 
 	writeFileSync(
 		join(liveSpool, 'jobs', 'helper.json'),
-		JSON.stringify({id: 'helper', owner: sendOwner, name: 'Helper', label: 'helper', kind: 'agent', state: 'done', startedAt: 0}),
+		JSON.stringify({id: 'helper', owner: sendOwner, name: 'Helper', description: 'helper', kind: 'agent', state: 'done', startedAt: 0}),
 	);
 	const spawnTool = toolOf(sendBundle, 'subagent_spawn');
 	const named = await spawnTool.run({input: {description: 'named spawn', prompt: 'hello', name: 'Scout'}});
@@ -4004,7 +4004,7 @@ process.stdin.on('data', (data) => {
 		id: 'hb-1',
 		owner: 'owner-hb',
 		name: 'Reporter',
-		label: 'reporter',
+		description: 'reporter',
 		kind: 'agent',
 		jobsDir: join(hbDir, 'jobs'),
 		inboxDir: join(hbDir, 'inbox'),
@@ -4019,7 +4019,7 @@ process.stdin.on('data', (data) => {
 	mod(hb.api, hb.runtime);
 	writeFileSync(
 		join(hbDir, 'jobs', 'hb-1.json'),
-		JSON.stringify({id: 'hb-1', label: 'reporter', kind: 'agent', owner: 'owner-hb', state: 'running', startedAt: 10}),
+		JSON.stringify({id: 'hb-1', description: 'reporter', kind: 'agent', owner: 'owner-hb', state: 'running', startedAt: 10}),
 	);
 	const handback = await toolOf(hb, 'SubagentHandback').run({input: {report: 'the final answer is 42'}});
 	assert.equal(handback.ok, true, JSON.stringify(handback));
@@ -4036,7 +4036,7 @@ process.stdin.on('data', (data) => {
 	// stop plus the control marker, not a state transition.
 	writeFileSync(
 		join(liveSpool, 'jobs', 'live-idle.json'),
-		JSON.stringify({...liveRecord, id: 'live-idle', label: 'idle live', state: 'done', workerPid: livePid}),
+		JSON.stringify({...liveRecord, id: 'live-idle', description: 'idle live', state: 'done', workerPid: livePid}),
 	);
 	const liveStopped = await toolOf(sendBundle, 'subagent_cancel').run({input: {id: 'live-idle'}});
 	assert.equal(liveStopped.ok, true, JSON.stringify(liveStopped));
@@ -4223,7 +4223,7 @@ process.stdin.on('data', (data) => {
 	);
 	const mcpDefinition = {
 		name: 'mcp-agent',
-		source: 'project',
+		scope: 'project',
 		path: join(mcpRoot, '.commandcode', 'agents', 'mcp.md'),
 	};
 	const configured = mcpExports.mcpServerConfigs(realFs, [mcpRoot]);
@@ -4279,7 +4279,7 @@ process.stdin.on('data', (data) => {
 		'a deny policy wins over an allow policy',
 	);
 	assert.deepEqual(
-		mcpExports.resolveAgentMcpServers({...mcpBase, definition: {...mcpDefinition, source: 'plugin'}}).servers,
+		mcpExports.resolveAgentMcpServers({...mcpBase, definition: {...mcpDefinition, scope: 'plugin'}}).servers,
 		[],
 		'a plugin definition loads no MCP server',
 	);
@@ -4290,12 +4290,12 @@ process.stdin.on('data', (data) => {
 	);
 	assert.equal(mcpExports.agentFolderTrusted(mcpDefinition, {cwd: mcpRoot, home: mcpRoot}), true, 'the project folder is trusted');
 	assert.equal(
-		mcpExports.agentFolderTrusted({name: 'x', source: 'project', path: '/elsewhere/x.md'}, {cwd: mcpRoot, home: mcpRoot}),
+		mcpExports.agentFolderTrusted({name: 'x', scope: 'project', sourcePath: '/elsewhere/x.md'}, {cwd: mcpRoot, home: mcpRoot}),
 		false,
 		'a definition outside the workspace is not trusted',
 	);
 	assert.equal(
-		mcpExports.agentFolderTrusted({name: 'x', source: 'plugin', path: join(mcpRoot, 'x.md')}, {cwd: mcpRoot, home: mcpRoot}),
+		mcpExports.agentFolderTrusted({name: 'x', scope: 'plugin', path: join(mcpRoot, 'x.md')}, {cwd: mcpRoot, home: mcpRoot}),
 		false,
 		'a plugin is never trusted for inline servers',
 	);
@@ -4735,7 +4735,7 @@ process.stdout.write(JSON.stringify({
 	const forkWorkerSpec = modExports.buildSpec(
 		{
 			id: forkWorkerId,
-			label: 'fork worker',
+			description: 'fork worker',
 			kind: 'fork',
 			owner: 'owner-fork',
 			cwd: forkWorkerDir,
@@ -4899,10 +4899,10 @@ process.stdout.write(JSON.stringify({
 	mod(panelBundle.api, panelBundle.runtime);
 	const panelOwner = ownerEntries(panelBundle.api.session)[0];
 	const writePanelJob = (record) => writeFileSync(join(panelDir, 'jobs', `${record.id}.json`), JSON.stringify(record, null, 2));
-	writePanelJob({id: 'a-done', owner: panelOwner, label: 'done row', kind: 'agent', state: 'done', startedAt: panelNow - 1000, finishedAt: panelNow - 1000});
-	writePanelJob({id: 'b-fail', owner: panelOwner, label: 'failed row', kind: 'agent', state: 'failed', startedAt: panelNow - 2000, finishedAt: panelNow - 500, failureReason: 'boom'});
-	writePanelJob({id: 'c-old', owner: panelOwner, label: 'old failure', kind: 'agent', state: 'failed', startedAt: panelNow - 90000, finishedAt: panelNow - 80000});
-	writePanelJob({id: 'd-run', owner: panelOwner, label: 'running row', kind: 'agent', state: 'running', background: false, startedAt: panelNow - 100, pid: 737373});
+	writePanelJob({id: 'a-done', owner: panelOwner, description: 'done row', kind: 'agent', state: 'done', startedAt: panelNow - 1000, finishedAt: panelNow - 1000});
+	writePanelJob({id: 'b-fail', owner: panelOwner, description: 'failed row', kind: 'agent', state: 'failed', startedAt: panelNow - 2000, finishedAt: panelNow - 500, failureReason: 'boom'});
+	writePanelJob({id: 'c-old', owner: panelOwner, description: 'old failure', kind: 'agent', state: 'failed', startedAt: panelNow - 90000, finishedAt: panelNow - 80000});
+	writePanelJob({id: 'd-run', owner: panelOwner, description: 'running row', kind: 'agent', state: 'running', background: false, startedAt: panelNow - 100, pid: 737373});
 	writeFileSync(join(panelDir, 'logs', 'b-fail.log'), 'the failure output\n');
 	writeFileSync(join(panelDir, 'logs', 'a-done.log'), 'the success output\n');
 	const panelRefresh = panelBundle.everyTicks.find((tick) => tick.ms === 1000);
@@ -5095,7 +5095,7 @@ process.stdout.write(JSON.stringify({
 			...leadRecord,
 			id: 'handle-job',
 			agentId: 'agent-handle',
-			label: 'handle',
+			description: 'handle',
 			state: 'done',
 			finishedAt: fixedNow,
 			acpSessionId: 'acp-handle',
@@ -5203,7 +5203,7 @@ process.stdin.on('data', (data) => {
 	const limitSpec = modExports.buildSpec(
 		{
 			id: 'limit-job',
-			label: 'limit',
+			description: 'limit',
 			kind: 'agent',
 			owner: 'owner-t13',
 			cwd: t13WorkerDir,
@@ -5231,7 +5231,7 @@ process.stdin.on('data', (data) => {
 		join(t13WorkerDir, 'jobs', 'limit-job.json'),
 		JSON.stringify({
 			id: 'limit-job',
-			label: 'limit',
+			description: 'limit',
 			kind: 'agent',
 			agentId: 'limit-job',
 			state: 'queued',
@@ -5272,7 +5272,7 @@ process.stdin.on('data', (data) => {
 	ok('T13: maxTurns is partial and emits compact_boundary');
 
 	const partialOutcome = foregroundOutcome(
-		{state: 'failed', partial: true, failureReason: 'max turns reached; result is partial', label: 'limit', kind: 'agent'},
+		{state: 'failed', partial: true, failureReason: 'max turns reached; result is partial', description: 'limit', kind: 'agent'},
 		'partial answer',
 	);
 	assert.equal(partialOutcome.ok, true, 'a partial foreground result is not an error');
@@ -5340,13 +5340,13 @@ process.stdin.on('data', (data) => {
 	// 87. the description limit warns at startup, built-ins excluded.
 	assert.deepEqual(
 		modExports.descriptionLimit([
-			{source: 'builtin', description: 'x'.repeat(100_000)},
-			{source: 'project', description: 'x'.repeat(60_004)},
+			{scope: 'builtin', description: 'x'.repeat(100_000)},
+			{scope: 'project', description: 'x'.repeat(60_004)},
 		]),
 		{tokens: 15001, maxTokens: 15000, over: true},
 		'the limit counts non-built-in descriptions at four characters per token',
 	);
-	assert.equal(modExports.descriptionLimit([{source: 'project', description: 'short'}]).over, false, 'a short set stays under');
+	assert.equal(modExports.descriptionLimit([{scope: 'project', description: 'short'}]).over, false, 'a short set stays under');
 	const limitRoot = mkdtempSync(join(tmpdir(), 'subagent-limit-'));
 	writeAgent(join(limitRoot, '.commandcode', 'agents'), 'big.md', 'big', 'x'.repeat(60_004), 'BIG BODY');
 	const limitRuntime = makeRuntime({cwd: limitRoot, home: mkdtempSync(join(tmpdir(), 'subagent-limit-home-'))});
@@ -5358,6 +5358,545 @@ process.stdin.on('data', (data) => {
 	assert.match(warnings[0].message, /15001 tokens/, 'the warning carries the total');
 	assert.match(warnings[0].message, /15000-token/, 'and the threshold');
 	ok('description limit: startup warns with the total and excludes built-ins');
+
+	// 89. subagent_list shows the agent id and the addressable name.
+	const listRoot = mkdtempSync(join(tmpdir(), 'subagent-list-'));
+	const listSession = makeSession();
+	const listRuntime = makeRuntime({now: () => fixedNow});
+	const listBundle = makeApi({spoolDir: listRoot, session: listSession, runtime: listRuntime.runtime});
+	mod(listBundle.api, listRuntime.runtime);
+	writeFileSync(
+		join(listRoot, 'jobs', 'listedTool.json'),
+		JSON.stringify({
+			id: 'listedTool',
+			agentId: 'agent-abc',
+			name: 'Tester',
+			description: 'a list row',
+			kind: 'agent',
+			state: 'running',
+			agentType: 'general-purpose',
+			startedAt: fixedNow - 1000,
+			owner: ownerEntries(listSession)[0],
+		}),
+	);
+	const listedTool = await toolOf(listBundle, 'subagent_list').run({input: {}});
+	assert.equal(listedTool.ok, true, JSON.stringify(listedTool));
+	const listedText = String(listedTool.content[0].text);
+	assert.match(listedText, /agent id agent-abc/, 'the list shows the durable agent id');
+	assert.match(listedText, /name=Tester/, 'the list shows the addressable name');
+	ok('subagent_list shows the agent id and the addressable name');
+
+	// 90. a foreground teammate's send returns its result, not "wait for a signal".
+	const mateRoot = mkdtempSync(join(tmpdir(), 'subagent-mate-'));
+	const mateRuntime = makeRuntime({
+		now: () => fixedNow,
+		spawn(command, args, options) {
+			const spawned = JSON.parse(options.env.SUBAGENT_SPEC);
+			writeFileSync(
+				join(spawned.jobsDir, `${spawned.id}.json`),
+				JSON.stringify({
+					id: spawned.id,
+					agentId: spawned.agentId,
+					name: spawned.name,
+					teamName: spawned.teamName,
+					description: spawned.description,
+					kind: spawned.kind,
+					state: 'done',
+					cwd: spawned.cwd,
+					logPath: spawned.logPath,
+					startedAt: spawned.startedAt,
+					finishedAt: fixedNow,
+					owner: spawned.owner,
+					agentType: spawned.agentType,
+					background: false,
+				}),
+			);
+			writeFileSync(spawned.logPath, 'the teammate result\n');
+			return makeChild();
+		},
+	});
+	const mateSession = makeSession();
+	const mateBundle = makeApi({spoolDir: mateRoot, session: mateSession, runtime: mateRuntime.runtime});
+	mod(mateBundle.api, mateRuntime.runtime);
+	writeFileSync(
+		join(mateRoot, 'jobs', 'mate.json'),
+		JSON.stringify({
+			id: 'mate',
+			name: 'Mate',
+			description: 'teammate',
+			kind: 'agent',
+			state: 'done',
+			teamName: 'crew',
+			agentType: 'general-purpose',
+			acpSessionId: 'acp-mate',
+			cwd: mateRoot,
+			owner: ownerEntries(mateSession)[0],
+			startedAt: fixedNow - 1000,
+		}),
+	);
+	const sentMate = await toolOf(mateBundle, 'subagent_send').run({input: {to: 'Mate', message: 'status?'}});
+	assert.equal(sentMate.ok, true, JSON.stringify(sentMate));
+	assert.match(String(sentMate.content[0].text), /the teammate result/, 'the foreground teammate result is returned');
+	assert.ok(!/arrives here as its own signal/.test(String(sentMate.content[0].text)), 'the background wording is not used');
+	ok('subagent_send returns a foreground teammate result instead of discarding it');
+
+	// 91. the worker enforces the resolved tool set and runs definition hooks.
+	const policyRoot = mkdtempSync(join(tmpdir(), 'subagent-policy-'));
+	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(policyRoot, dir), {recursive: true});
+	const hookRuns = [];
+	const policySpec = {
+		id: 'policy',
+		owner: 'owner-policy',
+		name: 'Policy',
+		agentType: 'reviewer',
+		cwd: policyRoot,
+		jobsDir: join(policyRoot, 'jobs'),
+		inboxDir: join(policyRoot, 'inbox'),
+		logPath: join(policyRoot, 'logs', 'policy.log'),
+		startedAt: fixedNow,
+		tailMax: 1000,
+		tools: ['Read', 'Write', 'mcp__docs__*'],
+		hooks: {
+			PreToolUse: [{matcher: 'Write', command: 'block-tool'}],
+			PostToolUse: [{command: 'context-tool'}],
+			Stop: [{command: 'stop-tool'}],
+		},
+	};
+	const policyRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(policySpec)},
+		run(command, args) {
+			const script = args[1];
+			hookRuns.push(script);
+			if (script === 'block-tool') return {ok: false, code: 2, stdout: '', stderr: 'blocked by policy'};
+			if (script === 'context-tool') return {ok: false, code: 2, stdout: 'post note', stderr: ''};
+			if (script === 'stop-tool') return {ok: false, code: 2, stdout: '', stderr: 'keep going'};
+			return {ok: true, code: 0, stdout: '', stderr: ''};
+		},
+	}).runtime;
+	const policyBundle = makeApi({spoolDir: policyRoot, session: makeSession(), runtime: policyRuntime});
+	mod(policyBundle.api, policyRuntime);
+	const blockedTool = policyBundle.registeredHooks.beforeToolCall({toolName: 'Bash', input: {}});
+	assert.equal(blockedTool.block, true, 'a tool outside the resolved set is blocked');
+	assert.match(blockedTool.additionalContext, /not in this agent's resolved tool set/);
+	assert.equal(policyBundle.registeredHooks.beforeToolCall({toolName: 'Read', input: {}}), undefined, 'a listedTool tool passes');
+	assert.equal(
+		policyBundle.registeredHooks.beforeToolCall({toolName: 'mcp__docs__search', input: {}}),
+		undefined,
+		'an MCP wildcard admits that server\'s tools',
+	);
+	const blockedHook = policyBundle.registeredHooks.beforeToolCall({toolName: 'Write', input: {}});
+	assert.equal(blockedHook.block, true, 'a PreToolUse hook blocks its matched tool');
+	assert.match(blockedHook.additionalContext, /blocked by policy/);
+	const postTool = policyBundle.registeredHooks.afterToolCall({toolName: 'Read', input: {}, result: 'ok'});
+	assert.equal(postTool.additionalContext, 'post note', 'a PostToolUse hook feeds the model');
+	const stopHook = policyBundle.registeredHooks.onStop();
+	assert.equal(stopHook.continue, true, 'a Stop hook asks for another turn');
+	assert.match(stopHook.reason, /keep going/);
+	assert.ok(
+		hookRuns.includes('block-tool') && hookRuns.includes('context-tool') && hookRuns.includes('stop-tool'),
+		'all three hook events ran',
+	);
+	ok('worker: the resolved tool set is enforced and PreToolUse/PostToolUse/Stop fire');
+
+	// 92. a definition's parsed hooks and tools reach the worker spec.
+	const hooksRoot = mkdtempSync(join(tmpdir(), 'subagent-hookspec-'));
+	const hooksSession = makeSession();
+	const hooksRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {...process.env},
+		execPath: '/usr/bin/node',
+	});
+	const hooksBundle = makeApi({spoolDir: hooksRoot, session: hooksSession, runtime: hooksRuntime.runtime});
+	hooksBundle.api.setFlag(
+		'agents',
+		JSON.stringify({
+			hooked: {
+				description: 'hooked agent',
+				prompt: 'BODY',
+				tools: 'Read, Grep',
+				hooks: {PreToolUse: [{matcher: 'Bash', command: 'audit'}]},
+			},
+		}),
+	);
+	mod(hooksBundle.api, hooksRuntime.runtime);
+	const hookedSpawn = await toolOf(hooksBundle, 'subagent_spawn').run({
+		input: {description: 'hooked', prompt: 'go', subagent_type: 'hooked'},
+	});
+	assert.equal(hookedSpawn.ok, true, JSON.stringify(hookedSpawn));
+	const hookedSpec = JSON.parse(hooksRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.deepEqual(hookedSpec.hooks, {PreToolUse: [{matcher: 'Bash', command: 'audit'}]}, 'the hooks reach the worker');
+	assert.deepEqual(hookedSpec.tools, ['Read', 'Grep'], 'the resolved tool set reaches the worker with them');
+	ok('definition hooks and tools reach the worker spec');
+
+	// 93. a CLI definition keeps memory, which enables the memory tools.
+	const cliMemRoot = mkdtempSync(join(tmpdir(), 'subagent-cli-memory-'));
+	mkdirSync(join(cliMemRoot, '.commandcode', 'agent-memory', 'memoried'), {recursive: true});
+	writeFileSync(join(cliMemRoot, '.commandcode', 'agent-memory', 'memoried', 'MEMORY.md'), 'REMEMBER THIS\n');
+	const cliMemSession = makeSession();
+	const cliMemRuntime = makeRuntime({now: () => fixedNow, cwd: cliMemRoot, env: {...process.env}});
+	const cliMemBundle = makeApi({spoolDir: join(cliMemRoot, 'spool'), session: cliMemSession, runtime: cliMemRuntime.runtime});
+	cliMemBundle.api.setFlag(
+		'agents',
+		JSON.stringify({memoried: {description: 'memory agent', prompt: 'BODY', memory: 'project'}}),
+	);
+	mod(cliMemBundle.api, cliMemRuntime.runtime);
+	const memSpawn = await toolOf(cliMemBundle, 'subagent_spawn').run({
+		input: {description: 'memory', prompt: 'go', subagent_type: 'memoried', cwd: cliMemRoot},
+	});
+	assert.equal(memSpawn.ok, true, JSON.stringify(memSpawn));
+	const memSpec = JSON.parse(cliMemRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	for (const tool of ['Read', 'Write', 'Edit']) {
+		assert.ok(memSpec.tools.includes(tool), `memory enables ${tool}`);
+	}
+	assert.match(String(memSpec.startup), /REMEMBER THIS/, 'the memory index is in the startup bundle');
+	ok('a CLI definition parses memory like frontmatter');
+
+	// 94. /add-dir loads a directory's agents without a restart.
+	const addRoot = mkdtempSync(join(tmpdir(), 'subagent-adddir-'));
+	const addedDir = mkdtempSync(join(tmpdir(), 'subagent-added-'));
+	writeAgent(join(addedDir, '.commandcode', 'agents'), 'added.md', 'added', 'added agent', 'ADDED BODY');
+	const addSession = makeSession();
+	const addRuntime = makeRuntime({now: () => fixedNow, cwd: addRoot, home: mkdtempSync(join(tmpdir(), 'subagent-adddir-home-'))})
+	const addBundle = makeApi({spoolDir: join(addRoot, 'spool'), session: addSession, runtime: addRuntime.runtime});
+	mod(addBundle.api, addRuntime.runtime);
+	const addDirCommand = addBundle.commandDefs.find((def) => def.name === 'add-dir');
+	assert.ok(addDirCommand !== undefined, '/add-dir is registered');
+	const addResult = addDirCommand.handler({args: addedDir});
+	assert.match(String(addResult.message), /1 definition\(s\) loaded/, 'the command reports the loaded count');
+	const addSpawn = await toolOf(addBundle, 'subagent_spawn').run({
+		input: {description: 'added', prompt: 'go', subagent_type: 'added'},
+	});
+	assert.equal(addSpawn.ok, true, JSON.stringify(addSpawn));
+	assert.equal(JSON.parse(addRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).agentType, 'added', 'the added definition is spawnable');
+	ok('/add-dir loads agents from the added directory');
+
+	// 95. the parent sets timers only through the host clock or the runtime seam.
+	const clockRoot = mkdtempSync(join(tmpdir(), 'subagent-clock-'));
+	const clockSession = makeSession();
+	const laterCalls = [];
+	const clock = makeRuntime({
+		now: () => fixedNow,
+		later: (ms, fn) => laterCalls.push({ms, fn}),
+	});
+	const clockBundle = makeApi({spoolDir: clockRoot, session: clockSession, runtime: clock.runtime});
+	mod(clockBundle.api, clock.runtime);
+	writeFileSync(
+		join(clockRoot, 'jobs', 'clocked.json'),
+		JSON.stringify({
+			id: 'clocked',
+			state: 'running',
+			startedAt: fixedNow,
+			pid: 1111,
+			workerPid: 2222,
+			owner: ownerEntries(clockSession)[0],
+		}),
+	);
+	clockBundle.api.clock.after = () => {
+		throw new Error('the host has no clock');
+	};
+	const canceledBySeam = await toolOf(clockBundle, 'subagent_cancel').run({input: {id: 'clocked'}});
+	assert.equal(canceledBySeam.ok, true, JSON.stringify(canceledBySeam));
+	assert.equal(laterCalls.length, 1, 'the SIGKILL escalation uses the runtime timer seam');
+	assert.equal(laterCalls[0].ms, 1000, 'after one second');
+	laterCalls[0].fn();
+	assert.equal(clock.kills.filter((kill) => kill.signal === 'SIGKILL').length, 2, 'the escalation kills both pids');
+	const modText = modSource();
+	const workerTextStart = modText.indexOf('const WORKER_SOURCE = `');
+	const workerTextEnd = modText.indexOf('\n`;', workerTextStart);
+	const parentText = modText.slice(0, workerTextStart) + modText.slice(workerTextEnd + 4);
+	const adapterStart = parentText.indexOf('const OS_RUNTIME');
+	const adapterEnd = parentText.indexOf('// The test adapter', adapterStart);
+	const outsideAdapter = parentText.slice(0, adapterStart) + parentText.slice(adapterEnd);
+	assert.ok(!outsideAdapter.includes('Date.now('), 'the parent reads the clock only through runtime.now');
+	assert.ok(!/\bsetTimeout\(/.test(outsideAdapter), 'the parent sets timers only through the host clock or runtime.later');
+	ok('the parent clock and timers go through the runtime seam');
+
+	// 96. retention keeps a changed worktree and removes only a clean one, through git.
+	const worktreeRetRoot = mkdtempSync(join(tmpdir(), 'subagent-wt-retention-'));
+	const worktreeGitCalls = [];
+	const worktreeRetRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {...process.env, CLAUDE_CODE_CLEANUP_PERIOD_DAYS: '1'},
+		run(command, args, options) {
+			worktreeGitCalls.push({args, cwd: options?.cwd});
+			if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not git'};
+			if (args.includes('--show-toplevel')) return {ok: true, code: 0, stdout: `/repo\n`, stderr: ''};
+			if (args.includes('--git-common-dir')) return {ok: true, code: 0, stdout: '/repo/.git\n', stderr: ''};
+			if (args[0] === 'status') {
+				const dirty = String(options?.cwd ?? '').includes('changed-job') ? '?? notes.txt\n' : '';
+				return {ok: true, code: 0, stdout: dirty, stderr: ''};
+			}
+			return {ok: true, code: 0, stdout: '', stderr: ''};
+		},
+	}).runtime;
+	const worktreeRetBundle = makeApi({spoolDir: worktreeRetRoot, session: makeSession(), runtime: worktreeRetRuntime});
+	mod(worktreeRetBundle.api, worktreeRetRuntime);
+	const retentionOldAt = fixedNow - 2 * day;
+	for (const id of ['clean-job', 'changed-job']) {
+		mkdirSync(join(worktreeRetRoot, 'worktrees', id), {recursive: true});
+		writeFileSync(join(worktreeRetRoot, 'worktrees', id, 'file.txt'), 'work\n');
+		writeFileSync(
+			join(worktreeRetRoot, 'jobs', `${id}.json`),
+			JSON.stringify({
+				id,
+				state: 'done',
+				startedAt: retentionOldAt,
+				finishedAt: retentionOldAt,
+				worktree: join(worktreeRetRoot, 'worktrees', id),
+				worktreeRepo: '/repo',
+			}),
+		);
+	}
+	worktreeRetBundle.registeredHooks.onSessionStart({source: 'resume', sessionId: 'wtr'});
+	const removals = worktreeGitCalls
+		.filter((call) => call.args[0] === 'worktree' && call.args[1] === 'remove')
+		.map((call) => call.args[3]);
+	assert.deepEqual(removals, [join(worktreeRetRoot, 'worktrees', 'clean-job')], 'only the clean worktree is removed');
+	assert.ok(existsSync(join(worktreeRetRoot, 'worktrees', 'changed-job')), 'the changed worktree and its files survive');
+	assert.equal(
+		worktreeGitCalls.find((call) => call.args[0] === 'worktree' && call.args[1] === 'remove').cwd,
+		'/repo',
+		'removal runs in the main checkout, so git also clears its metadata',
+	);
+	ok('retention keeps a changed worktree and removes a clean one through git');
+
+	// 97. a foreground isolated job finalizes its worktree before returning.
+	const fgRoot = mkdtempSync(join(tmpdir(), 'subagent-fg-iso-'));
+	const fgProject = mkdtempSync(join(tmpdir(), 'subagent-fg-project-'));
+	writeAgent(join(fgProject, '.commandcode', 'agents'), 'iso-fg.md', 'iso-fg', 'isolated', 'You are isolated.', {
+		isolation: 'worktree',
+	});
+	const foreIsoRuntime = makeRuntime({
+		now: () => fixedNow,
+		cwd: fgProject,
+		execPath: '/usr/bin/node',
+		env: {...process.env},
+		run(command, args, options) {
+			if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not git'};
+			if (args.includes('--show-toplevel')) return {ok: true, code: 0, stdout: `${fgProject}\n`, stderr: ''};
+			if (args.includes('--git-common-dir')) return {ok: true, code: 0, stdout: `${fgProject}/.git\n`, stderr: ''};
+			if (args[0] === 'symbolic-ref') return {ok: true, code: 0, stdout: 'origin/main\n', stderr: ''};
+			if (args[0] === 'status') return {ok: true, code: 0, stdout: '?? kept.txt\n', stderr: ''};
+			return {ok: true, code: 0, stdout: '', stderr: ''};
+		},
+		spawn(command, args, options) {
+			const spawned = JSON.parse(options.env.SUBAGENT_SPEC);
+			writeFileSync(
+				join(spawned.jobsDir, `${spawned.id}.json`),
+				JSON.stringify({
+					id: spawned.id,
+					agentId: spawned.agentId,
+					description: spawned.description,
+					kind: 'agent',
+					state: 'done',
+					cwd: spawned.cwd,
+					worktree: spawned.worktree,
+					worktreeRepo: fgProject,
+					logPath: spawned.logPath,
+					startedAt: spawned.startedAt,
+					finishedAt: fixedNow,
+					owner: spawned.owner,
+					agentType: spawned.agentType,
+					background: false,
+				}),
+			);
+			writeFileSync(spawned.logPath, 'finished in the worktree\n');
+			return makeChild();
+		},
+	});
+	const foreIsoBundle = makeApi({spoolDir: fgRoot, session: makeSession(), runtime: foreIsoRuntime.runtime});
+	mod(foreIsoBundle.api, foreIsoRuntime.runtime);
+	const fgSpawn = await toolOf(foreIsoBundle, 'subagent_spawn').run({
+		input: {description: 'foreground iso', prompt: 'go', subagent_type: 'iso-fg', run_in_background: false},
+	});
+	assert.equal(fgSpawn.ok, true, JSON.stringify(fgSpawn));
+	const fgText = String(fgSpawn.content[0].text);
+	assert.match(fgText, /finished in the worktree/, 'the foreground result is returned');
+	assert.match(fgText, /worktree kept at/, 'a changed worktree is reported in the foreground result');
+	const fgJobFile = readdirSync(join(fgRoot, 'jobs')).find((name) => name.endsWith('.json') && !name.includes('.tmp-'));
+	const foreIsoRecord = JSON.parse(readFileSync(join(fgRoot, 'jobs', fgJobFile), 'utf8'));
+	assert.equal(foreIsoRecord.worktreeFinalized, true, 'the foreground path finalizes the worktree');
+	assert.equal(foreIsoRecord.worktreeKept, true, 'and records that it was kept');
+	ok('a foreground isolated job finalizes and reports its worktree');
+
+	// 98. a nested spawn keeps the parent's owner token.
+	const nestRoot = mkdtempSync(join(tmpdir(), 'subagent-nested-owner-'));
+	for (const dir of ['jobs', 'inbox', 'logs']) mkdirSync(join(nestRoot, dir), {recursive: true});
+	const nestSpec = {
+		id: 'parent-job',
+		owner: 'owner-parent',
+		name: 'Parent',
+		kind: 'agent',
+		cwd: nestRoot,
+		jobsDir: join(nestRoot, 'jobs'),
+		inboxDir: join(nestRoot, 'inbox'),
+		logPath: join(nestRoot, 'logs', 'parent.log'),
+		startedAt: fixedNow,
+		tailMax: 1000,
+		rosterNames: [],
+	};
+	const nestRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(nestSpec)},
+	});
+	const nestBundle = makeApi({spoolDir: nestRoot, session: makeSession(), runtime: nestRuntime.runtime});
+	mod(nestBundle.api, nestRuntime.runtime);
+	const nestedSpawn = await toolOf(nestBundle, 'subagent_spawn').run({
+		input: {description: 'child', prompt: 'go', subagent_type: 'general-purpose'},
+	});
+	assert.equal(nestedSpawn.ok, true, JSON.stringify(nestedSpawn));
+	const nestedSpec = JSON.parse(nestRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(nestedSpec.owner, 'owner-parent', 'the nested job carries the parent session owner');
+	assert.equal(
+		JSON.parse(readFileSync(join(nestRoot, 'jobs', `${nestedSpec.id}.json`), 'utf8')).owner,
+		'owner-parent',
+		'and so does its record',
+	);
+	ok('nested spawn keeps the parent owner token, so its result is not foreign');
+
+	// 99. the background filter never removes Agent or plan-mode ExitPlanMode.
+	const planBackground = modExports.filterTools({
+		tools: ['Agent', 'ExitPlanMode', 'Read', 'ListAgents'],
+		permissionMode: 'plan',
+		background: true,
+	});
+	assert.equal(planBackground.ok, true, JSON.stringify(planBackground));
+	assert.ok(planBackground.tools.includes('Agent'), 'a background agent keeps Agent to report its depth error');
+	assert.ok(planBackground.tools.includes('ExitPlanMode'), 'plan mode keeps ExitPlanMode in the background');
+	assert.ok(!planBackground.tools.includes('ListAgents'), 'ListAgents stays foreground-only');
+	const defaultBackground = modExports.filterTools({
+		tools: ['Agent', 'ExitPlanMode'],
+		permissionMode: 'default',
+		background: true,
+	});
+	assert.ok(defaultBackground.tools.includes('Agent'), 'Agent survives every background filter');
+	assert.ok(!defaultBackground.tools.includes('ExitPlanMode'), 'ExitPlanMode still follows the first filter');
+	ok('the background filter exempts Agent and plan-mode ExitPlanMode');
+
+	// 100. walk-up stops at a linked worktree root, where `.git` is a file.
+	const outerRepo = mkdtempSync(join(tmpdir(), 'subagent-outer-repo-'));
+	const linkedWt = join(outerRepo, 'wt');
+	writeAgent(join(outerRepo, '.commandcode', 'agents'), 'outer.md', 'outer', 'outer agent', 'OUTER');
+	writeAgent(join(linkedWt, 'sub', '.commandcode', 'agents'), 'inner.md', 'inner', 'inner agent', 'INNER');
+	writeFileSync(join(linkedWt, '.git'), 'gitdir: /repo/.git/worktrees/wt\n');
+	writeFileSync(join(outerRepo, 'CLAUDE.md'), 'OUTER RULES\n');
+	writeFileSync(join(linkedWt, 'CLAUDE.md'), 'WORKTREE RULES\n');
+	const linkedHome = mkdtempSync(join(tmpdir(), 'subagent-linked-home-'));
+	const linkedWtRuntime = makeRuntime({now: () => fixedNow, cwd: join(linkedWt, 'sub'), home: linkedHome}).runtime;
+	const linkedBundle = makeApi({spoolDir: join(outerRepo, 'spool'), session: makeSession(), runtime: linkedWtRuntime});
+	mod(linkedBundle.api, linkedWtRuntime);
+	const linkedAgents = await toolOf(linkedBundle, 'subagent_agents').run({input: {}});
+	const linkedText = String(linkedAgents.content[0].text);
+	assert.match(linkedText, /inner · project/, 'the nearest project definition loads');
+	assert.ok(!/outer · project/.test(linkedText), 'a `.git` file stops the walk before the outer checkout');
+	const linkedHierarchy = modExports.claudeMdHierarchy({
+		cwd: join(linkedWt, 'sub'),
+		home: linkedHome,
+		fs: realFs,
+		env: {},
+	});
+	const linkedRules = linkedHierarchy.claudeMd.map((file) => file.content).join('\n');
+	assert.match(linkedRules, /WORKTREE RULES/, 'the worktree CLAUDE.md loads');
+	assert.ok(!/OUTER RULES/.test(linkedRules), 'the outer checkout CLAUDE.md is not loaded through a worktree root');
+	ok('walk-up stops at a linked worktree root whose .git is a file');
+
+	// 101. omitClaudeMd keeps managed policy except for a managed agent.
+	const omitHome = mkdtempSync(join(tmpdir(), 'subagent-omit-home-'));
+	mkdirSync(join(omitHome, '.commandcode', 'managed'), {recursive: true});
+	writeFileSync(join(omitHome, '.commandcode', 'managed', 'CLAUDE.md'), 'MANAGED POLICY\n');
+	writeFileSync(join(omitHome, '.commandcode', 'CLAUDE.md'), 'USER RULES\n');
+	const omitCwd = mkdtempSync(join(tmpdir(), 'subagent-omit-cwd-'));
+	writeFileSync(join(omitCwd, 'CLAUDE.md'), 'PROJECT RULES\n');
+	const omitBase = {cwd: omitCwd, home: omitHome, fs: realFs, env: {}, now: fixedNow, prompt: 'go'};
+	const managedAgent = modExports.buildStartupBundle({
+		...omitBase,
+		definition: {name: 'managed-agent', scope: 'managed', omitClaudeMd: true},
+	});
+	const managedRules = managedAgent.claudeMd.map((file) => file.content).join('\n');
+	assert.ok(!/MANAGED POLICY/.test(managedRules), 'a managed agent does not load managed policy');
+	assert.ok(!/USER RULES/.test(managedRules) && !/PROJECT RULES/.test(managedRules), 'nor the user or project files');
+	const projectAgent = modExports.buildStartupBundle({
+		...omitBase,
+		definition: {name: 'project-agent', scope: 'project', omitClaudeMd: true},
+	});
+	const projectRules = projectAgent.claudeMd.map((file) => file.content).join('\n');
+	assert.match(projectRules, /MANAGED POLICY/, 'a project agent keeps managed policy under omitClaudeMd');
+	assert.ok(!/USER RULES/.test(projectRules) && !/PROJECT RULES/.test(projectRules), 'and skips the user and project files');
+	ok('omitClaudeMd keeps managed policy except for a managed agent');
+
+	// 102. auto resolves to ACP's prompting mode and records the deviation.
+	const autoDir = mkdtempSync(join(tmpdir(), 'subagent-auto-mode-'));
+	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(autoDir, dir), {recursive: true});
+	const autoModeLog = join(autoDir, 'modes.jsonl');
+	const autoBin = join(autoDir, 'fake-acp.mjs');
+	writeFileSync(
+		autoBin,
+		`#!/usr/bin/env node
+import {appendFileSync} from 'node:fs';
+let buffer = '';
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') send({id: message.id, result: {protocolVersion: 1}});
+    else if (message.method === 'session/new') send({id: message.id, result: {sessionId: 'acp-auto', configOptions: []}});
+    else if (message.method === 'session/set_mode') {
+      appendFileSync(${JSON.stringify(autoModeLog)}, JSON.stringify(message.params) + '\\n');
+      send({id: message.id, result: {}});
+    } else if (message.method === 'session/set_config_option') send({id: message.id, result: {}});
+    else if (message.method === 'session/prompt') {
+      send({id: message.id, result: {stopReason: 'end_turn'}});
+      setTimeout(() => process.exit(0), 20);
+    }
+  }
+});
+`,
+	);
+	chmodSync(autoBin, 0o755);
+	const autoSpec = modExports.buildSpec(
+		{
+			id: 'auto-job',
+			description: 'auto',
+			kind: 'agent',
+			owner: 'owner-auto',
+			cwd: autoDir,
+			logPath: join(autoDir, 'logs', 'auto-job.log'),
+			inboxDir: join(autoDir, 'inbox'),
+			jobsDir: join(autoDir, 'jobs'),
+			startedAt: fixedNow,
+			tailMax: 4000,
+			bin: autoBin,
+			prompt: 'go',
+			agentType: 'general-purpose',
+			permissionMode: 'auto',
+		},
+		'/mod.ts',
+	);
+	writeFileSync(join(autoDir, 'jobs', 'auto-job.json'), JSON.stringify({id: 'auto-job', state: 'queued'}));
+	const autoChild = spawn(process.execPath, ['-e', workerSource()], {
+		cwd: autoDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(autoSpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	await new Promise((resolve) => autoChild.on('exit', resolve));
+	const autoModes = readFileSync(autoModeLog, 'utf8')
+		.trim()
+		.split('\n')
+		.filter(Boolean)
+		.map((line) => JSON.parse(line));
+	assert.equal(autoModes.length, 1, 'one mode was set');
+	assert.equal(autoModes[0].modeId, 'default', 'auto uses the prompting mode because ACP has no classifier');
+	assert.match(
+		readFileSync(join(autoDir, 'logs', 'auto-job.log'), 'utf8'),
+		/permissionMode auto -> default/,
+		'the deviation is recorded in the job log',
+	);
+	ok('auto permission mode maps to the prompting mode and logs the deviation');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

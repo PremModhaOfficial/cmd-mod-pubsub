@@ -68,9 +68,9 @@ A definition's location determines its scope. Higher priority wins when names co
 | 4 | User | `~/.commandcode/agents/**/*.md` | All projects |
 | 5 | Plugin | A plugin's `agents/` directory | Where the plugin is enabled |
 
-- Project discovery MUST walk up from the working directory to the repository root and scan every `.commandcode/agents/` on the way.
+- Project discovery MUST walk up from the working directory to the repository root and scan every `.commandcode/agents/` on the way. A repository root is the directory holding `.git`, whether that is a directory or a linked worktree's `.git` file.
 - When nested project directories define the same name, the definition closest to the working directory MUST win.
-- `--add-dir` and `/add-dir` MUST also load `.commandcode/agents/` from the added directory.
+- `--add-dir` and `/add-dir` MUST also load `.commandcode/agents/` from the added directory. The host exposes no `/add-dir`, so the mod registers the `add-dir` command; it appends the path to the same list the flag fills and rescans without a restart.
 - Project, user, and plugin directories MUST be scanned recursively. Subdirectories do not change a project or user identity.
 - A plugin subdirectory DOES become part of the scoped identifier: `agents/review/security.md` in plugin `my-plugin` registers as `my-plugin:review:security`.
 - Duplicate names in one directory MUST load one definition, chosen by read order. `/doctor` MUST report the duplicate and propose a rename or removal.
@@ -161,6 +161,8 @@ The second filter applies to background subagents. Apart from `Agent` and `ExitP
 
 Every other built-in tool is removed from a background agent, whether inherited or listed. The removal reports no error unless it leaves `tools` resolving to nothing. Teammates in agent teams additionally keep the task and cron tools. `ListAgents` is visible to a foreground agent when cross-session messaging is enabled and is not kept by a background agent.
 
+The resolved set is enforced where the tools run. ACP exposes no per-session tool filter, so the worker's `beforeToolCall` blocks any tool outside the resolved set, and the mod's own names match their specifiers (`subagent_spawn` is `Agent`, `subagent_send` is `SendMessage`). The worker also owns the definition's `PreToolUse`, `PostToolUse`, and `Stop` hooks, which run in the same place.
+
 ### Model resolution
 
 1. The per-invocation `model` parameter.
@@ -187,7 +189,7 @@ Every other built-in tool is removed from a background agent, whether inherited 
 
 - When the main conversation is in `bypassPermissions`, `acceptEdits`, or auto mode, the subagent runs in that mode and the definition's `permissionMode` is ignored.
 - When the main conversation is in `default`, `dontAsk`, or `plan`, the subagent runs in the definition's mode, except that `bypassPermissions` still requires the main conversation to be in it.
-- Auto mode's classifier MUST evaluate the subagent's tool calls and review its final report before delivery.
+- Auto mode's classifier MUST evaluate the subagent's tool calls and review its final report before delivery. The host classifier has no ACP mode, so the worker runs `auto` in the prompting (`default`) mode: nothing is auto-allowed, and the job log records the deviation once (ADR 0001). The final-report review is host-owned and is not reproduced.
 - `dontAsk` MUST still allow explicit allow rules and tools marked as requiring user interaction.
 - Permission prompts follow the foreground/background rules below.
 
@@ -298,7 +300,8 @@ queued -> running -> waiting-input | done | failed | canceled
 - Bash and PowerShell commands inside the subagent MUST run in that worktree.
 - A command whose working directory resolves to the main checkout MUST fail. This covers the whole repository containing the launch directory and, when the session runs in a linked worktree, the main checkout it links from.
 - Bash commands MUST also be checked for redirect vectors and command-shape rules that escape the worktree. PowerShell gets the working-directory check. Monitor commands get both checks.
-- A worktree with no changes MUST be removed automatically. A worktree with changes MUST be kept and its path reported.
+- A worktree with no changes MUST be removed automatically. A worktree with changes MUST be kept and its path reported. A foreground run makes the same decision before it returns, so its result carries a kept path.
+- Retention MUST preserve a changed worktree and its git metadata. It removes only a clean worktree, through `git worktree remove`, never by deleting the directory, and never one whose git state it cannot read.
 - When the main conversation itself runs isolated in a worktree, the same checks apply to the session and to every subagent it spawns, including subagents without `isolation: worktree`.
 
 ## Context and persistence
@@ -310,7 +313,7 @@ queued -> running -> waiting-input | done | failed | canceled
 - The CLAUDE.md hierarchy: user, project, local, managed policy, and AGENTS.md loaded as project instructions.
 - A git status snapshot, unless it is turned off or the agent is Explore or Plan.
 - The full content of every skill named in `skills`.
-- A sibling roster of `main` and every other named agent, when the agent has `SendMessage` and at least one other agent has a name. The roster is a snapshot taken at start.
+- A sibling roster of `main` and every other named agent, when the agent has `SendMessage`. `main` is always addressable, so the roster is never empty. The roster is a snapshot taken at start.
 - No parent conversation history, except for a fork.
 - No parent auto memory. `memory` gives the agent its own.
 - The agent's own output style; a fork uses the conversation's.
@@ -412,77 +415,132 @@ Compatibility:
 
 ## Data contracts
 
+These are the shapes the mod actually constructs and persists: `AgentDefinition`
+and `AgentEntry` are the loaded-registry shapes, `Job` is one on-disk
+`jobs/<id>.json` record, and `Signal` is one `inbox/` envelope. A job record and
+its signal share `JobIdentity`, so the two cannot drift.
+
 ```ts
+type AgentScope = 'managed' | 'cli' | 'project' | 'user' | 'plugin' | 'builtin';
+
 type AgentDefinition = {
   name: string;
   description: string;
-  prompt: string;
-  scope: 'managed' | 'cli' | 'project' | 'user' | 'plugin';
+  prompt: string;                 // the Markdown body, used as the system prompt
+  scope: AgentScope;
   sourcePath?: string;
+  plugin?: string;                // the plugin that supplied the file
   tools?: string[];
   disallowedTools?: string[];
   model?: string;
-  permissionMode?: 'default' | 'acceptEdits' | 'auto' | 'dontAsk' | 'bypassPermissions' | 'plan' | 'manual';
+  permissionMode?: string;
   maxTurns?: number;
-  autoCompactWindow?: number;
   skills?: string[];
-  mcpServers?: Array<string | Record<string, unknown>>;
-  hooks?: Record<string, unknown>;
+  mcpServers?: AgentMcpServer[];
+  hooks?: AgentHooks;             // PreToolUse / PostToolUse / Stop rules
   memory?: 'user' | 'project' | 'local';
   background?: boolean;
   omitClaudeMd?: boolean;
-  effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-  isolation?: 'worktree';
-  color?: 'red' | 'blue' | 'green' | 'yellow' | 'purple' | 'orange' | 'pink' | 'cyan';
+  effort?: string;
+  isolation?: string;
+  color?: string;
   initialPrompt?: string;
-  experimental?: { cacheTtl?: '5m' | '1h' };
+  autoCompactWindow?: number;
+  cacheTtl?: '5m' | '1h';
+  readOnly?: boolean;             // built-in: Write and Edit denied
+  oneShot?: boolean;              // Explore/Plan: no agent id, no resume
+  fork?: boolean;                 // the `fork` type inherits the conversation
 };
 
-type Job = {
+type AgentEntry = {
+  name: string;
+  scope: AgentScope;
+  sourcePath: string;
+  valid: boolean;
+  kind: 'valid' | 'invalid' | 'duplicate';
+  reason?: string;
+  warning?: string;
+  duplicateOf?: string;           // for a duplicate: the file that was kept
+  definition?: AgentDefinition;
+};
+
+type JobIdentity = {
   id: string;
-  agentId?: string;
-  name?: string;
-  teamName?: string;
-  owner: string;
-  sessionId: string;
-  agentType: string;
-  description: string;
-  prompt?: string;
+  agentId?: string;               // the durable resume handle; absent for a one-shot
+  owner?: string;
+  description?: string;           // the spawn's human name for the job
+  kind?: string;                  // command | agent | fork | message | note
+  state?: string;
+  startedAt?: number;
+  finishedAt?: number;
+  durationMs?: number;
+  logPath?: string;
+  sessionId?: string;
+};
+
+type Job = JobIdentity & {
   command?: string;
-  state: 'queued' | 'running' | 'waiting-input' | 'done' | 'failed' | 'canceled';
-  pid?: number;
-  workerPid?: number;
-  workerSessionId?: string;
-  cwd: string;
-  worktree?: string;
-  depth: number;
+  prompt?: string;
+  cwd?: string;
+  transcriptPath?: string;
+  partial?: boolean;
+  compactBoundary?: {trigger: 'auto' | 'manual'; preTokens: number; at: number};
+  depth?: number;
   parentJobId?: string;
+  agentType?: string;
+  name?: string;                  // the addressable name from the spawn
+  fork?: boolean;
+  mainSessionId?: string;
+  forkSessionId?: string;
+  promptCache?: 'shared' | 'own';
+  teamName?: string;
+  backgroundedAt?: number;
+  handbackAt?: number;
+  background?: boolean;           // the resolved policy, not the raw request
   model?: string;
+  tools?: string[];
+  mcpServers?: AgentMcpServer[];
+  autoCompactWindow?: number;
+  cacheTtl?: '5m' | '1h';
+  color?: string;
+  maxTurns?: number;
+  timeoutMs?: number;
+  sessionName?: string;           // the host fork name (`-n`)
+  resumedFrom?: string;
+  acpSessionId?: string;          // the ACP session a resume targets
   effort?: string;
   permissionMode?: string;
-  startedAt: number;
-  endedAt?: number;
+  isolation?: string;
+  worktree?: string;
+  worktreeRepo?: string;
+  mainCheckouts?: string[];
+  subagentStopHook?: boolean;
+  worktreeFinalized?: boolean;
+  worktreeKept?: boolean;
   exitCode?: number;
-  logPath: string;
-  signalPath?: string;
-  partial?: boolean;
-};
-
-type Signal = {
-  kind: 'subagent';
-  jobId: string;
-  agentId?: string;
-  name?: string;
-  owner: string;
-  state: Job['state'];
-  exitCode?: number;
-  durationMs?: number;
-  logTail?: string;
-  error?: string;
+  pid?: number;
+  workerPid?: number;
+  deliveredAt?: number;
+  updatedAt?: number;
+  failureReason?: string;
+  canceledAt?: number;
+  awaitingInput?: boolean;
   question?: string;
-  partial?: boolean;
+  permissionRequest?: PermissionRequest;
   scanned?: boolean;
   scanMatches?: string[];
+};
+
+type Signal = JobIdentity & {
+  exitCode?: number | null;
+  title?: string;
+  body?: string;                  // the scanned report, log tail, or message
+  scanned?: boolean;
+  scanMatches?: string[];
+  question?: string;
+  permissionRequest?: PermissionRequest;
+  partial?: boolean;              // a maxTurns / max_tokens stop
+  compactBoundary?: {trigger: 'auto' | 'manual'; preTokens: number; at: number};
 };
 ```
 
@@ -541,7 +599,7 @@ Claude Code aliases SHOULD be accepted so a user can move between the two tools 
 
 ## Acceptance tests
 
-Status on 2026-10-20: every check below passes. `node test/smoke.mjs` is 88 checks green; the real-host checks also pass in `node test/e2e.mjs`. The number names the smoke check; `e2e` names the end-to-end step. A behavior the host or ACP cannot expose is recorded as a deviation in `docs/adr/0001-worker-and-control.md`, not dropped.
+Status on 2026-10-20: every check below passes. `node test/smoke.mjs` is 102 checks green; the real-host checks also pass in `node test/e2e.mjs`. The number names the smoke check; `e2e` names the end-to-end step. A behavior the host or ACP cannot expose is recorded as a deviation in `docs/adr/0001-worker-and-control.md`, not dropped.
 
 Scope and definitions:
 
