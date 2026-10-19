@@ -130,10 +130,10 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
   `Human:`, `Assistant:`)
 - [x] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
   (smoke 37-39; permission mentions are marked and left as written; failed signals carry the tail)
-- [ ] Map `permissionMode` to the worker CLI flags.
-- [ ] Put a worker that needs approval into `waiting-input`.
-- [ ] Signal the parent with the question or the approval request.
-- [ ] Do not hang the worker.
+- [x] Map `permissionMode` to the worker CLI flags. (T5: `permissionModes` table; smoke 53-54)
+- [x] Put a worker that needs approval into `waiting-input`. (smoke 55)
+- [x] Signal the parent with the question or the approval request. (smoke 55, 58-59)
+- [x] Do not hang the worker. (bounded inline wait, then `waiting-input`; smoke 56)
 - Gate: scanning and `waiting-input` tests pass.
 
 ## Phase 9: UI and persistence
