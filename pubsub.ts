@@ -76,7 +76,6 @@ const PANE_ROWS_MAX = 12;
 const PENDING_SCAN_MAX = 500;
 const OWNER_TYPE = 'pubsub/owner';
 
-const TERMINAL_STATES = new Set(['waiting-input', 'done', 'failed', 'canceled']);
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -342,12 +341,115 @@ interface JobPatch {
 	awaitingInput?: boolean;
 }
 
-// Legacy state aliases are normalized in exactly one place.
-function canonicalState(value: unknown): string {
-	const state = String(value ?? 'unknown');
-	if (state === 'completed' || state === 'agent-done' || state === 'command-done') return 'done';
-	return state;
+// ---------------------------------------------------------------------------
+// Job states
+//
+// The six states and their edges in one table. Every writer asks this table
+// instead of spelling a state string, an edge that is not in the table is
+// rejected, and a state the table does not know renders as a warning - never as
+// a silent dot.
+// ---------------------------------------------------------------------------
+
+const JOB_STATES = ['queued', 'running', 'waiting-input', 'done', 'failed', 'canceled'] as const;
+type JobState = (typeof JOB_STATES)[number];
+
+// A signal may also carry a note (pubsub_send), which is not a job state.
+type SignalState = JobState | 'note';
+
+// Legacy aliases, normalized in exactly one place.
+const STATE_ALIASES: Readonly<Record<string, JobState>> = {
+	completed: 'done',
+	'agent-done': 'done',
+	'command-done': 'done',
+};
+
+const STATE_TRANSITIONS: Readonly<Record<JobState, readonly JobState[]>> = {
+	queued: ['running', 'failed', 'canceled'],
+	running: ['waiting-input', 'done', 'failed', 'canceled'],
+	'waiting-input': [],
+	done: [],
+	failed: [],
+	canceled: [],
+};
+
+const STATE_MARKERS: Readonly<Record<SignalState, string>> = {
+	queued: '◌',
+	running: '●',
+	'waiting-input': '?',
+	done: '✓',
+	failed: '✗',
+	canceled: '⊘',
+	note: '◈',
+};
+
+const STATE_COLORS: Readonly<Record<SignalState, string>> = {
+	queued: 'gray',
+	running: 'cyan',
+	'waiting-input': 'yellow',
+	done: 'green',
+	failed: 'red',
+	canceled: 'gray',
+	note: 'gray',
+};
+
+function isState(value: unknown): value is JobState {
+	return typeof value === 'string' && (JOB_STATES as readonly string[]).includes(value);
 }
+
+// Alias in, state out. One normalization point for every reader and writer.
+function normalizeState(value: unknown): JobState | undefined {
+	if (typeof value !== 'string' || value.length === 0) return undefined;
+	const alias = STATE_ALIASES[value];
+	if (alias !== undefined) return alias;
+	return isState(value) ? value : undefined;
+}
+
+function isSignalState(value: unknown): value is SignalState {
+	return value === 'note' || isState(value);
+}
+
+function canTransition(from: JobState, to: JobState): boolean {
+	// Writing the state a job already has is not a transition; every other edge must
+	// be in the table.
+	if (from === to) return true;
+	return STATE_TRANSITIONS[from].includes(to);
+}
+
+function isTerminal(state: JobState): boolean {
+	return STATE_TRANSITIONS[state].length === 0;
+}
+
+// Terminal for a value that may be a legacy alias or an unknown string.
+function isTerminalState(value: unknown): boolean {
+	const state = normalizeState(value);
+	return state !== undefined && isTerminal(state);
+}
+
+// Display: a legacy alias shows as its state, an unknown value shows as itself so
+// it cannot hide.
+function canonicalState(value: unknown): string {
+	return normalizeState(value) ?? String(value ?? 'unknown');
+}
+
+function stateMarker(state: unknown): string {
+	return isSignalState(state) ? STATE_MARKERS[state] : '⚠';
+}
+
+function stateColor(state: unknown): string {
+	return isSignalState(state) ? STATE_COLORS[state] : 'red';
+}
+
+// Exported for the tests, which assert edges rather than inferring them from
+// English. The harness never reads it.
+export const jobStates = {
+	list: JOB_STATES,
+	isState,
+	normalize: normalizeState,
+	canTransition,
+	isTerminal,
+	marker: stateMarker,
+	color: stateColor,
+};
 
 // ---------------------------------------------------------------------------
 // Envelope
@@ -567,6 +669,19 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		} catch {
 			/* the in-memory list still shows it */
 		}
+	}
+
+	// One state-change choke point for the parent. The durable record is the source of
+	// truth, so a stale in-memory copy cannot skip a step, and an edge the state table
+	// does not allow is rejected instead of written.
+	function applyPatch(id: string, patch: JobPatch, fallback: JobRecord, stamp: number): boolean {
+		const current = readJob(id) ?? fallback;
+		const from = normalizeState(current.state);
+		const to = patch.state === undefined ? from : normalizeState(patch.state);
+		if (patch.state !== undefined && to === undefined) return false;
+		if (from !== undefined && to !== undefined && !canTransition(from, to)) return false;
+		writeJob({...current, ...patch, ...(to !== undefined ? {state: to} : {}), updatedAt: stamp});
+		return true;
 	}
 
 	function readRecentJobs(limit: number): JobRecord[] {
@@ -826,22 +941,26 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (workerMode) return;
 		const now = runtime.now();
 		for (const job of readRecentJobs(RECONCILE_SCAN_MAX)) {
-			const state = canonicalState(job.state);
+			const state = normalizeState(job.state);
 			if (state === 'queued' || state === 'running') {
 				if (runtime.alive(job.pid) || runtime.alive(job.workerPid)) continue;
 				if (hasPendingSignal(job.id)) continue;
 				const startedAt = Number(job.startedAt ?? 0) || 0;
 				if (now - startedAt < LOST_GRACE_MS) continue;
-				job.state = 'failed';
-				job.failureReason = state === 'queued' ? 'worker never started' : 'lost (no live process)';
-				job.finishedAt = now;
-				job.durationMs = Math.max(0, now - startedAt);
-				job.updatedAt = now;
-				writeJob(job);
-			} else if (state !== job.state) {
-				job.state = state;
-				job.updatedAt = now;
-				writeJob(job);
+				applyPatch(
+					job.id,
+					{
+						state: 'failed',
+						failureReason: state === 'queued' ? 'worker never started' : 'lost (no live process)',
+						finishedAt: now,
+						durationMs: Math.max(0, now - startedAt),
+					},
+					job,
+					now,
+				);
+			} else if (state !== undefined && state !== job.state) {
+				// A legacy alias is rewritten as its state, once.
+				applyPatch(job.id, {state}, job, now);
 			}
 		}
 	}
@@ -911,40 +1030,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
-	function stateMarker(state: string): string {
-		switch (state) {
-			case 'queued':
-				return '◌';
-			case 'running':
-				return '●';
-			case 'waiting-input':
-				return '?';
-			case 'done':
-				return '✓';
-			case 'failed':
-				return '✗';
-			case 'canceled':
-				return '⊘';
-			default:
-				return '·';
-		}
-	}
-
-	function stateColor(state: string): string {
-		switch (state) {
-			case 'running':
-				return 'cyan';
-			case 'waiting-input':
-				return 'yellow';
-			case 'done':
-				return 'green';
-			case 'failed':
-				return 'red';
-			default:
-				return 'gray';
-		}
-	}
-
 	function listText(): string {
 		const jobs = readRecentJobs(LIST_SCAN_MAX);
 		const counts: Record<string, number> = {};
@@ -959,7 +1044,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			const state = canonicalState(job.state);
 			const exit = typeof job.exitCode === 'number' ? ` exit ${job.exitCode}` : '';
 			const duration = typeof job.durationMs === 'number' ? ` ${(job.durationMs / 1000).toFixed(1)}s` : '';
-			const unread = TERMINAL_STATES.has(state) && job.deliveredAt === undefined ? ' · unread' : '';
+			const unread = isTerminalState(state) && job.deliveredAt === undefined ? ' · unread' : '';
 			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${unread}`;
 		});
 		const orphanNote = orphaned > 0 ? ` ${orphaned} orphaned signal(s) quarantined.` : '';
@@ -981,8 +1066,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	function cancelJob(id: string): string {
 		const job = readJob(id);
 		if (job === undefined) return `pubsub: no job ${id}`;
-		const state = canonicalState(job.state);
-		if (TERMINAL_STATES.has(state)) return `pubsub: job ${id} is already ${state}`;
+		const state = normalizeState(job.state);
+		if (state !== undefined && isTerminal(state)) return `pubsub: job ${id} is already ${state}`;
 
 		const now = runtime.now();
 		const startedAt = Number(job.startedAt ?? now) || now;
@@ -995,7 +1080,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			},
 			{state: 'canceled', exitCode: null, finishedAt: now, durationMs: Math.max(0, now - startedAt), body: 'canceled by request'},
 		);
-		writeJob({...job, ...patchOf(signal), canceledAt: now, updatedAt: now});
+		if (!applyPatch(id, {...patchOf(signal), canceledAt: now}, job, now)) {
+			return `pubsub: job ${id} is already ${canonicalState(job.state)}`;
+		}
 
 		killPid(job.pid, 'SIGTERM');
 		killPid(job.workerPid, 'SIGTERM');
@@ -1171,7 +1258,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					durationMs: Math.max(0, now - startedAt),
 					body: reason,
 				});
-				writeJob({...record, ...patchOf(signal), updatedAt: now});
+				if (!applyPatch(id, patchOf(signal), record, now)) return {ok: false, error: reason};
 				enqueueSignal(signal);
 				refreshJobs();
 				return {ok: false, error: reason};
@@ -1182,7 +1269,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			// does not sit at `queued` forever.
 			worker.on('error', error => {
 				const current = readJob(id);
-				if (current !== undefined && canonicalState(current.state) === 'canceled') return;
+				if (current !== undefined && normalizeState(current.state) === 'canceled') return;
 				const now = runtime.now();
 				const reason = `worker spawn error: ${String((error as Error)?.message ?? error)}`;
 				const signal = signalOf(current ?? record, {
@@ -1191,7 +1278,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					durationMs: Math.max(0, now - startedAt),
 					body: reason,
 				});
-				writeJob({...(current ?? record), ...patchOf(signal), updatedAt: now});
+				// A terminal job keeps its result: no state change, and no phantom signal.
+				if (!applyPatch(id, patchOf(signal), current ?? record, now)) return;
 				enqueueSignal(signal);
 				refreshJobs();
 			});
@@ -1206,7 +1294,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					durationMs: Math.max(0, now - startedAt),
 					body: reason,
 				});
-				writeJob({...record, ...patchOf(signal), updatedAt: now});
+				if (!applyPatch(id, patchOf(signal), record, now)) return {ok: false, error: reason};
 				enqueueSignal(signal);
 				refreshJobs();
 				return {ok: false, error: reason};

@@ -20,7 +20,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod from '../pubsub.ts';
+import mod, {jobStates} from '../pubsub.ts';
 
 // ---------------------------------------------------------------- assertions
 
@@ -499,6 +499,77 @@ try {
 	);
 	assert.equal(u.userMessages.length, 0, 'nothing is delivered without a session');
 	ok('no session bound holds the signal instead of throwing');
+
+
+	// 13. job state machine -------------------------------------------------
+	assert.deepEqual(
+		[...jobStates.list],
+		['queued', 'running', 'waiting-input', 'done', 'failed', 'canceled'],
+		'the six states live in one table',
+	);
+	assert.equal(jobStates.isState('running'), true, 'a state in the table is a state');
+	assert.equal(jobStates.isState('teleported'), false, 'a state outside the table is not a state');
+	assert.equal(jobStates.normalize('completed'), 'done', 'legacy aliases normalize in one place');
+	assert.equal(jobStates.normalize('agent-done'), 'done');
+	assert.equal(jobStates.normalize('command-done'), 'done');
+	assert.equal(jobStates.normalize('done'), 'done', 'a canonical state normalizes to itself');
+	assert.equal(jobStates.normalize(undefined), undefined, 'a missing state is not invented');
+	assert.equal(jobStates.canTransition('queued', 'running'), true);
+	assert.equal(jobStates.canTransition('running', 'done'), true);
+	assert.equal(jobStates.canTransition('done', 'running'), false, 'a terminal state has no outgoing edge');
+	assert.equal(jobStates.canTransition('queued', 'done'), false, 'running cannot be skipped');
+	assert.equal(jobStates.canTransition('done', 'done'), true, 'writing the same state is not a transition');
+	assert.equal(jobStates.isTerminal('canceled'), true);
+	assert.equal(jobStates.isTerminal('queued'), false);
+	assert.equal(jobStates.marker('done'), '✓');
+	assert.equal(jobStates.marker('teleported'), '⚠', 'an unknown state is never a silent dot');
+	ok('state table: six states, one alias map, one edge rule');
+
+	// 14. an invalid transition is rejected ---------------------------------
+	const stateDir = mkdtempSync(join(tmpdir(), 'pubsub-state-'));
+	const stateSession = makeSession();
+	const stateRuntime = makeRuntime({now: () => fixedNow});
+	const s = makeApi({spoolDir: stateDir, session: stateSession, runtime: stateRuntime.runtime});
+	mod(s.api, s.runtime);
+	const stateFire = s.toolDefs.find((def) => def.schema.name === 'pubsub_fire');
+	const stateFired = await stateFire.run({input: {label: 'terminal', command: 'true'}});
+	assert.equal(stateFired.ok, true, 'the job is fired');
+	const stateSpec = JSON.parse(stateRuntime.spawnCalls[0].options.env.PUBSUB_SPEC);
+	const stateRecordPath = join(stateDir, 'jobs', `${stateSpec.id}.json`);
+
+	// The worker already wrote a terminal record ...
+	writeFileSync(
+		stateRecordPath,
+		JSON.stringify({
+			...JSON.parse(readFileSync(stateRecordPath, 'utf8')),
+			state: 'done',
+			exitCode: 0,
+			finishedAt: fixedNow,
+			durationMs: 3,
+		}),
+	);
+	const inboxBeforeError = readdirSync(join(stateDir, 'inbox')).length;
+	// ... and a late spawn error arrives afterwards.
+	stateRuntime.spawnCalls[0].child.emit('error', new Error('late spawn error'));
+	const afterError = JSON.parse(readFileSync(stateRecordPath, 'utf8'));
+	assert.equal(afterError.state, 'done', 'a terminal job is not dragged back to failed');
+	assert.equal(
+		readdirSync(join(stateDir, 'inbox')).length,
+		inboxBeforeError,
+		'a rejected transition emits no phantom signal',
+	);
+
+	// A state the table does not know is loud in the pane, not a dot.
+	writeFileSync(
+		join(stateDir, 'jobs', 'zz-teleported.json'),
+		JSON.stringify({id: 'zz-teleported', label: 'teleported', state: 'teleported', startedAt: fixedNow}),
+	);
+	s.everyTicks.find((tick) => tick.ms === 1000).fn();
+	const pane = s.paneDefs.find((def) => def.id === 'jobs');
+	const rendered = JSON.stringify(pane.render());
+	assert.ok(rendered.includes('⚠'), 'an unknown state renders as a warning marker');
+	assert.ok(rendered.includes('teleported'), 'and its raw state stays visible');
+	ok('an invalid transition is rejected and an unknown state is loud');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
