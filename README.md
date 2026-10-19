@@ -7,14 +7,14 @@ finishes its result **lands back in the session that fired it** as a separate me
 Neither side blocks. Nothing polls. The wake-up *is* the message arriving.
 
 ```
-you ──pubsub_fire──▶ detached worker  ──spool file──▶  drain  ──sendUserMessage──▶ you
-       (returns now)  (own process)                    (400ms)  (starts the turn)
+you ──subagent_spawn──▶ detached worker  ──spool file──▶  drain  ──sendUserMessage──▶ you
+       (returns now)     (own process)                    (400ms)  (starts the turn)
 ```
 
 ## Why
 
 `agent`, `task` and friends are fire-and-*wait*: the parent has to hold a turn open, poll, or ask for the
-result later. Every one of those costs a turn while nothing is happening. `pubsub` uses
+result later. Every one of those costs a turn while nothing is happening. This mod uses
 `cmd.sendUserMessage(...)` as the seam instead — it starts a turn when the session is idle and queues
 behind the active turn otherwise, so a result can arrive at any time without the model waiting on it.
 
@@ -25,6 +25,7 @@ one JSON file and exits. If a signal lands while no session is running, it is st
 
 - **Command Code 1.84+** (for `sendUserMessage({deliverAs})`, `session.appendCustomEntry` /
   `getCustomEntries`, and the `ui.pane` host surface)
+- A signed-in `cmd` for agent jobs, and `-r/--resume` support for `subagent_resume`
 - Node 22.18+ if you want to run the smoke test with native TypeScript type stripping (no build step)
 
 ## Install
@@ -44,28 +45,45 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `pubsub_fire` | `label`, plus **either** `command` **or** `prompt`, and optional `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a headless `cmd -p` in a fresh process. `cwd` defaults to the mod workspace root. |
-| `pubsub_send` | `title`, `body` | Publishes a signal into the agent loop of **this** session. The agent-to-agent channel: worker and peer agents signal a session so neither blocks or polls. Delivered as a visible user turn. |
-| `pubsub_list` | – | Fired jobs, their lifecycle states, unread results, and how many signals are still waiting for this session. |
-| `pubsub_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives a `canceled` signal. |
+| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `agent_type`, `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a headless `cmd -p` in a fresh process. `cwd` defaults to the mod workspace root. |
+| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, elapsed time and owner, plus how many signals are still waiting for this session. |
+| `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
+| `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
+| `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its own worker session (pinned as `subagent-<id>`) with a new instruction. The resumed run is a new job with its own signal. |
+| `subagent_send` | `title`, `body` | Publishes a signal into the agent loop of **this** session. The agent-to-agent channel: worker and peer agents signal a session so neither blocks or polls. Delivered as a visible user turn. |
 
-`pubsub_fire` is the whole point: it returns in milliseconds with the job id and pid, and the result
+`subagent_spawn` is the whole point: it returns in milliseconds with the job id and pid, and the result
 arrives later **as a signal, never as a tool result** — so there is nothing to wait for.
 
 ```jsonc
 // fire a shell command
-{"label": "typecheck", "command": "tsc --noEmit", "cwd": "/repo"}
+{"description": "typecheck", "command": "tsc --noEmit", "cwd": "/repo"}
 
-// fire a headless agent
-{"label": "audit-deps", "prompt": "Audit dependencies for unused packages and report."}
+// fire a headless agent, with a hard timeout
+{"description": "audit-deps", "prompt": "Audit dependencies for unused packages and report.", "timeout_ms": 600000}
+
+// continue it afterwards
+{"id": "m3k2-9f1a2b", "prompt": "Now open issues for the three worst offenders."}
 ```
+
+`permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
+arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
+background path is the only one that exists yet.
+
+### Deprecated aliases (one release)
+
+`pubsub_fire`, `pubsub_list`, `pubsub_cancel` and `pubsub_send` are still registered and marked
+`[deprecated: use subagent_…]`. They are registered from the **same run function**, so an installed
+prompt, a script, or a habit that still calls the old name behaves identically and cannot drift. So are
+the `/pubsub` command and the `pubsub_dir` / `pubsub_deliver` flags.
 
 ## Command
 
 ```
-/pubsub list          # jobs, states, unread results, pending signal count
-/pubsub cancel <id>   # cancel a queued/running job
-/pubsub jobs          # open the async-jobs dashboard pane
+/subagents list          # jobs, states, unread results, pending signal count
+/subagents jobs          # open the async-jobs dashboard pane
+/subagents cancel <id>   # cancel a queued/running job
+/subagents open <id>     # one job: state, exit code, duration, log
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
@@ -75,8 +93,11 @@ The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` runni
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `pubsub_dir` | `~/.commandcode/pubsub` | Where the spool, logs and job records live. Point several sessions at one shared spool (the default) or give a project its own. |
-| `pubsub_deliver` | `steer` | How a signal reaches the session: `steer` delivers right after the current tool batch; `follow-up` waits until the run would otherwise stop. |
+| `subagent_dir` | `~/.commandcode/subagents` | Where the spool, logs and job records live. Point several sessions at one shared spool (the default) or give a project its own. |
+| `subagent_deliver` | `steer` | How a signal reaches the session: `steer` delivers right after the current tool batch; `follow-up` waits until the run would otherwise stop. |
+
+`pubsub_dir` and `pubsub_deliver` are deprecated aliases, recognised for one release when set to
+anything other than their own default.
 
 ## Lifecycle
 
@@ -89,12 +110,22 @@ queued → running → waiting-input | done | failed | canceled
 - **waiting-input** — the worker exited with a question (its last log line ends in `?`). A headless
   worker cannot stay alive waiting for input, so answering it means firing a follow-up job.
 - **done** / **failed** — the child exited, with code, duration and a log tail carried in the signal.
-- **canceled** — terminal. `pubsub_cancel` kills the child and worker and emits a `canceled` signal.
+- **canceled** — terminal. `subagent_cancel` kills the child and worker and emits a `canceled` signal.
   A worker that notices the cancellation while exiting will not overwrite the state.
 
 Crashes are reconciled, not ignored: a `queued`/`running` record whose pid and worker pid are both dead,
 with no signal on disk and past a 30s grace, is marked `failed` (`lost (no live process)` or
-`worker never started`). A detached worker survives the harness, so a live pid always means keep waiting.
+`worker never started`) **and emits one failed signal**, so the session that fired it learns the result is
+gone instead of waiting forever. A detached worker survives the harness, so a live pid always means keep
+waiting.
+
+A job that overruns `timeout_ms` is `SIGTERM`ed and then `SIGKILL`ed, and signals `failed` with
+`timed out after …`. A `cmd -p` run that hits its turn cap exits 8 and signals
+`exit 8 (max turns reached; result is partial)`; any other non-zero exit is `failed` with the CLI's own
+error in the log tail, so an API or auth failure is visible rather than silent.
+
+Finished jobs keep their record and their log for **30 days** (`BETTER_SUBAGENTS_RETENTION_DAYS` overrides
+it), then both are swept. A running job is never swept, however old its record is.
 
 ## Ownership — why another session's result never lands in yours
 
@@ -104,18 +135,20 @@ token**, and a drain only delivers signals whose owner matches.
 - The token is minted once per session and persisted in the session transcript:
 
   ```js
-  cmd.session.appendCustomEntry({customType: 'pubsub/owner', data: {token}})
+  cmd.session.appendCustomEntry({customType: 'subagent/owner', data: {token}})
   ```
 
-  It is read back with `cmd.session.getCustomEntries({customType: 'pubsub/owner'})`, so it **survives
-  resume and hot reload** — the same session keeps the same identity.
+  It is read back with `cmd.session.getCustomEntries({customType: 'subagent/owner'})`, so it **survives
+  resume and hot reload** — the same session keeps the same identity. The 0.1.0 entry (`pubsub/owner`) is
+  read as a fallback, so a session that was live across the rename keeps the identity its older jobs were
+  stamped with.
 
 - A drain that claims a file it does not own **puts it back** in `inbox/` rather than deleting it, so the
   owning session can still collect it later.
 - **Untagged legacy signals** (written by older versions, with no `owner` field) are never delivered to
   "whoever happens to be running". They are quarantined to `orphaned/`.
-- A headless worker is itself a Command Code process; it runs with `PUBSUB_WORKER=1` so its own mod
-  instance never steals an unaddressed signal.
+- A headless worker is itself a Command Code process; it runs with `BETTER_SUBAGENTS_WORKER=1` so its own
+  mod instance never steals an unaddressed signal.
 
 Delivery is also exactly-once per job id: signals are claimed by atomic `rename` into `claimed/`
 (exactly one drainer can win a file), job ids are deduplicated in memory, and the check is seeded from a
@@ -123,15 +156,16 @@ durable ledger so a restart cannot replay what a previous process already delive
 
 ## Spool layout
 
-Under `pubsub_dir` (default `~/.commandcode/pubsub`):
+Under `subagent_dir` (default `~/.commandcode/subagents`):
 
 ```
 inbox/            workers drop <timestamp>-<id>.json here
 claimed/          rename target during delivery, so two drains cannot deliver one signal twice
 orphaned/         untagged legacy signals, quarantined instead of leaked
 logs/             one log per fired job
-jobs/             one JSON record per job (for pubsub_list and the jobs pane)
+jobs/             one JSON record per job (for subagent_list and the jobs pane)
 delivered.jsonl   durable delivery ledger, so a restart cannot replay a signal
+worktrees/        reserved for `isolation: worktree` (phase 7)
 ```
 
 `claimed/` and `orphaned/` are swept on session start (1h and 7d TTLs), the ledger is compacted past
@@ -152,20 +186,20 @@ The failure modes are all closed:
 
 ## Security
 
-**This mod runs arbitrary commands — the ones you ask it to run.** `pubsub_fire` with `command` passes
+**This mod runs arbitrary commands — the ones you ask it to run.** `subagent_spawn` with `command` passes
 your string to `/bin/sh -c`, and with `prompt` starts a full headless Command Code agent that can use its
 own tools. Both run **detached and headless, with no TUI to prompt you and no approval gate**, in the
-`cwd` you give them and with the mod's environment (`PUBSUB_SPEC` carries the JSON job spec, so quotes,
+`cwd` you give them and with the mod's environment (`SUBAGENT_SPEC` carries the JSON job spec, so quotes,
 `$` and newlines in a prompt or command cannot break the wrapper — there is no shell interpolation of it).
 
-Treat `pubsub_fire` exactly like handing a shell to the model: only enable the mod where the model is
+Treat `subagent_spawn` exactly like handing a shell to the model: only enable the mod where the model is
 allowed to run background commands, and do not point it at untrusted prompts. Job records and logs are
-written to `pubsub_dir` in plain text and are readable by anything that can read that directory.
+written to `subagent_dir` in plain text and are readable by anything that can read that directory.
 
-`pubsub_send` injects a message into your own session's agent loop. Only signals whose owner token matches
+`subagent_send` injects a message into your own session's agent loop. Only signals whose owner token matches
 the session are delivered, and untagged signals are quarantined, but **the token is an isolation
 mechanism, not an authorization boundary**: any local process that can write to the shared spool can
-write a signal tagged with a token it has read from disk. Use a private `pubsub_dir` if that matters.
+write a signal tagged with a token it has read from disk. Use a private `subagent_dir` if that matters.
 
 No network, no telemetry, no credentials: the mod never reads `auth.json`, opens no socket, and makes no
 outbound connection.
@@ -177,13 +211,14 @@ interface, and the smoke test drives every one of them.
 
 | Seam | Interface | Why it is a module |
 | --- | --- | --- |
-| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `pid`, `execPath`, `env`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
 | States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
 | Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
 | Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |
 | Launch | `fire(intent)`, `failJob(job, reason)` | One failure contract: one record, one signal, one delivery. The next guard reuses it. |
 | Owner | `id()`, verdict `mine \| foreign \| orphan \| pending` | One identity rule. `pending` is a state, and there is no invented `process-<pid>` identity. |
 | Ledger | `has(id)`, `accept(id)`, `retain(n)` | The replay guard and its retention, in memory and on disk together. |
+| Surface | `addSurface(name, …, run, {aliases})` | One implementation per tool; `pubsub_*` is registered from the same `run`, so the deprecated names cannot drift. |
 
 Follow-up: the detached worker is still an inline string (`WORKER_SOURCE`) because the mod ships as one
 file with nothing to install. Extracting it into a real module would let the worker share the envelope and
@@ -193,11 +228,17 @@ state code and would make the `waiting-input` heuristic a unit test, but it need
 ## Tests
 
 ```bash
-node test/smoke.mjs   # prints PASS
+node test/smoke.mjs   # the unit/behaviour suite: prints PASS, never touches the network
+node test/e2e.mjs     # the real thing: a real printf job, a real cmd -p job, a real timeout, a resume
 ```
 
+`test/e2e.mjs` needs `cmd` on PATH (or `COMMANDCODE_BIN`), a signed-in Command Code and network, so CI runs
+only the smoke suite. It prints the spool path it used, and leaves the artifacts there as evidence:
+`jobs/<id>.json`, `logs/<id>.log` and the `inbox/` signal for each job.
+
 The smoke test imports `better-sub-agents.ts` directly with Node's native TypeScript type stripping and drives it with
-a fake `ModApi` and a fake `Runtime` — no dependencies, no build, no network, no process. It covers the
+a fake `ModApi` and a fake `Runtime` (both in `test/harness.mjs`) — no dependencies, no build, no network,
+no process. It covers the
 public surface (tools, command, flags, renderer, pane, hooks, timers) and each seam on its own: the runtime
 seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
 the state table's edges, the envelope's record/signal agreement, a foreign signal surviving a failed
