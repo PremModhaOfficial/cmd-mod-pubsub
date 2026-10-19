@@ -49,7 +49,7 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 | Tool | Arguments | What it does |
 | --- | --- | --- |
 | `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `name`, `subagent_type` (or the deprecated `agent_type`), `model`, `effort`, `tools`, `disallowed_tools`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. A `name` makes the agent addressable with `subagent_send`. |
-| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, effort, color, elapsed time and owner, plus how many signals are still waiting for this session. |
+| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, agent id, name, model, effort, color, elapsed time and owner, plus how many signals are still waiting for this session. |
 | `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration, owner and agent id, plus a bounded slice of its log (or its transcript when the log is gone) and the transcript path. `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
 | `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. `id` may be the agent id or the job id. The resumed run is a new job with its own signal; model, effort, cache TTL and the compact window carry over. |
@@ -163,8 +163,11 @@ branch (`origin/HEAD`, then `main`, then `master`) — never the caller's HEAD. 
 Monitor calls are refused when their working directory resolves to the main checkout, and when a redirect,
 `cd`, `git -C`/`--work-tree`/`--git-dir`, `GIT_DIR` or `git --prefix` would leave the worktree;
 PowerShell gets the working-directory check. A job that leaves no changes removes its worktree; a job
-that changes files keeps it and the delivered result names the path. A session that itself runs in a
-linked worktree applies the same checks to its own tools and to every subagent it spawns.
+that changes files keeps it and the result names the path — a foreground run makes that decision before it
+returns. Retention never deletes a changed worktree or one whose git state it cannot read: it removes only
+a clean worktree, through `git worktree remove`, so the repository's worktree metadata clears with it. A
+session that itself runs in a linked worktree applies the same checks to its own tools and to every
+subagent it spawns.
 
 `subagent_type` is canonical; `agent_type` is a deprecated alias. Omitting the type uses
 `general-purpose`; with no `general-purpose` definition the call fails with `subagent_type is required`.
@@ -242,8 +245,8 @@ message (`BETTER_SUBAGENTS_LIVE_IDLE_MS` overrides it) and then exits; a later m
 `main` is always addressable: from an agent it writes a signal owned by the parent session; from the main
 session it is delivered as a note.
 
-A named agent starts with a **sibling roster** snapshot when at least one other named agent exists:
-`main` plus the other named agents, with their state and job id. `ListAgents` exposes the same set. A
+A named agent always starts with a **sibling roster** snapshot:
+`main` plus the other named agents, with their state and job id; `main` is always addressable. `ListAgents` exposes the same set. A
 message from a worker to a peer is accepted only for a name in that roster.
 
 `SubagentHandback` is the explicit final-report path for an agent that reports through it: the report is
@@ -285,7 +288,10 @@ widget; the mod supplies the candidate list, not a replacement widget.
 - Every subagent loses `AskUserQuestion`, `EndConversation`, `EnterPlanMode`, `ScheduleWakeup`,
   `WaitForMcpServers`, `Workflow`, and `ExitPlanMode` unless its permission mode is `plan`.
 - A background subagent keeps every MCP tool but only the allowlisted built-ins, so `ListAgents` is
-  foreground-only.
+  foreground-only. `Agent` and `ExitPlanMode` follow the first filter wherever the agent runs: a background
+  agent keeps `Agent` (it reports its own depth error) and a plan-mode agent keeps `ExitPlanMode`.
+- The resolved set is enforced in the worker's `beforeToolCall`: ACP has no per-session filter, so an
+  unlisted tool call is blocked and named. The definition's PreToolUse/PostToolUse/Stop hooks run there too.
 - A `tools` list that resolves to nothing fails the launch and names the entries.
 
 Model: the per-invocation `model`, then the definition's `model`, then `BETTER_SUBAGENTS_SUBAGENT_MODEL`
@@ -309,9 +315,10 @@ it. `permission_mode` on `subagent_spawn` is a per-call override that follows th
 definition mode is ignored (default); an unknown per-call mode is refused.
 
 The mode reaches the worker with ACP `session/set_mode`: `acceptEdits` → `auto-accept`, `dontAsk` →
-`dont-ask`, `bypassPermissions` → `bypass`, `plan` → `plan`, `default`/`manual` → `default`. `auto` is the
-host classifier, which has no ACP equivalent, so it is left to the host. The same table carries the
-`cmd --permission-mode` spelling (`standard`, `accept-edits`, `yolo`, `plan`) for the CLI paths.
+`dont-ask`, `bypassPermissions` → `bypass`, `plan` → `plan`, `default`/`manual`/`auto` → `default`. ACP has
+no classifier mode, so `auto` runs in the prompting mode: nothing is auto-allowed, and the job log records
+the deviation once (ADR 0001). The same table carries the `cmd --permission-mode` spelling (`standard`,
+`accept-edits`, `yolo`, `plan`) for the CLI paths.
 
 A worker that needs approval lands in `waiting-input` with the request on its signal
 (`permissionRequest` and a human-readable `question`); the job keeps its ACP session id, so it stays
@@ -343,6 +350,7 @@ note into this session; `subagent_send` takes `to`/`message` and delivers a live
 /subtask <prompt>        # start a fork of the main conversation when the agent view is off
 /agents [name|path]      # subagent definitions: scope, validity, source file
 /doctor [plugins]        # duplicate, invalid, and plugin-file problems, with the fix
+/add-dir <path>          # load agents from an added directory (the host has no /add-dir)
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
@@ -359,7 +367,7 @@ to the background. The footer keeps the running count and a `/tasks` hint for 30
 | `subagent_deliver` | `steer` | How a signal reaches the session: `steer` delivers right after the current tool batch; `follow-up` waits until the run would otherwise stop. |
 | `managed_dir` | `~/.commandcode/managed` | The managed settings directory; `agents/` under it wins every other scope. |
 | `agents` | empty | Session-only definitions as inline JSON, or a JSON file path in a non-interactive session (`--mod-option agents=...`). |
-| `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`). |
+| `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`); `/add-dir <path>` adds one mid-session. |
 | `plugin_dir` | empty | Comma-separated plugin roots; every child directory with an `agents/` directory is a plugin. |
 | `fork_mode` | `auto` | `auto` = interactive on, non-interactive/SDK off; `on`/`off` override. Where it is on, model-spawned agents run in the background and `run_in_background` is removed. |
 | `agent` | empty | Run the whole session as this agent definition (`--agent` is not a host flag, so use the mod option or `BETTER_SUBAGENTS_AGENT`). Its body becomes the main system prompt and its `initialPrompt` is the first turn. |
@@ -511,7 +519,7 @@ interface, and the smoke test drives every one of them.
 
 | Seam | Interface | Why it is a module |
 | --- | --- | --- |
-| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs`, `run` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. Worktree git goes through `run` via `gitSeam`. |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `later`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs`, `run` | The OS is one adapter, the test is the other. No other parent code names `node:fs`, `node:child_process`, `Date.now` or `setTimeout`; timers go through the host clock or `later`. Worktree git goes through `run` via `gitSeam`. |
 | States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
 | Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
 | Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |
@@ -538,7 +546,7 @@ only the smoke suite. It prints the spool path it used, and leaves the artifacts
 
 The smoke test imports `better-sub-agents.ts` directly with Node's native TypeScript type stripping and drives it with
 a fake `ModApi` and a fake `Runtime` (both in `test/harness.mjs`) — no dependencies, no build, no network,
-no process. Its 88 checks cover the
+no process. Its 102 checks cover the
 public surface (tools, command, flags, renderer, pane, hooks, timers) and each seam on its own: the runtime
 seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
 the state table's edges, the envelope's record/signal agreement, a foreign signal surviving a failed

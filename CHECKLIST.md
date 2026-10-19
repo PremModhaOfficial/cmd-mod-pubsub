@@ -149,7 +149,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 10: Release
 
-- [x] All tests pass. (`node test/smoke.mjs` 88/88; `node test/e2e.mjs` 10/10 on a signed-in host.)
+- [x] All tests pass. (`node test/smoke.mjs` 102/102; `node test/e2e.mjs` 10/10 on a signed-in host.)
 - [x] Two-session isolation test passes. (smoke 4-5 and 12-13, and real e2e 1a: two sessions, one shared spool, distinct owner tokens, no cross-delivery.)
 - [x] No foreign signal is delivered. (smoke 5, 12, 13.)
 - [x] No untagged signal remains in `inbox/`. (smoke 6: it moves to `orphaned/`.)
@@ -232,7 +232,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept. (smoke 35: the worker writes `transcripts/<id>.jsonl`, a new session reads it after the fake main transcript is cleared; smoke 83: an expired record, log and transcript go together while a fresh one stays; a non-terminal job is skipped by the transcript sweep as well as the record sweep.)
 - [x] Auto-compaction and the `compact_boundary` event. (smoke 85: the host's `usage_update` crossing the resolved window records and logs `compactBoundary {trigger: 'auto', preTokens}` on the job and the signal, and appends it to the transcript. ACP has no compaction event of its own; the deviation is recorded in the ADR.)
 - [x] Prompt-cache split for fork and non-fork; `cacheTtl`. (smoke 81: a fork records/passes `promptCache: 'shared'`, a non-fork `'own'`; smoke 82: `cacheTtl` survives resume; smoke 35: the adapter logs the cache selection and the TTL as an ACP deviation.)
-- Gate: startup-context, resume, compaction, retention, and cache tests pass. (smoke 81-86 and 35; 88 checks green.)
+- Gate: startup-context, resume, compaction, retention, and cache tests pass. (smoke 81-86 and 35; 102 checks green.)
 
 ## Phase 15: Live messaging, teams, forks, permissions
 
@@ -256,7 +256,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Pane, footer count, 30-second task-row lifecycle, transcript open, @mention typeahead. (smoke 79.)
 - [x] Claude Code environment aliases accepted. (smoke 36, 47, 73.)
 - [x] README and the parity matrix updated. (README title/version/install/surfaces/built-ins/description limit; `SPEC.md` ledger has a check on every row.)
-- [x] Every `SPEC.md` acceptance test passes. (88 smoke checks; real-host checks pass in e2e.)
+- [x] Every `SPEC.md` acceptance test passes. (102 smoke checks; real-host checks pass in e2e.)
 - [x] Two-session isolation, no foreign delivery, no untagged inbox, no duplicate after restart. (smoke 4-6, 12-13, 21; real e2e 1a.)
 - [x] Version 2.0.0.
 - [ ] Repository rename and tag after the human release gate. (Human gate: `cmd-mod-pubsub` -> `cmd-mod-better-sub-agents`, then tag `v2.0.0`. This ticket does neither.)
