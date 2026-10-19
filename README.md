@@ -114,6 +114,14 @@ with a missing name or description, a bad first line, a colon or over-256-charac
 YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
 skip with its reason, and `/doctor` reports each duplicate and invalid file with the fix.
 
+`isolation: worktree` runs the job in a temporary `git worktree` branched from the repository's default
+branch (`origin/HEAD`, then `main`, then `master`) — never the caller's HEAD. Inside the worker, Bash and
+Monitor calls are refused when their working directory resolves to the main checkout, and when a redirect,
+`cd`, `git -C`/`--work-tree`/`--git-dir`, `GIT_DIR` or `git --prefix` would leave the worktree;
+PowerShell gets the working-directory check. A job that leaves no changes removes its worktree; a job
+that changes files keeps it and the delivered result names the path. A session that itself runs in a
+linked worktree applies the same checks to its own tools and to every subagent it spawns.
+
 `subagent_type` is canonical; `agent_type` is a deprecated alias. Omitting the type uses
 `general-purpose`; with no `general-purpose` definition the call fails with `subagent_type is required`.
 
@@ -314,7 +322,7 @@ orphaned/         untagged legacy signals, quarantined instead of leaked
 logs/             one log per fired job
 jobs/             one JSON record per job (for subagent_list and the jobs pane)
 delivered.jsonl   durable delivery ledger, so a restart cannot replay a signal
-worktrees/        reserved for `isolation: worktree` (phase 7)
+worktrees/        `isolation: worktree` jobs; a changed one is kept and reported, an unchanged one removed
 ```
 
 `claimed/` and `orphaned/` are swept on session start (1h and 7d TTLs), the ledger is compacted past
@@ -360,7 +368,7 @@ interface, and the smoke test drives every one of them.
 
 | Seam | Interface | Why it is a module |
 | --- | --- | --- |
-| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs`, `run` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. Worktree git goes through `run` via `gitSeam`. |
 | States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
 | Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
 | Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |

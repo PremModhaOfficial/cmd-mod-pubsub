@@ -21,7 +21,21 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod, {AGENT_API_ERROR, foregroundOutcome, hasAgentOutput, jobStates, ledgerFactory, resolveExecutionPolicy} from '../better-sub-agents.ts';
+import mod, {
+	AGENT_API_ERROR,
+	commandEscapesWorktree,
+	createJobWorktree,
+	defaultBranch,
+	finalizeWorktree,
+	foregroundOutcome,
+	guardToolCall,
+	hasAgentOutput,
+	isolationRoots,
+	jobStates,
+	ledgerFactory,
+	mainCheckoutRoots,
+	resolveExecutionPolicy,
+} from '../better-sub-agents.ts';
 import * as modExports from '../better-sub-agents.ts';
 import {
 	fail,
@@ -1100,7 +1114,23 @@ try {
 	writeFileSync(join(projectAgents, 'bad-yaml.md'), '---\nname: [unclosed\ndescription: x\n---\nbody');
 	writeFileSync(join(projectAgents, 'tab-indent.md'), '---\nname: tab-indent\ndescription: x\n\tmodel: y\n---\nbody');
 
-	const registryRuntime = makeRuntime({now: () => fixedNow, cwd: nestedRoot, home: homeRoot});
+	const registryRuntime = makeRuntime({
+		now: () => fixedNow,
+		cwd: nestedRoot,
+		home: homeRoot,
+		// The `full` definition sets `isolation: worktree`; the seam answers as a repo
+		// so the job can start without touching a real checkout.
+		run: (command, args) => {
+			if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not available'};
+			const key = args.join(' ');
+			if (key === 'rev-parse --show-toplevel') return {ok: true, code: 0, stdout: `${nestedRoot}\n`, stderr: ''};
+			if (key.startsWith('rev-parse --path-format')) {
+				return {ok: true, code: 0, stdout: `${nestedRoot}/.git\n`, stderr: ''};
+			}
+			if (key.startsWith('symbolic-ref')) return {ok: true, code: 0, stdout: 'origin/main\n', stderr: ''};
+			return {ok: true, code: 0, stdout: '', stderr: ''};
+		},
+	});
 	const registrySpool = mkdtempSync(join(tmpdir(), 'subagent-registry-spool-'));
 	const registry = makeApi({spoolDir: registrySpool, session: makeSession(), runtime: registryRuntime.runtime});
 	mod(registry.api, registry.runtime);
@@ -1412,7 +1442,6 @@ process.stdin.on('data', (data) => {
 	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
-
 
 	// limits: the concurrency pool, nesting depth, and the shared TTL sweeper ---
 	const limits = await import('../better-sub-agents.ts');
@@ -3306,6 +3335,315 @@ process.stdin.on('data', (data) => {
 	assert.equal(questionSignal.state, 'waiting-input', 'a trailing question waits for input');
 	assert.equal(questionSignal.question, 'Which branch?', 'the question travels in the signal');
 	ok('waiting-input: a shell command that ends in a question carries it');
+
+	// 60. worktree isolation: creation, cleanup, and the command guard ----------
+	// The lifecycle is parent-owned and every git call goes through the runtime seam,
+	// so a fake git makes each branch drivable without a repository.
+	const gitSeam = (answers) => {
+		const calls = [];
+		const git = (args, cwd) => {
+			calls.push({args, cwd});
+			const key = args.join(' ');
+			for (const [pattern, answer] of Object.entries(answers)) {
+				if (key.includes(pattern)) return typeof answer === 'function' ? answer(args, cwd) : answer;
+			}
+			return {code: 0, stdout: '', stderr: ''};
+		};
+		return {git, calls};
+	};
+	const okGit = {code: 0, stdout: '', stderr: ''};
+	// The runtime seam is one generic `run`; this maps the worktree-sized fake onto it.
+	const runOf = (seam) => (command, args, options) => {
+		if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not git'};
+		const answer = seam.git(args, options?.cwd);
+		return {ok: answer.code === 0, code: answer.code, stdout: answer.stdout, stderr: answer.stderr};
+	};
+	const repoGit = gitSeam({
+		'rev-parse --show-toplevel': {code: 0, stdout: '/repo\n', stderr: ''},
+		'rev-parse --path-format=absolute --git-common-dir': {code: 0, stdout: '/repo/.git\n', stderr: ''},
+		'symbolic-ref --short refs/remotes/origin/HEAD': {code: 0, stdout: 'origin/main\n', stderr: ''},
+		'rev-parse --verify': okGit,
+	});
+
+	assert.deepEqual(mainCheckoutRoots(repoGit, '/repo/sub'), ['/repo'], 'a normal checkout has one root');
+	assert.equal(defaultBranch(repoGit, '/repo'), 'origin/main', 'the default branch comes from origin/HEAD');
+	assert.deepEqual(
+		repoGit.calls.filter((call) => call.args[0] === 'rev-parse').map((call) => call.args.join(' ')),
+		['rev-parse --show-toplevel', 'rev-parse --path-format=absolute --git-common-dir', 'rev-parse --verify --quiet origin/main'],
+		'root discovery and branch verification are real git calls through the seam',
+	);
+
+	const worktreePath = '/spool/worktrees/job-36';
+	const mkdirs = [];
+	const created = createJobWorktree(
+		{git: repoGit.git, fs: {mkdir: (dir) => mkdirs.push(dir)}},
+		{cwd: '/repo/sub', path: worktreePath},
+	);
+	assert.equal(created.ok, true, 'a git repository yields a worktree');
+	assert.equal(created.path, worktreePath);
+	assert.equal(created.base, 'origin/main', 'branched from the default branch, not HEAD');
+	assert.deepEqual(created.mainCheckouts, ['/repo']);
+	assert.deepEqual(mkdirs, ['/spool/worktrees'], 'the worktree parent is created');
+	const addCall = repoGit.calls.find((call) => call.args[0] === 'worktree' && call.args[1] === 'add');
+	assert.deepEqual(
+		addCall.args,
+		['worktree', 'add', '--detach', worktreePath, 'origin/main'],
+		'git worktree add --detach <path> <default>',
+	);
+	assert.equal(addCall.cwd, '/repo', 'the add runs in the repository root');
+
+	const failedGit = gitSeam({
+		'rev-parse --show-toplevel': {code: 0, stdout: '/repo\n', stderr: ''},
+		'symbolic-ref': {code: 0, stdout: 'origin/main\n', stderr: ''},
+		'worktree add': {code: 128, stdout: '', stderr: 'fatal: already exists'},
+	});
+	const createFailed = createJobWorktree({git: failedGit.git, fs: {mkdir() {}}}, {cwd: '/repo', path: worktreePath});
+	assert.equal(createFailed.ok, false, 'a failing git worktree add fails the job');
+	assert.match(createFailed.error, /already exists/, 'the git error is reported');
+
+	const noBranch = createJobWorktree(
+		{
+			git: gitSeam({
+				'rev-parse --show-toplevel': {code: 0, stdout: '/repo\n', stderr: ''},
+				'rev-parse --path-format': {code: 0, stdout: '/repo/.git\n', stderr: ''},
+				'symbolic-ref': {code: 1, stdout: '', stderr: ''},
+				'rev-parse --verify': {code: 1, stdout: '', stderr: ''},
+			}).git,
+			fs: {mkdir() {}},
+		},
+		{cwd: '/repo', path: worktreePath},
+	);
+	assert.equal(noBranch.ok, false);
+	assert.match(noBranch.error, /default branch/, 'no resolvable default branch is a clear error');
+
+	const fallbackBranch = defaultBranch(gitSeam({'rev-parse --verify': okGit}), '/repo');
+	assert.equal(fallbackBranch, 'main', 'main is the fallback when origin/HEAD is absent');
+
+	// A finished job: unchanged removes the worktree, changed keeps and reports it.
+	const cleanGit = gitSeam({'status --porcelain': {code: 0, stdout: '', stderr: ''}, 'worktree remove': okGit});
+	const removed = finalizeWorktree(cleanGit, {worktree: worktreePath, worktreeRepo: '/repo'});
+	assert.deepEqual(removed, {kept: false, path: worktreePath}, 'an unchanged worktree is removed');
+	assert.deepEqual(
+		cleanGit.calls.find((call) => call.args[0] === 'worktree' && call.args[1] === 'remove').args,
+		['worktree', 'remove', '--force', worktreePath],
+		'removal goes through git worktree remove',
+	);
+	assert.equal(
+		cleanGit.calls.find((call) => call.args[0] === 'worktree' && call.args[1] === 'remove').cwd,
+		'/repo',
+		'removal runs in the repository root, not the worktree being removed',
+	);
+
+	const dirtyGit = gitSeam({'status --porcelain': {code: 0, stdout: '?? notes.txt\n', stderr: ''}});
+	const kept = finalizeWorktree(dirtyGit, {worktree: worktreePath, worktreeRepo: '/repo'});
+	assert.deepEqual(kept, {kept: true, path: worktreePath}, 'a changed worktree is kept');
+	assert.ok(!dirtyGit.calls.some((call) => call.args[1] === 'remove'), 'a changed worktree is never removed');
+
+	const statusFailed = finalizeWorktree(
+		gitSeam({'status --porcelain': {code: 128, stdout: '', stderr: 'not a worktree'}}),
+		{worktree: worktreePath, worktreeRepo: '/repo'},
+	);
+	assert.equal(statusFailed.kept, true, 'a git failure keeps the worktree rather than deleting it');
+	assert.match(statusFailed.error, /status/);
+
+	assert.equal(
+		finalizeWorktree(dirtyGit, {worktree: worktreePath, worktreeFinalized: true}),
+		undefined,
+		'finalizing twice is a no-op',
+	);
+	ok('worktree isolation: create from the default branch; remove unchanged; keep and report changed');
+
+	// 61. the command guard -----------------------------------------------------
+	const roots = {worktree: '/spool/worktrees/job-36', mainCheckouts: ['/repo', '/repo-main']};
+	assert.equal(commandEscapesWorktree('ls -la && cat README.md', roots), undefined, 'a local command is allowed');
+	assert.match(commandEscapesWorktree('cat /repo/README.md', roots), /main checkout/, 'an absolute main-checkout path is blocked');
+	assert.match(commandEscapesWorktree('cd .. && touch x', roots), /leaves the worktree/, 'cd above the worktree is blocked');
+	assert.match(commandEscapesWorktree('echo hi > /repo/out.txt', roots), /main checkout/, 'a redirect into the main checkout is blocked');
+	assert.match(commandEscapesWorktree('echo hi > ../out.txt', roots), /redirect/, 'a redirect above the worktree is blocked');
+	assert.equal(commandEscapesWorktree('ls missing 2>/dev/null', roots), undefined, 'discarding output is allowed');
+	assert.equal(commandEscapesWorktree('ls missing 2>&1', roots), undefined, 'merging streams is allowed');
+	assert.match(commandEscapesWorktree('git -C /repo status', roots), /main checkout/, 'git -C into the main checkout is blocked');
+	assert.match(commandEscapesWorktree('GIT_DIR=/repo/.git git status', roots), /git directory/, 'a redirected git dir is blocked');
+	assert.match(commandEscapesWorktree('git status --prefix=/repo/', roots), /--prefix/, 'a git prefix is blocked');
+
+	assert.equal(guardToolCall('Bash', {command: 'ls -la'}, roots), undefined, 'Bash in the worktree passes');
+	const bashMain = guardToolCall('Bash', {command: 'ls', cwd: '/repo'}, roots);
+	assert.equal(bashMain.block, true, 'Bash whose cwd resolves to the main checkout fails');
+	assert.match(bashMain.reason, /main checkout \(\/repo\)/, 'the error names the main checkout');
+	assert.match(bashMain.reason, /isolated in its worktree/, 'the error names the isolation');
+	assert.equal(
+		guardToolCall('Bash', {command: 'ls', cwd: '/spool/worktrees/job-36/sub'}, roots),
+		undefined,
+		'a subdirectory of the worktree is allowed',
+	);
+	assert.equal(
+		guardToolCall('PowerShell', {command: 'cd /repo; ls'}, roots),
+		undefined,
+		'PowerShell gets only the working-directory check',
+	);
+	assert.equal(guardToolCall('PowerShell', {command: 'ls', cwd: '/repo-main'}, roots).block, true);
+	assert.equal(guardToolCall('Monitor', {command: 'cd /repo'}, roots).block, true, 'Monitor gets both checks');
+	assert.equal(guardToolCall('Read', {file_path: '/repo/README.md'}, roots), undefined, 'non-shell tools are not guarded');
+	ok('isolation guard: main checkout blocked by cwd, escapes rejected by command shape');
+
+	// 62. where the guard comes from -------------------------------------------
+	const linkedGit = gitSeam({
+		'rev-parse --show-toplevel': {code: 0, stdout: '/repo-wt\n', stderr: ''},
+		'rev-parse --path-format=absolute --git-common-dir': {code: 0, stdout: '/repo/.git\n', stderr: ''},
+	});
+	const linked = isolationRoots(linkedGit, '/repo-wt');
+	assert.deepEqual(linked, {worktree: '/repo-wt', mainCheckouts: ['/repo-wt', '/repo']}, 'a linked-worktree session is isolated');
+	assert.equal(isolationRoots(repoGit, '/repo'), undefined, 'a normal checkout session is not isolated');
+	assert.deepEqual(
+		isolationRoots(repoGit, '/spool/worktrees/job-36', {worktree: '/spool/worktrees/job-36', mainCheckouts: ['/repo']}),
+		{worktree: '/spool/worktrees/job-36', mainCheckouts: ['/repo']},
+		'a worker spec carries the worktree and the forbidden roots',
+	);
+	assert.deepEqual(
+		isolationRoots(repoGit, '/repo/worktrees/job-1', {worktree: '/repo/worktrees/job-1', mainCheckouts: ['/repo']}),
+		{worktree: '/repo/worktrees/job-1', mainCheckouts: ['/repo']},
+		'a spool inside the repository keeps the root forbidden',
+	);
+	const nested = {worktree: '/repo/worktrees/job-1', mainCheckouts: ['/repo']};
+	assert.equal(
+		guardToolCall('Bash', {command: 'ls -la', cwd: '/repo/worktrees/job-1/sub'}, nested),
+		undefined,
+		'the worktree subtree is allowed even when it sits inside the root',
+	);
+	assert.equal(
+		guardToolCall('Bash', {command: 'ls -la', cwd: '/repo/src'}, nested).block,
+		true,
+		'the rest of that checkout is still blocked',
+	);
+	assert.equal(
+		commandEscapesWorktree('cat /repo/worktrees/job-1/README.md', nested),
+		undefined,
+		'naming the worktree itself is not naming the main checkout',
+	);
+	ok('isolation roots: linked worktrees and worktree specs are recognised');
+
+	// 63. the guard is registered in the worker and in a linked-worktree session -
+	const workerDir = mkdtempSync(join(tmpdir(), 'subagent-wt-worker-'));
+	const workerRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {
+			...process.env,
+			SUBAGENT_SPEC: JSON.stringify({
+				id: 'wt-worker',
+				cwd: '/spool/worktrees/job-36',
+				worktree: '/spool/worktrees/job-36',
+				mainCheckouts: ['/repo'],
+			}),
+			BETTER_SUBAGENTS_WORKER: '1',
+		},
+	}).runtime;
+	const workerApi = makeApi({spoolDir: workerDir, session: makeSession(), runtime: workerRuntime});
+	mod(workerApi.api, workerRuntime);
+	assert.equal(typeof workerApi.registeredHooks.beforeToolCall, 'function', 'the worker registers a tool guard');
+	const workerBlock = workerApi.registeredHooks.beforeToolCall({
+		toolName: 'Bash',
+		input: {command: 'ls', cwd: '/repo'},
+	});
+	assert.equal(workerBlock.block, true);
+	assert.match(workerBlock.additionalContext, /main checkout/);
+	assert.equal(
+		workerApi.registeredHooks.beforeToolCall({toolName: 'Bash', input: {command: 'ls'}}),
+		undefined,
+		'the worker default cwd is the worktree',
+	);
+
+	const normalDir = mkdtempSync(join(tmpdir(), 'subagent-wt-normal-'));
+	const normalRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo', run: runOf(repoGit)}).runtime;
+	const normalApi = makeApi({spoolDir: normalDir, session: makeSession(), runtime: normalRuntime});
+	mod(normalApi.api, normalRuntime);
+	assert.equal(normalApi.registeredHooks.beforeToolCall, undefined, 'a normal main-checkout session registers no guard');
+
+	const linkedDir = mkdtempSync(join(tmpdir(), 'subagent-wt-linked-'));
+	const linkedRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo-wt', run: runOf(linkedGit)}).runtime;
+	const linkedApi = makeApi({spoolDir: linkedDir, session: makeSession(), runtime: linkedRuntime});
+	mod(linkedApi.api, linkedRuntime);
+	assert.equal(typeof linkedApi.registeredHooks.beforeToolCall, 'function', 'a linked-worktree session guards its own tools');
+	assert.equal(
+		linkedApi.registeredHooks.beforeToolCall({toolName: 'Bash', input: {command: 'ls', cwd: '/repo'}}).block,
+		true,
+		'a linked-worktree session cannot enter the main checkout',
+	);
+	ok('guard wiring: worker, linked-worktree session, and no guard in a normal checkout');
+
+	// 64. fire() creates the worktree and delivery finalizes it -----------------
+	const fireDir = mkdtempSync(join(tmpdir(), 'subagent-wt-fire-'));
+	const project = mkdtempSync(join(tmpdir(), 'subagent-wt-project-'));
+	writeAgent(join(project, '.commandcode', 'agents'), 'iso.md', 'iso', 'isolated worker', 'You are isolated.', {
+		isolation: 'worktree',
+	});
+	const fireGit = gitSeam({
+		'rev-parse --show-toplevel': {code: 0, stdout: `${project}\n`, stderr: ''},
+		'rev-parse --path-format=absolute --git-common-dir': {code: 0, stdout: `${project}/.git\n`, stderr: ''},
+		'symbolic-ref --short refs/remotes/origin/HEAD': {code: 0, stdout: 'origin/main\n', stderr: ''},
+		'rev-parse --verify': okGit,
+		'worktree add': okGit,
+		'status --porcelain': {code: 0, stdout: '?? changed.txt\n', stderr: ''},
+	});
+	const fireRuntime = makeRuntime({now: () => fixedNow, cwd: project, run: runOf(fireGit), execPath: '/usr/bin/node'});
+	const fireApi = makeApi({spoolDir: fireDir, session: makeSession(), runtime: fireRuntime.runtime});
+	mod(fireApi.api, fireRuntime.runtime);
+	const spawnedIso = await toolOf(fireApi, 'subagent_spawn').run({
+		input: {description: 'isolated', prompt: 'do it', subagent_type: 'iso'},
+	});
+	assert.equal(spawnedIso.ok, true, JSON.stringify(spawnedIso));
+	const isoId = spawnedIso.content[0].text.match(/spawned (\S+)/)[1];
+	const isoRecord = JSON.parse(readFileSync(join(fireDir, 'jobs', `${isoId}.json`), 'utf8'));
+	const expectedWorktree = join(fireDir, 'worktrees', isoId);
+	assert.equal(isoRecord.worktree, expectedWorktree, 'the record carries the worktree path');
+	assert.equal(isoRecord.cwd, expectedWorktree, 'the worker cwd is the worktree');
+	assert.deepEqual(isoRecord.mainCheckouts, [project], 'the record carries the forbidden roots');
+	const workerSpec = JSON.parse(
+		fireRuntime.spawnCalls.find((call) => call.args[0] === '-e').options.env.SUBAGENT_SPEC,
+	);
+	assert.equal(workerSpec.cwd, expectedWorktree, 'the worker spec runs in the worktree');
+	assert.equal(workerSpec.worktree, expectedWorktree);
+	assert.equal(
+		fireGit.calls.find((call) => call.args[0] === 'worktree' && call.args[1] === 'add').args[4],
+		'origin/main',
+		'the job branched from the default branch',
+	);
+
+	// A terminal signal finalizes through the same path the session drain uses.
+	const doneRecord = JSON.parse(readFileSync(join(fireDir, 'jobs', `${isoId}.json`), 'utf8'));
+	doneRecord.state = 'done';
+	writeFileSync(join(fireDir, 'jobs', `${isoId}.json`), JSON.stringify(doneRecord, null, 2));
+	writeFileSync(
+		join(fireDir, 'inbox', `${fixedNow}-${isoId}-test.json`),
+		JSON.stringify({id: isoId, owner: doneRecord.owner, label: doneRecord.label, kind: 'agent', state: 'done', body: 'exit 0'}),
+	);
+	// Session start reconciles first and drains second: the record is finalized by the
+	// reconcile, and delivery still has to report the kept path.
+	fireApi.registeredHooks.onSessionStart({sessionId: 'wt'});
+	const isoDelivered = fireApi.userMessages.at(-1)?.text ?? '';
+	assert.match(isoDelivered, /worktree kept at/, 'a changed worktree path is reported with the result');
+	assert.match(isoDelivered, new RegExp(expectedWorktree.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+	const finalized = JSON.parse(readFileSync(join(fireDir, 'jobs', `${isoId}.json`), 'utf8'));
+	assert.equal(finalized.worktreeKept, true, 'the record says the worktree was kept');
+	assert.equal(finalized.worktreeFinalized, true, 'finalization is recorded once');
+
+	// Per-call isolation is refused with the place it actually lives.
+	const refusedIsolation = await toolOf(fireApi, 'subagent_spawn').run({
+		input: {description: 'refuse', prompt: 'x', subagent_type: 'iso', isolation: 'worktree'},
+	});
+	assert.equal(refusedIsolation.ok, false);
+	assert.match(refusedIsolation.error, /frontmatter/, 'the refusal points at the definition field');
+
+	// A repository that cannot provide a worktree fails before any worker is spawned.
+	const noRepoRuntime = makeRuntime({now: () => fixedNow, cwd: project, execPath: '/usr/bin/node'});
+	const noRepoApi = makeApi({spoolDir: fireDir, session: makeSession(), runtime: noRepoRuntime.runtime});
+	mod(noRepoApi.api, noRepoRuntime.runtime);
+	const noRepo = await toolOf(noRepoApi, 'subagent_spawn').run({
+		input: {description: 'no repo', prompt: 'x', subagent_type: 'iso'},
+	});
+	assert.equal(noRepo.ok, false, 'a failed worktree fails the spawn');
+	assert.match(noRepo.error, /git repository/, 'the error says why');
+	assert.equal(noRepoRuntime.spawnCalls.length, 0, 'no worker starts without its worktree');
+	ok('worktree isolation: fire creates it, the result removes or keeps and reports it');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
