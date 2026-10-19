@@ -5867,7 +5867,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const now = runtime.now();
 		const ttlMs = retentionMs();
 		const cutoff = now - ttlMs;
-		const expired: string[] = [];
+		const expired: {id: string; transcriptPath?: string}[] = [];
 		// A record's age lives in its timestamps, not its mtime: one sweeper, but the
 		// predicate decides. A running job is never expired.
 		sweepExpiredEntries(spool, jobsDir, now, {
@@ -5879,21 +5879,28 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					if (state === undefined || !isTerminal(state)) return false;
 					const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
 					if (settledAt === 0 || settledAt > cutoff) return false;
-					if (typeof job.id === 'string' && job.id.length > 0) expired.push(job.id);
+					if (typeof job.id === 'string' && job.id.length > 0) {
+						expired.push({
+							id: job.id,
+							...(typeof job.transcriptPath === 'string' && job.transcriptPath.length > 0
+								? {transcriptPath: job.transcriptPath}
+								: {}),
+						});
+					}
 					return true;
 				} catch {
 					return false;
 				}
 			},
 		});
-		for (const id of expired) {
+		for (const {id, transcriptPath} of expired) {
 			try {
 				spool.remove(join(logsDir, `${id}.log`));
 			} catch {
 				/* the log is already gone */
 			}
 			try {
-				spool.remove(join(transcriptsDir, `${id}.jsonl`));
+				spool.remove(transcriptPath ?? join(transcriptsDir, `${id}.jsonl`));
 			} catch {
 				/* the transcript is already gone */
 			}
