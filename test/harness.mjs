@@ -141,6 +141,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 	const statusCalls = [];
 	const shownEntries = [];
 	const userMessages = [];
+	const promptSubmits = [];
 	const stateValues = new Map();
 
 	const api = {
@@ -184,6 +185,13 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		sendUserMessage(text, options) {
 			userMessages.push({text, options});
 			return true;
+		},
+
+		// A session-agent initialPrompt is auto-submitted through this surface.
+		prompt: {
+			submit(text) {
+				promptSubmits.push(text);
+			},
 		},
 
 		// ---- clock
@@ -245,6 +253,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		statusCalls,
 		shownEntries,
 		userMessages,
+		promptSubmits,
 	};
 }
 

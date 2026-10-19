@@ -636,9 +636,21 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // is the one the worker sent. session/new is the only place an id is discovered.
     let sessionId;
     let configOptions = [];
+    // The MCP servers are resolved in the parent and scoped to this agent;
+    // session/new is where ACP attaches them to this job's session.
+    const mcpServers = Array.isArray(spec.mcpServers) ? spec.mcpServers : [];
+    if (mcpServers.length > 0) logWrite('[acp] mcp servers ' + mcpServers.map(server => server.name).join(', ') + '\\n');
+    // ACP exposes neither setting. Record the resolved value so the deviation is
+    // visible in the job log instead of silent; the host default still governs.
+    if (typeof spec.autoCompactWindow === 'number') {
+      logWrite('[acp] auto-compact window ' + spec.autoCompactWindow + ' requested; ACP has no option (host default applies)\\n');
+    }
+    if (typeof spec.cacheTtl === 'string') {
+      logWrite('[acp] cache TTL ' + spec.cacheTtl + ' requested; ACP has no option (host default applies)\\n');
+    }
     if (typeof spec.resumeSession === 'string' && spec.resumeSession.length > 0) {
       try {
-        const state = await request('session/resume', {sessionId: spec.resumeSession, cwd: spec.cwd, mcpServers: []});
+        const state = await request('session/resume', {sessionId: spec.resumeSession, cwd: spec.cwd, mcpServers: mcpServers});
         sessionId = spec.resumeSession;
         configOptions = state && Array.isArray(state.configOptions) ? state.configOptions : [];
         logWrite('[acp] resumed ' + sessionId + '\\n');
@@ -647,7 +659,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       }
     }
     if (sessionId === undefined) {
-      const session = await request('session/new', {cwd: spec.cwd, mcpServers: []});
+      const session = await request('session/new', {cwd: spec.cwd, mcpServers: mcpServers});
       if (!session || typeof session.sessionId !== 'string') throw new Error('session/new returned no sessionId');
       sessionId = session.sessionId;
       configOptions = Array.isArray(session.configOptions) ? session.configOptions : [];
@@ -786,6 +798,14 @@ export interface SpoolFs {
 	exists(file: string): boolean;
 }
 
+/** One bounded command's result: a value, never a throw. */
+export interface CommandResult {
+	ok: boolean;
+	stdout: string;
+	code?: number;
+	stderr?: string;
+}
+
 export interface Runtime {
 	now(): number;
 	spawn(command: string, args: string[], options: SpawnOptions): ChildHandle;
@@ -806,12 +826,7 @@ export interface Runtime {
 	 * One bounded, synchronous command. Optional so a test can leave the OS out; a
 	 * failure is a value, never a throw.
 	 */
-	run?(command: string, args: string[], options: {cwd?: string; timeoutMs?: number}): {
-		ok: boolean;
-		stdout: string;
-		code?: number;
-		stderr?: string;
-	};
+	run?(command: string, args: string[], options: {cwd?: string; timeoutMs?: number; env?: Record<string, string | undefined>}): CommandResult;
 }
 
 export type RuntimeOverrides = Partial<Omit<Runtime, 'fs'>> & {fs?: Partial<SpoolFs>};
@@ -877,6 +892,7 @@ const OS_RUNTIME: Runtime = {
 			encoding: 'utf8',
 			timeout: options.timeoutMs ?? 2000,
 			maxBuffer: 64 * 1024,
+			...(options.env !== undefined ? {env: {...process.env, ...options.env}} : {}),
 		});
 		return {
 			ok: result.status === 0,
@@ -920,6 +936,33 @@ export type AgentScope = (typeof AGENT_SCOPES)[number];
 
 export type AgentEntryKind = 'valid' | 'invalid' | 'duplicate';
 
+/** One MCP server an agent scopes to itself: referenced by name or inline. */
+export interface AgentMcpServer {
+	name: string;
+	/** Standard input server: a command and its arguments. */
+	command?: string;
+	args?: string[];
+	env?: Record<string, string>;
+	/** HTTP server. A server has either `command` or `url`. */
+	url?: string;
+}
+
+/** One command a definition's hooks run. A hook blocks on exit 2. */
+export interface AgentHookRule {
+	/** Tool-name filter: `*`, an exact name, `mcp__srv__*`, or `/regex/`. */
+	matcher?: string;
+	command: string;
+	timeoutMs?: number;
+}
+
+/** The definition hooks the worker registers while this agent is active. */
+export interface AgentHooks {
+	PreToolUse?: AgentHookRule[];
+	PostToolUse?: AgentHookRule[];
+	/** The spec's `Stop`; the runtime reports it as `SubagentStop`. */
+	Stop?: AgentHookRule[];
+}
+
 export interface AgentDefinition {
 	name: string;
 	description: string;
@@ -941,9 +984,21 @@ export interface AgentDefinition {
 	color?: string;
 	omitClaudeMd?: boolean;
 	effort?: string;
+	/** Inline or referenced MCP servers, scoped to this agent. */
+	mcpServers?: AgentMcpServer[];
+	/** PreToolUse/PostToolUse/Stop rules, active only while this agent runs. */
+	hooks?: AgentHooks;
+	/** Auto-submitted as the first user turn when this agent runs the session. */
+	initialPrompt?: string;
+	/** The requested auto-compact window; it can only lower the inherited one. */
+	autoCompactWindow?: number;
+	/** `experimental.cacheTtl`: `5m` or `1h`. */
+	cacheTtl?: CacheTtl;
 	readOnly?: boolean;
 	oneShot?: boolean;
 }
+
+export type CacheTtl = '5m' | '1h';
 
 export interface AgentEntry {
 	name: string;
@@ -1053,6 +1108,127 @@ function parseYamlScalar(raw: string): {ok: true; value: unknown} | {ok: false; 
 	return {ok: true, value: bare};
 }
 
+// A nested value is the same indentation language as the document, one level
+// down: mappings, block sequences, and scalars. It exists because `hooks`,
+// `mcpServers`, and `experimental` are maps, not opaque unknowns; every other
+// nested key is still accepted and simply never read.
+interface NestedLine {
+	indent: number;
+	text: string;
+}
+
+type NestedResult = {ok: true; value: unknown; next: number} | {ok: false; reason: string};
+
+function normalizeNestedLines(raw: string[]): NestedLine[] {
+	const lines = raw
+		.filter(line => line.trim().length > 0 && !line.trim().startsWith('#'))
+		.map(line => {
+			const indent = line.length - line.trimStart().length;
+			return {indent, text: line.slice(indent).replace(/\s+$/, '')};
+		});
+	if (lines.length === 0) return lines;
+	const margin = Math.min(...lines.map(line => line.indent));
+	return lines.map(line => ({indent: line.indent - margin, text: line.text}));
+}
+
+const isSequenceLine = (text: string): boolean => text === '-' || text.startsWith('- ');
+
+// `key: value`, where the colon must be followed by whitespace or end of line, so
+// `- https://example.test` stays a scalar and does not become a map.
+const MAP_LINE = /^([A-Za-z0-9_.-]+):(?:[ \t]+(.*))?$/;
+
+function parseYamlNode(lines: NestedLine[], start: number, indent: number): NestedResult {
+	const first = lines[start];
+	if (first === undefined) return {ok: true, value: undefined, next: start};
+	return isSequenceLine(first.text) ? parseYamlSequence(lines, start, indent) : parseYamlMapping(lines, start, indent);
+}
+
+function parseYamlSequence(lines: NestedLine[], start: number, indent: number): NestedResult {
+	const values: unknown[] = [];
+	let index = start;
+	while (index < lines.length) {
+		const line = lines[index];
+		if (line.indent < indent) break;
+		if (line.indent > indent) return {ok: false, reason: `unexpected indentation`};
+		if (!isSequenceLine(line.text)) break;
+		const rest = line.text === '-' ? '' : line.text.slice(2);
+		const trimmed = rest.trim();
+		if (trimmed.length === 0) {
+			const next = lines[index + 1];
+			if (next !== undefined && next.indent > indent) {
+				const nested = parseYamlNode(lines, index + 1, next.indent);
+				if (!nested.ok) return nested;
+				values.push(nested.value);
+				index = nested.next;
+			} else {
+				values.push(null);
+				index += 1;
+			}
+			continue;
+		}
+		// A sequence item can open a mapping: `- matcher: Bash`, then sibling keys at
+		// the same content column. The synthesized first line sits at that column, and
+		// the following raw lines are already indented relative to it.
+		const map = MAP_LINE.exec(trimmed);
+		if (map !== null) {
+			// The content column is where the first non-space after `-` starts.
+			const base = indent + (line.text.length - trimmed.length);
+			const itemLines: NestedLine[] = [{indent: base, text: trimmed}];
+			let cursor = index + 1;
+			while (cursor < lines.length && lines[cursor].indent > indent) {
+				itemLines.push(lines[cursor]);
+				cursor += 1;
+			}
+			const nested = parseYamlNode(itemLines, 0, base);
+			if (!nested.ok) return nested;
+			values.push(nested.value);
+			index = cursor;
+			continue;
+		}
+		const parsed = parseYamlScalar(trimmed);
+		if (!parsed.ok) return parsed;
+		values.push(parsed.value);
+		index += 1;
+	}
+	return {ok: true, value: values, next: index};
+}
+
+function parseYamlMapping(lines: NestedLine[], start: number, indent: number): NestedResult {
+	const value: Record<string, unknown> = {};
+	let index = start;
+	while (index < lines.length) {
+		const line = lines[index];
+		if (line.indent < indent) break;
+		if (line.indent > indent) return {ok: false, reason: 'unexpected indentation'};
+		const match = MAP_LINE.exec(line.text);
+		if (match === null) return {ok: false, reason: `expected key: value, got "${line.text.slice(0, 40)}"`};
+		const key = match[1];
+		const inline = (match[2] ?? '').trim();
+		if (Object.hasOwn(value, key)) return {ok: false, reason: `duplicate key "${key}"`};
+		const next = lines[index + 1];
+		if (inline.length > 0) {
+			if (next !== undefined && next.indent > indent) {
+				return {ok: false, reason: `unexpected indentation under "${key}"`};
+			}
+			const parsed = parseYamlScalar(inline);
+			if (!parsed.ok) return parsed;
+			value[key] = parsed.value;
+			index += 1;
+			continue;
+		}
+		if (next !== undefined && next.indent > indent) {
+			const nested = parseYamlNode(lines, index + 1, next.indent);
+			if (!nested.ok) return nested;
+			value[key] = nested.value;
+			index = nested.next;
+			continue;
+		}
+		value[key] = undefined;
+		index += 1;
+	}
+	return {ok: true, value, next: index};
+}
+
 export function parseFrontmatter(source: string): FrontmatterResult {
 	const text = source.startsWith('\uFEFF') ? source.slice(1) : source;
 	const lines = text.split('\n');
@@ -1067,7 +1243,9 @@ export function parseFrontmatter(source: string): FrontmatterResult {
 	if (close < 0) return {ok: false, reason: 'frontmatter is not closed'};
 
 	// Group top-level keys with their indented lines before parsing any value, so a
-	// block scalar and a block list are one case rather than interleaved state.
+	// block scalar and a block list are one case rather than interleaved state. The
+	// raw lines are kept: a nested value (`mcpServers`, `hooks`, `experimental`) is
+	// parsed by indentation below.
 	const blocks: {key: string; inline: string; lines: string[]}[] = [];
 	for (let index = 1; index < close; index += 1) {
 		const line = lines[index];
@@ -1080,7 +1258,7 @@ export function parseFrontmatter(source: string): FrontmatterResult {
 		const indent = line.length - line.trimStart().length;
 		if (indent > 0) {
 			if (blocks.length === 0) return {ok: false, reason: 'unexpected indentation'};
-			blocks[blocks.length - 1].lines.push(line.slice(Math.min(indent, 2)));
+			blocks[blocks.length - 1].lines.push(line);
 			continue;
 		}
 		const match = /^([A-Za-z0-9_.-]+):(.*)$/.exec(line);
@@ -1093,31 +1271,25 @@ export function parseFrontmatter(source: string): FrontmatterResult {
 		if (Object.hasOwn(fields, block.key)) return {ok: false, reason: `duplicate key "${block.key}"`};
 		const blockScalar = block.inline === '|' || block.inline === '|-' || block.inline === '>' || block.inline === '>-';
 		if (blockScalar) {
-			const body = block.lines.map(line => line.replace(/\s+$/, ''));
+			// A block scalar keeps its relative indentation; only the common margin and
+			// the surrounding blank lines are removed.
+			const filled = block.lines.filter(line => line.trim().length > 0);
+			const margin =
+				filled.length === 0
+					? 0
+					: Math.min(...filled.map(line => line.length - line.trimStart().length));
+			const body = block.lines.map(line => (line.trim().length === 0 ? '' : line.slice(margin).replace(/\s+$/, '')));
 			fields[block.key] = (block.inline.startsWith('>') ? body.join(' ') : body.join('\n')).replace(/^\n+|\n+$/g, '');
 			continue;
 		}
-		if (block.inline.length === 0 && block.lines.length > 0) {
-			const first = block.lines.find(line => line.trim().length > 0);
-			if (first !== undefined && first.trim().startsWith('- ')) {
-				const values: unknown[] = [];
-				for (const line of block.lines) {
-					const item = line.trim();
-					if (item.length === 0) continue;
-					if (!item.startsWith('- ')) return {ok: false, reason: `expected a list item, got "${item.slice(0, 40)}"`};
-					const parsed = parseYamlScalar(item.slice(2));
-					if (!parsed.ok) return parsed;
-					values.push(parsed.value);
-				}
-				fields[block.key] = values;
-				continue;
-			}
-			// A nested map. Unknown fields are ignored by contract, so its contents do
-			// not need to be understood; storing null keeps the key known.
-			fields[block.key] = null;
+		const hasNested = block.lines.some(line => line.trim().length > 0);
+		if (block.inline.length === 0 && hasNested) {
+			const parsed = parseYamlNode(normalizeNestedLines(block.lines), 0, 0);
+			if (!parsed.ok) return parsed;
+			fields[block.key] = parsed.value;
 			continue;
 		}
-		if (block.lines.some(line => line.trim().length > 0)) {
+		if (hasNested) {
 			return {ok: false, reason: `unexpected indentation under "${block.key}"`};
 		}
 		if (block.inline.length === 0) {
@@ -1159,6 +1331,293 @@ function booleanField(value: unknown): boolean | undefined {
 function numberField(value: unknown): number | undefined {
 	const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
 	return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : undefined;
+}
+
+function stringMapField(value: unknown): Record<string, string> | undefined {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+	const out: Record<string, string> = {};
+	for (const [key, raw] of Object.entries(value as Record<string, unknown>)) {
+		if (typeof raw !== 'string') continue;
+		out[key] = raw;
+	}
+	return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function serverFields(value: Record<string, unknown>): Omit<AgentMcpServer, 'name'> | undefined {
+	const command = stringField(value.command);
+	const url = stringField(value.url);
+	const args = listField(value.args);
+	const env = stringMapField(value.env);
+	if (command === undefined && url === undefined) return undefined;
+	return {
+		...(command !== undefined ? {command} : {}),
+		...(args !== undefined ? {args} : {}),
+		...(env !== undefined ? {env} : {}),
+		...(url !== undefined ? {url} : {}),
+	};
+}
+
+// `mcpServers` accepts the host's map form, a list of names (references to the
+// configured servers), and a list of inline servers. A plugin's servers are
+// ignored by contract, so parsing is skipped there rather than resolved later.
+export function parseMcpServers(value: unknown): AgentMcpServer[] | undefined {
+	const out: AgentMcpServer[] = [];
+	if (typeof value === 'string') {
+		const name = stringField(value);
+		return name === undefined ? undefined : [{name}];
+	}
+	if (Array.isArray(value)) {
+		for (const item of value) {
+			if (typeof item === 'string') {
+				const name = stringField(item);
+				if (name !== undefined) out.push({name});
+				continue;
+			}
+			if (item === null || typeof item !== 'object') continue;
+			const record = item as Record<string, unknown>;
+			const name = stringField(record.name) ?? stringField(record.server);
+			if (name === undefined) continue;
+			out.push({name, ...serverFields(record)});
+		}
+	} else if (value !== null && typeof value === 'object') {
+		for (const [name, config] of Object.entries(value as Record<string, unknown>)) {
+			const clean = name.trim();
+			if (clean.length === 0) continue;
+			if (config === null || config === undefined || config === true) {
+				out.push({name: clean});
+				continue;
+			}
+			if (typeof config === 'string') {
+				out.push({name: clean, command: config});
+				continue;
+			}
+			if (typeof config === 'object' && !Array.isArray(config)) {
+				out.push({name: clean, ...serverFields(config as Record<string, unknown>)});
+			}
+		}
+	}
+	return out.length > 0 ? out : undefined;
+}
+
+// A hook rule is a command string, or a map with `command` plus an optional
+// `matcher` and `timeout` (seconds). The standard nested form
+// (`{matcher, hooks: [{type, command}]}`) is flattened, inheriting the matcher.
+function hookRule(value: unknown, inheritedMatcher?: string): AgentHookRule[] {
+	if (typeof value === 'string') {
+		const command = value.trim();
+		return command.length === 0 ? [] : [{command, ...(inheritedMatcher !== undefined ? {matcher: inheritedMatcher} : {})}];
+	}
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return [];
+	const record = value as Record<string, unknown>;
+	const matcher = stringField(record.matcher) ?? inheritedMatcher;
+	const nested = record.hooks;
+	if (nested !== undefined) {
+		// The wrapper only groups; the commands are the rules.
+		return Array.isArray(nested) ? nested.flatMap(item => hookRule(item, matcher)) : hookRule(nested, matcher);
+	}
+	const command = stringField(record.command);
+	if (command === undefined) return [];
+	const seconds = numberField(record.timeout);
+	return [
+		{
+			command,
+			...(matcher !== undefined ? {matcher} : {}),
+			...(seconds !== undefined ? {timeoutMs: seconds * 1000} : {}),
+		},
+	];
+}
+
+function hookList(value: unknown): AgentHookRule[] | undefined {
+	const rules = (Array.isArray(value) ? value : [value]).flatMap(item => hookRule(item));
+	return rules.length > 0 ? rules : undefined;
+}
+
+// Only the events the frontmatter reference defines are read. `SubagentStop` is
+// accepted as the runtime spelling of `Stop`; anything else is an unknown field.
+export function parseHooks(value: unknown): AgentHooks | undefined {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+	const byEvent: Record<string, AgentHookRule[]> = {};
+	for (const [event, raw] of Object.entries(value as Record<string, unknown>)) {
+		const normalized = event.replace(/[^a-z]/gi, '').toLowerCase();
+		const key =
+			normalized === 'pretooluse'
+				? 'PreToolUse'
+				: normalized === 'posttooluse'
+					? 'PostToolUse'
+					: normalized === 'stop' || normalized === 'subagentstop'
+						? 'Stop'
+						: undefined;
+		if (key === undefined) continue;
+		const rules = hookList(raw);
+		if (rules !== undefined) byEvent[key] = [...(byEvent[key] ?? []), ...rules];
+	}
+	return Object.keys(byEvent).length > 0 ? (byEvent as AgentHooks) : undefined;
+}
+
+export function parseCacheTtl(value: unknown): CacheTtl | undefined {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+	const ttl = stringField((value as Record<string, unknown>).cacheTtl);
+	return ttl === '5m' || ttl === '1h' ? ttl : undefined;
+}
+
+const AUTO_COMPACT_MIN = 100_000;
+const AUTO_COMPACT_MAX = 1_000_000;
+
+// The field may only LOWER the inherited window: a value outside the documented
+// range is clamped into it, and the result is the smaller of the two. The main
+// session never has one, by contract.
+export function resolveAutoCompactWindow(
+	inherited: number,
+	requested: number | undefined,
+	isMain: boolean,
+): number | undefined {
+	if (isMain || requested === undefined || !Number.isFinite(requested)) return undefined;
+	const bounded = Math.min(AUTO_COMPACT_MAX, Math.max(AUTO_COMPACT_MIN, Math.round(requested)));
+	return Math.min(inherited, bounded);
+}
+
+export interface AppendPromptInput {
+	readonly flag?: string;
+	readonly file?: string;
+	readonly env?: Record<string, string | undefined>;
+	readonly fs: Pick<SpoolFs, 'readFile'>;
+	readonly cwd: string;
+}
+
+// `--append-subagent-system-prompt` has no host flag, so it arrives as a mod flag
+// or an environment value (the ACP child inherits the environment, which is how a
+// nested subagent gets it too). The file form and the `@path` form both read text.
+export function resolveAppendSystemPrompt(input: AppendPromptInput): string {
+	const env = input.env ?? {};
+	const file = (
+		input.file ||
+		env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE ||
+		env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE ||
+		''
+	).trim();
+	const value = (
+		input.flag ||
+		env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT ||
+		env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT ||
+		''
+	).trim();
+	const read = (path: string): string => {
+		try {
+			return input.fs.readFile(isAbsolute(path) ? path : join(input.cwd, path)).trim();
+		} catch {
+			return '';
+		}
+	};
+	const parts: string[] = [];
+	if (file.length > 0) {
+		const text = read(file);
+		if (text.length > 0) parts.push(text);
+	}
+	if (value.startsWith('@')) {
+		const text = read(value.slice(1).trim());
+		if (text.length > 0) parts.push(text);
+	} else if (value.length > 0) {
+		parts.push(value);
+	}
+	return parts.join('\n\n');
+}
+
+// A matcher is `*`, an exact tool name, a pipe list, a `/regex/`, or a glob such
+// as `mcp__server__*`. Tool names are case-insensitive, like the host's.
+export function hookMatches(matcher: string | undefined, toolName: string): boolean {
+	const pattern = (matcher ?? '').trim();
+	if (pattern.length === 0 || pattern === '*') return true;
+	if (pattern.length > 2 && pattern.startsWith('/') && pattern.endsWith('/')) {
+		try {
+			return new RegExp(pattern.slice(1, -1), 'i').test(toolName);
+		} catch {
+			return false;
+		}
+	}
+	const glob = (value: string): boolean => {
+		const escaped = value.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*');
+		return new RegExp(`^${escaped}$`, 'i').test(toolName);
+	};
+	return pattern.split('|').some(part => glob(part.trim()));
+}
+
+export interface HookDetail {
+	readonly event: 'PreToolUse' | 'PostToolUse' | 'SubagentStart' | 'SubagentStop';
+	readonly cwd: string;
+	readonly agent?: string;
+	readonly toolName?: string;
+	readonly input?: unknown;
+	readonly result?: unknown;
+}
+
+export interface HookOutcome {
+	/** A PreToolUse hook requested a block; the text becomes the tool result. */
+	block?: string;
+	/** A PostToolUse hook's message for the model. */
+	additionalContext?: string;
+	/** A SubagentStop hook requested another turn. */
+	continue?: boolean;
+	reason?: string;
+	/** How many commands actually ran. */
+	ran: number;
+}
+
+const HOOK_TIMEOUT_MS = 10_000;
+
+// The command-hook contract: exit 0 allows, exit 2 blocks (PreToolUse), feeds the
+// model (PostToolUse), or continues the run (SubagentStop), and any other exit is a
+// non-blocking failure. Every rule gets the event, agent, tool and payload in its
+// environment, so one script can serve all events.
+export function runHookRules(
+	run: Runtime['run'],
+	rules: readonly AgentHookRule[] | undefined,
+	detail: HookDetail,
+): HookOutcome {
+	const outcome: HookOutcome = {ran: 0};
+	if (run === undefined || rules === undefined || rules.length === 0) return outcome;
+	const contexts: string[] = [];
+	for (const rule of rules) {
+		if ((detail.event === 'PreToolUse' || detail.event === 'PostToolUse') && !hookMatches(rule.matcher, detail.toolName ?? '')) {
+			continue;
+		}
+		const env: Record<string, string> = {
+			BETTER_SUBAGENTS_HOOK_EVENT: detail.event,
+			BETTER_SUBAGENTS_HOOK_AGENT: detail.agent ?? '',
+			BETTER_SUBAGENTS_HOOK_TOOL_NAME: detail.toolName ?? '',
+			BETTER_SUBAGENTS_HOOK_TOOL_INPUT: JSON.stringify(detail.input ?? {}),
+			BETTER_SUBAGENTS_HOOK_RESULT: JSON.stringify(detail.result ?? null),
+			BETTER_SUBAGENTS_HOOK_CWD: detail.cwd,
+		};
+		let result: CommandResult;
+		try {
+			result = run('/bin/sh', ['-c', rule.command], {
+				cwd: detail.cwd,
+				timeoutMs: rule.timeoutMs ?? HOOK_TIMEOUT_MS,
+				env,
+			});
+		} catch {
+			continue;
+		}
+		outcome.ran += 1;
+		const code = typeof result.code === 'number' ? result.code : result.ok ? 0 : 1;
+		if (code !== 2) continue;
+		const message = (result.stderr || result.stdout || '').trim();
+		if (detail.event === 'PreToolUse') {
+			outcome.block = message.length > 0 ? message : 'Blocked by a PreToolUse hook.';
+			return outcome;
+		}
+		if (detail.event === 'PostToolUse') {
+			if (message.length > 0) contexts.push(message);
+			continue;
+		}
+		if (detail.event === 'SubagentStop') {
+			outcome.continue = true;
+			outcome.reason = message.length > 0 ? message : 'SubagentStop hook requested another turn.';
+			return outcome;
+		}
+	}
+	if (contexts.length > 0) outcome.additionalContext = contexts.join('\n\n');
+	return outcome;
 }
 
 export interface AgentDefinitionOptions {
@@ -1292,6 +1751,21 @@ export function agentDefinitionFromSource(
 	if (background !== undefined) definition.background = background;
 	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
 	if (memory !== undefined) definition.memory = memory;
+	// A plugin ignores mcpServers, hooks, and initialPrompt by contract: the host
+	// owns a plugin's servers, hooks, and first turn. autoCompactWindow and
+	// experimental.cacheTtl still apply, because the agent still runs as a subagent.
+	if (options.plugin !== true) {
+		const mcpServers = parseMcpServers(fields.mcpServers);
+		const hooks = parseHooks(fields.hooks);
+		const initialPrompt = stringField(fields.initialPrompt);
+		if (mcpServers !== undefined) definition.mcpServers = mcpServers;
+		if (hooks !== undefined) definition.hooks = hooks;
+		if (initialPrompt !== undefined) definition.initialPrompt = initialPrompt;
+	}
+	const autoCompactWindow = numberField(fields.autoCompactWindow);
+	const cacheTtl = parseCacheTtl(fields.experimental);
+	if (autoCompactWindow !== undefined) definition.autoCompactWindow = autoCompactWindow;
+	if (cacheTtl !== undefined) definition.cacheTtl = cacheTtl;
 	return {ok: true, definition};
 }
 
@@ -1389,6 +1863,15 @@ function cliAgentDefinition(
 	const omitClaudeMd = booleanField(spec.omitClaudeMd);
 	if (background !== undefined) definition.background = background;
 	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	const mcpServers = parseMcpServers(spec.mcpServers);
+	const hooks = parseHooks(spec.hooks);
+	const initialPrompt = stringField(spec.initialPrompt);
+	const autoCompactWindow = numberField(spec.autoCompactWindow);
+	if (mcpServers !== undefined) definition.mcpServers = mcpServers;
+	if (hooks !== undefined) definition.hooks = hooks;
+	if (initialPrompt !== undefined) definition.initialPrompt = initialPrompt;
+	if (autoCompactWindow !== undefined) definition.autoCompactWindow = autoCompactWindow;
+	// `color` and `experimental` are ignored for a CLI definition by contract.
 	return {ok: true, definition};
 }
 
@@ -2136,6 +2619,12 @@ export interface WorkerSpecInput {
 	/** The resolved tool capabilities; the worker logs them and never widens them. */
 	tools?: string[];
 	disallowedTools?: string[];
+	/** The MCP servers scoped to this agent; `session/new` receives exactly these. */
+	mcpServers?: AgentMcpServer[];
+	/** The resolved auto-compact window, never larger than inherited. */
+	autoCompactWindow?: number;
+	/** `experimental.cacheTtl`: `5m` or `1h`. ACP has no option; the adapter logs it. */
+	cacheTtl?: CacheTtl;
 	permissionMode?: string;
 	/** how long an inline prompt waits before settling waiting-input; default 30s */
 	permissionTimeoutMs?: number;
@@ -2833,25 +3322,164 @@ export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResoluti
 	};
 }
 
-// MCP server names come from the host's config files. Discovery is best-effort: a
-// missing or malformed file means "no MCP tools known", never a session error.
-export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
-	const names: string[] = [];
+export interface McpServerConfig {
+	command?: string;
+	args?: string[];
+	env?: Record<string, string>;
+	url?: string;
+}
+
+// MCP server configs come from the host's config files. Discovery is best-effort:
+// a missing or malformed file means "no MCP server known", never a session error.
+// The first directory wins, matching the host's config precedence.
+export function mcpServerConfigs(
+	fs: Pick<SpoolFs, 'readFile'>,
+	dirs: string[],
+): Record<string, McpServerConfig> {
+	const configs: Record<string, McpServerConfig> = {};
 	for (const dir of dirs.slice(0, 4)) {
 		if (typeof dir !== 'string' || dir.length === 0) continue;
 		try {
 			const parsed = JSON.parse(fs.readFile(join(dir, '.commandcode', 'mcp.json'))) as {
-				mcpServers?: Record<string, {enabled?: boolean} | undefined>;
+				mcpServers?: Record<string, Record<string, unknown> | undefined>;
 			};
 			for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
-				if (name.length === 0 || config?.enabled === false) continue;
-				if (!names.includes(name)) names.push(name);
+				if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
+				if (config === null || typeof config !== 'object') continue;
+				const command = stringField(config.command);
+				const url = stringField(config.url);
+				const args = listField(config.args);
+				const env = stringMapField(config.env);
+				configs[name] = {
+					...(command !== undefined ? {command} : {}),
+					...(args !== undefined ? {args} : {}),
+					...(env !== undefined ? {env} : {}),
+					...(url !== undefined ? {url} : {}),
+				};
 			}
 		} catch {
 			/* no MCP config here */
 		}
 	}
-	return names;
+	return configs;
+}
+
+export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
+	return Object.keys(mcpServerConfigs(fs, dirs));
+}
+
+export interface McpTrustRoots {
+	readonly cwd: string;
+	readonly home: string;
+	readonly managedDir?: string;
+	readonly addDirs?: readonly string[];
+}
+
+// An inline server runs a command, so the folder that declares it must be one the
+// session already trusts: the workspace, home, the managed directory, or an
+// --add-dir. A plugin is never trusted with an inline server.
+export function agentFolderTrusted(
+	definition: {readonly source?: string; readonly path?: string},
+	roots: McpTrustRoots,
+): boolean {
+	if (definition.source === 'plugin') return false;
+	const path = definition.path;
+	if (path === undefined || path.length === 0) return true;
+	const absolute = isAbsolute(path) ? path : join(roots.cwd, path);
+	const trustedRoots = [
+		roots.cwd,
+		roots.home,
+		roots.managedDir ?? join(roots.home, '.commandcode', 'managed'),
+		...(roots.addDirs ?? []),
+	];
+	return trustedRoots.some(root => root.length > 0 && isInside(root, absolute));
+}
+
+export interface McpResolutionInput {
+	/** The definition's authored `mcpServers`. */
+	readonly defined?: readonly AgentMcpServer[];
+	readonly configured?: Record<string, McpServerConfig>;
+	readonly definition?: {readonly source?: string; readonly path?: string};
+	readonly env?: Record<string, string | undefined>;
+	/** The caller's trust decision; `false` drops every inline server. */
+	readonly trusted?: boolean;
+}
+
+export interface McpDrop {
+	readonly name: string;
+	readonly reason: string;
+}
+
+export interface McpResolution {
+	readonly servers: AgentMcpServer[];
+	readonly dropped: McpDrop[];
+}
+
+function commaList(value: string | undefined): string[] {
+	return String(value ?? '')
+		.split(',')
+		.map(item => item.trim())
+		.filter(Boolean);
+}
+
+// The one resolution: a name resolves from configured servers, an inline entry
+// needs trust, and strict/bare/allow/deny policies apply afterwards. The result
+// is what `session/new` receives, so the scope is exactly this agent's.
+export function resolveAgentMcpServers(input: McpResolutionInput = {}): McpResolution {
+	const env = input.env ?? {};
+	const defined = input.defined ?? [];
+	const dropped: McpDrop[] = [];
+	if (input.definition?.source === 'plugin') {
+		for (const spec of defined) dropped.push({name: spec.name, reason: 'plugin definitions ignore mcpServers'});
+		return {servers: [], dropped};
+	}
+	const bare = env.BETTER_SUBAGENTS_BARE ?? env.CLAUDE_CODE_BARE;
+	if (bare === '1' || bare === 'true') {
+		for (const spec of defined) dropped.push({name: spec.name, reason: 'bare mode disables MCP'});
+		return {servers: [], dropped};
+	}
+	const strictConfig = env.BETTER_SUBAGENTS_STRICT_MCP_CONFIG ?? env.CLAUDE_CODE_STRICT_MCP_CONFIG;
+	const strict = strictConfig === '1' || strictConfig === 'true';
+	const allow = commaList(env.BETTER_SUBAGENTS_MCP_ALLOW ?? env.CLAUDE_CODE_MCP_ALLOW);
+	const deny = commaList(env.BETTER_SUBAGENTS_MCP_DENY ?? env.CLAUDE_CODE_MCP_DENY);
+	const trusted = input.trusted !== false;
+	const servers: AgentMcpServer[] = [];
+	const seen = new Set<string>();
+	for (const spec of defined) {
+		const name = spec.name.trim();
+		if (name.length === 0 || seen.has(name)) continue;
+		const inline = spec.command !== undefined || spec.url !== undefined;
+		let resolved: AgentMcpServer;
+		if (inline) {
+			if (!trusted) {
+				dropped.push({name, reason: 'inline server outside a trusted folder'});
+				continue;
+			}
+			if (strict) {
+				dropped.push({name, reason: 'strict MCP config ignores inline servers'});
+				continue;
+			}
+			resolved = {...spec, name};
+		} else {
+			const config = input.configured?.[name];
+			if (config === undefined) {
+				dropped.push({name, reason: 'not configured'});
+				continue;
+			}
+			resolved = {name, ...config};
+		}
+		if (deny.includes('*') || deny.includes(name)) {
+			dropped.push({name, reason: 'denied by the MCP policy'});
+			continue;
+		}
+		if (allow.length > 0 && !allow.includes('*') && !allow.includes(name)) {
+			dropped.push({name, reason: 'not in the MCP allow policy'});
+			continue;
+		}
+		seen.add(name);
+		servers.push(resolved);
+	}
+	return {servers, dropped};
 }
 
 // ---------------------------------------------------------------------------
@@ -3002,6 +3630,10 @@ interface JobRecord extends JobIdentity {
 	background?: boolean;
 	model?: string;
 	tools?: string[];
+	/** The MCP servers scoped to this agent; a resume keeps the same scope. */
+	mcpServers?: AgentMcpServer[];
+	autoCompactWindow?: number;
+	cacheTtl?: CacheTtl;
 	color?: string;
 	maxTurns?: number;
 	timeoutMs?: number;
@@ -3018,6 +3650,8 @@ interface JobRecord extends JobIdentity {
 	worktreeRepo?: string;
 	/** Checkout roots the worker must never enter. */
 	mainCheckouts?: string[];
+	/** Set once the project SubagentStop hook ran for this terminal job. */
+	subagentStopHook?: boolean;
 	/** Set once cleanup decided: the worktree was removed, or kept. */
 	worktreeFinalized?: boolean;
 	worktreeKept?: boolean;
@@ -3576,6 +4210,24 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		default: '',
 		description: 'Comma-separated plugin roots; every child directory with an agents/ dir is a plugin.',
 	});
+	// The host has no `--agent` or `--append-subagent-system-prompt` flag, so both
+	// arrive as mod options (or the documented environment aliases). Recorded in
+	// docs/adr/0001-worker-and-control.md.
+	cmd.addFlag('agent', {
+		type: 'string',
+		default: '',
+		description: 'Run this session as the named agent definition (--agent <name>).',
+	});
+	cmd.addFlag('append_subagent_system_prompt', {
+		type: 'string',
+		default: '',
+		description: 'Text, or @path, appended to every subagent system prompt (--append-subagent-system-prompt).',
+	});
+	cmd.addFlag('append_subagent_system_prompt_file', {
+		type: 'string',
+		default: '',
+		description: 'File whose text is appended to every subagent system prompt.',
+	});
 
 	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
 	// A flag still sitting on its default is not an override; anything else is.
@@ -3685,6 +4337,49 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		};
 	}
 
+	// The session-wide agent: `--agent <name>` as a mod option, or the environment
+	// alias. The host has no such flag, so a mod flag or env is the documented
+	// deviation. A worker never sets one: it is already an agent.
+	const sessionAgentName = (): string => {
+		if (workerMode) return '';
+		return (readFlag('agent') || runtime.env.BETTER_SUBAGENTS_AGENT || runtime.env.CLAUDE_CODE_AGENT || '').trim();
+	};
+	function sessionAgent(): AgentDefinition | undefined {
+		const name = sessionAgentName();
+		return name.length === 0 ? undefined : registry.get(name);
+	}
+	let initialPromptSubmitted = false;
+
+	// initialPrompt is the main session's first turn, never a subagent's. The host
+	// exposes `cmd.prompt.submit`; when it is absent, transformInput prepends the
+	// value to the first typed prompt instead.
+	function submitInitialPrompt(): void {
+		if (initialPromptSubmitted || workerMode) return;
+		const text = sessionAgent()?.initialPrompt;
+		if (text === undefined || !('prompt' in cmd)) return;
+		const promptApi = cmd.prompt;
+		if (promptApi === null || typeof promptApi !== 'object' || !('submit' in promptApi)) return;
+		const submit = promptApi.submit;
+		if (typeof submit !== 'function') return;
+		submit(text);
+		initialPromptSubmitted = true;
+	}
+
+	// The text every subagent's system prompt gets, from the flag, the file form,
+	// the @path form, or the environment alias. A fork is exempt because it reuses
+	// the main conversation's prompt (phase 15).
+	function subagentSystemPrompt(base: string | undefined): string | undefined {
+		const appended = resolveAppendSystemPrompt({
+			flag: readFlag('append_subagent_system_prompt'),
+			file: readFlag('append_subagent_system_prompt_file'),
+			env: runtime.env,
+			fs: spool,
+			cwd: runtime.cwd,
+		});
+		const parts = [base ?? '', appended].filter(part => part.length > 0);
+		return parts.length > 0 ? parts.join('\n\n') : undefined;
+	}
+
 	// The worker's system prompt: the definition body, the rendered sibling roster
 	// (supplied by the live session), then the startup bundle. The parent builds
 	// all three, so the hook is registered only in worker mode and only when there
@@ -3722,6 +4417,34 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			gitStatus: gitStatusSnapshot(runtime, cwd),
 			now: runtime.now(),
 		}).text;
+	}
+
+	// Project hooks: `.commandcode/hooks.json` from the working directory up to the
+	// repository root. Nearest first, so a nested project's hooks run before its
+	// parent's. A missing or malformed file contributes nothing, never an error.
+	function projectHookRules(event: 'SubagentStart' | 'SubagentStop'): AgentHookRule[] {
+		const rules: AgentHookRule[] = [];
+		let current = runtime.cwd;
+		for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+			try {
+				const parsed = JSON.parse(spool.readFile(join(current, '.commandcode', 'hooks.json'))) as Record<string, unknown>;
+				const found = hookList(parsed?.[event]);
+				if (found !== undefined) rules.push(...found);
+			} catch {
+				/* no hooks here */
+			}
+			try {
+				// `stat` covers both a normal `.git` directory and a linked worktree's file.
+				spool.stat(join(current, '.git'));
+				break;
+			} catch {
+				/* treat an unreadable marker as absent */
+			}
+			const parent = dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+		return rules;
 	}
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
@@ -4289,8 +5012,29 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
+	// SubagentStop is the counterpart to SubagentStart. The parent observes the
+	// terminal record and fires once; the marker is on the record, so a refresh, a
+	// restart reconcile, and a second session cannot fire it twice.
+	function sweepSubagentStopHooks(): void {
+		if (workerMode) return;
+		const owner = ownerId();
+		for (const job of jobCache) {
+			const state = normalizeState(job.state);
+			if (state === undefined || !isTerminal(state) || job.subagentStopHook === true) continue;
+			if (typeof job.owner === 'string' && job.owner.length > 0 && job.owner !== owner) continue;
+			runHookRules(runtime.run, projectHookRules('SubagentStop'), {
+				event: 'SubagentStop',
+				cwd: String(job.cwd ?? runtime.cwd),
+				agent: job.agentType,
+				input: {id: job.id, state},
+			});
+			writeJob({...job, subagentStopHook: true, updatedAt: runtime.now()});
+		}
+	}
+
 	function refreshJobs(): void {
 		jobCache = readRecentJobs(LIST_SCAN_MAX);
+		sweepSubagentStopHooks();
 		updateStatus();
 		const signature = jobCache.map(job => `${job.id}:${canonicalState(job.state)}`).join('|');
 		if (signature !== lastJobsSignature) {
@@ -4429,6 +5173,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		/** The resolved tool capabilities for an agent job. */
 		readonly tools?: string[];
 		readonly disallowedTools?: string[];
+		/** The MCP servers scoped to this agent. */
+		readonly mcpServers?: AgentMcpServer[];
+		/** The resolved auto-compact window; only ever lowers the inherited one. */
+		readonly autoCompactWindow?: number;
+		readonly cacheTtl?: CacheTtl;
 		readonly color?: string;
 		readonly permissionMode?: string;
 		readonly isolation?: string;
@@ -4500,6 +5249,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
 			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+			...(intent.mcpServers !== undefined ? {mcpServers: intent.mcpServers} : {}),
+			...(intent.autoCompactWindow !== undefined ? {autoCompactWindow: intent.autoCompactWindow} : {}),
+			...(intent.cacheTtl !== undefined ? {cacheTtl: intent.cacheTtl} : {}),
 			...(intent.color !== undefined ? {color: intent.color} : {}),
 			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 			...(intent.effort !== undefined ? {effort: intent.effort} : {}),
@@ -4546,6 +5298,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		latest.workerPid = worker.pid;
 		latest.updatedAt = runtime.now();
 		writeJob(latest);
+		// SubagentStart is a project hook: it runs once the job actually started.
+		runHookRules(runtime.run, projectHookRules('SubagentStart'), {
+			event: 'SubagentStart',
+			cwd: spec.cwd,
+			agent: spec.agentType,
+			input: {id, label: record.label, kind: record.kind},
+		});
 		refreshJobs();
 		return {ok: true, id, pid: worker.pid};
 	}
@@ -4650,6 +5409,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.model !== undefined ? {model: intent.model} : {}),
 				...(intent.tools !== undefined ? {tools: intent.tools} : {}),
 				...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
+				...(intent.mcpServers !== undefined ? {mcpServers: intent.mcpServers} : {}),
+				...(intent.autoCompactWindow !== undefined ? {autoCompactWindow: intent.autoCompactWindow} : {}),
+				...(intent.cacheTtl !== undefined ? {cacheTtl: intent.cacheTtl} : {}),
 				...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 				...(intent.effort !== undefined ? {effort: intent.effort} : {}),
 				...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
@@ -4860,6 +5622,27 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				definitionBackground: definition?.background,
 				env: runtime.env,
 			}) === 'background';
+		// MCP servers are resolved once, for this agent: a reference reads the host's
+		// config, an inline entry needs a trusted folder, and bare/strict/allow/deny
+		// still apply. The result scopes `session/new`; the tool pool is widened by
+		// the same names so a definition can list `mcp__server__*`.
+		const configuredMcp = mcpServerConfigs(spool, [runtime.home, runtime.cwd]);
+		const mcp = resolveAgentMcpServers({
+			defined: definition?.mcpServers ?? [],
+			configured: configuredMcp,
+			definition,
+			env: runtime.env,
+			trusted:
+				definition === undefined ||
+				agentFolderTrusted(definition, {
+					cwd: runtime.cwd,
+					home: runtime.home,
+					managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+					addDirs: splitFlag(ADD_DIRS_OPTION),
+				}),
+		});
+		const mcpNames = Object.keys(configuredMcp);
+		for (const server of mcp.servers) if (!mcpNames.includes(server.name)) mcpNames.push(server.name);
 		const launch = resolveLaunch({
 			...(model !== undefined ? {requestedModel: model} : {}),
 			...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
@@ -4872,7 +5655,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
 			...(permissionMode !== undefined ? {permissionMode} : {}),
 			background,
-			mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
+			mcpServers: mcpNames,
 		});
 		if (!launch.ok) return badInput(launch.error);
 		// Memory definitions auto-enable Read, Write, and Edit.
@@ -4884,6 +5667,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					? Math.round(requestedMaxTurns)
 					: definition?.maxTurns;
 		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
+		// The auto-compact window only lowers what this agent's own model gives it.
+		const compactWindow = resolveAutoCompactWindow(
+			contextWindowForModel(launch.model, runtime.env),
+			definition?.autoCompactWindow,
+			false,
+		);
 		const launched = await fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
@@ -4892,12 +5681,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			background,
 			cwd: runCwd,
 			agentType: definition?.name,
-			systemPrompt: definition?.systemPrompt,
+			systemPrompt: subagentSystemPrompt(definition?.systemPrompt),
 			startup: startupFor(definition, runCwd, prompt, launch.model),
 			model: prompt === undefined ? undefined : launch.model,
 			tools: prompt === undefined ? undefined : launchTools,
 			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
 			...(definition?.color !== undefined ? {color: definition.color} : {}),
+			...(prompt !== undefined ? {mcpServers: mcp.servers} : {}),
+			...(prompt !== undefined && compactWindow !== undefined ? {autoCompactWindow: compactWindow} : {}),
+			...(prompt !== undefined && definition?.cacheTtl !== undefined ? {cacheTtl: definition.cacheTtl} : {}),
 			maxTurns,
 			effort: prompt === undefined ? undefined : launch.effort,
 			permissionMode,
@@ -5038,6 +5830,26 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				definitionBackground: definition?.ok === true ? definition.definition.background : undefined,
 				env: runtime.env,
 			}) === 'background';
+		const resumedMcp =
+			resumeDefinition === undefined
+				? (record.mcpServers ?? [])
+				: resolveAgentMcpServers({
+						defined: resumeDefinition.mcpServers ?? [],
+						configured: mcpServerConfigs(spool, [runtime.home, runtime.cwd]),
+						definition: resumeDefinition,
+						env: runtime.env,
+						trusted: agentFolderTrusted(resumeDefinition, {
+							cwd: runtime.cwd,
+							home: runtime.home,
+							managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+							addDirs: splitFlag(ADD_DIRS_OPTION),
+						}),
+					}).servers;
+		const resumeCompact = resolveAutoCompactWindow(
+			contextWindowForModel(record.model, runtime.env),
+			resumeDefinition?.autoCompactWindow,
+			false,
+		);
 		const launched = await fire({
 			label: `${String(record.label ?? id)} (resume)`,
 			kind: 'agent',
@@ -5045,10 +5857,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			background,
 			cwd: resumeCwd,
 			agentType: record.agentType,
-			systemPrompt: resumeDefinition?.systemPrompt,
+			systemPrompt: subagentSystemPrompt(resumeDefinition?.systemPrompt),
 			startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(resumedMcp.length > 0 ? {mcpServers: resumedMcp} : {}),
+			...(resumeCompact !== undefined ? {autoCompactWindow: resumeCompact} : {}),
+			...(resumeDefinition?.cacheTtl !== undefined ? {cacheTtl: resumeDefinition.cacheTtl} : {}),
 			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
 			effort: record.effort,
@@ -5353,6 +6168,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// the session and in the ACP worker, so one guard covers both: a subagent with a
 	// worktree, and any session that is itself a linked worktree.
 	const isolation = isolationRoots(git, String(workerSpec?.cwd ?? runtime.cwd), workerSpec);
+	// The definition's hooks live only in its worker; the parent never inherits them.
+	const workerHooks = workerMode ? workerSpec?.hooks : undefined;
+	const workerHookCwd = String(workerSpec?.cwd ?? runtime.cwd);
+	const workerHookAgent = workerSpec?.agentType;
 
 	cmd.hooks({
 		// The worker process loads this mod with `cmd --mod <file> acp`. Its whole
@@ -5365,19 +6184,64 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			? {appendSystemPrompt: () => workerSystemPrompt()}
 			: !workerMode
 				? {
+						// The session-wide agent's body is the main session's prompt; with no
+						// `--agent` this is a read-only tap for the permission mode.
 						appendSystemPrompt: (context?: {permissionMode?: unknown}) => {
 							noteMainPermissionMode(context?.permissionMode);
-							return '';
+							return sessionAgent()?.systemPrompt ?? '';
 						},
 					}
 				: {}),
+		// initialPrompt is a main-session first turn. If the host exposes
+		// `cmd.prompt.submit`, it is submitted there; otherwise the first typed
+		// prompt is prefixed, so the value is never silently dropped.
+		...(!workerMode && sessionAgent()?.initialPrompt !== undefined
+			? {
+					transformInput: (input: {text?: string}) => {
+						const text = sessionAgent()?.initialPrompt;
+						if (text === undefined || initialPromptSubmitted) return undefined;
+						initialPromptSubmitted = true;
+						return {action: 'transform', text: `${text}\n\n${String(input?.text ?? '')}`};
+					},
+				}
+			: {}),
 		// A blocked tool returns the reason as its result, so the model learns where it
-		// is allowed to work instead of silently retrying.
-		...(isolation !== undefined
+		// is allowed to work instead of silently retrying. The definition's PreToolUse
+		// hooks run after the isolation guard: a hook cannot widen a worktree.
+		...(isolation !== undefined || workerHooks?.PreToolUse !== undefined
 			? {
 					beforeToolCall: (call: {toolName?: string; input?: Record<string, unknown>}) => {
-						const verdict = guardToolCall(String(call?.toolName ?? ''), call?.input ?? {}, isolation);
-						return verdict === undefined ? undefined : {block: true, additionalContext: verdict.reason};
+						const verdict =
+							isolation === undefined
+								? undefined
+								: guardToolCall(String(call?.toolName ?? ''), call?.input ?? {}, isolation);
+						if (verdict !== undefined) return {block: true, additionalContext: verdict.reason};
+						const outcome = runHookRules(runtime.run, workerHooks?.PreToolUse, {
+							event: 'PreToolUse',
+							cwd: workerHookCwd,
+							agent: workerHookAgent,
+							toolName: String(call?.toolName ?? ''),
+							input: call?.input ?? {},
+						});
+						return outcome.block === undefined ? undefined : {block: true, additionalContext: outcome.block};
+					},
+				}
+			: {}),
+		// PostToolUse's exit 2 message reaches the model as an extra text block.
+		...(workerHooks?.PostToolUse !== undefined
+			? {
+					afterToolCall: (call: {toolName?: string; input?: Record<string, unknown>; result?: unknown}) => {
+						const outcome = runHookRules(runtime.run, workerHooks.PostToolUse, {
+							event: 'PostToolUse',
+							cwd: workerHookCwd,
+							agent: workerHookAgent,
+							toolName: String(call?.toolName ?? ''),
+							input: call?.input ?? {},
+							result: call?.result,
+						});
+						return outcome.additionalContext === undefined
+							? undefined
+							: {additionalContext: outcome.additionalContext};
 					},
 				}
 			: {}),
@@ -5394,6 +6258,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			reconcileJobs();
 			refreshJobs();
 			safeDrain();
+			// A resume already had its first turn; only a fresh start submits one.
+			if (info?.source !== 'resume' && info?.source !== 'reload') submitInitialPrompt();
 		},
 		// The race guard. A worker can finish in the window between the last turn and the
 		// next drain tick, and the session would then fall idle with the result unread.
@@ -5401,6 +6267,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// onStop inbox drain). Anything already delivered is no longer in the inbox, so
 		// this cannot double-report a signal.
 		onStop: () => {
+			// In a worker the definition's Stop hook is the subagent's SubagentStop:
+			// exit 2 asks for one more turn with the hook's message as the reason.
+			if (workerMode) {
+				const outcome = runHookRules(runtime.run, workerHooks?.Stop, {
+					event: 'SubagentStop',
+					cwd: workerHookCwd,
+					agent: workerHookAgent,
+				});
+				return outcome.continue === true
+					? {continue: true, reason: outcome.reason ?? 'SubagentStop hook requested another turn.'}
+					: undefined;
+			}
 			const pending = claimPending(5);
 			if (pending.length === 0) return undefined;
 			for (const claim of pending) {
