@@ -1926,14 +1926,28 @@ process.stdin.on('data', (data) => {
 	// Foreground returns the result, and that result is not also delivered as a
 	// background message.
 	const fgDir = mkdtempSync(join(tmpdir(), 'subagent-fg-'));
-	const fgAuto = autoSettle(fgDir, {state: 'done', log: 'FOREGROUND RESULT'});
-	const fgCase = modeCase(fgDir, {spawn: fgAuto.spawn});
+	const fgSpecs = [];
+	let fgSettled = false;
+	// The worker is still running when spawn returns; it settles only while the
+	// foreground call is waiting. So returning the result proves the call polled the
+	// record after the spawn instead of reading it once and giving up.
+	const fgCase = modeCase(fgDir, {
+		spawn(_command, _args, options) {
+			fgSpecs.push(JSON.parse(options.env.SUBAGENT_SPEC));
+			return makeChild();
+		},
+		async sleep() {
+			if (fgSettled || fgSpecs.length === 0) return;
+			fgSettled = true;
+			settleJob(fgDir, fgSpecs[0], {state: 'done', log: 'FOREGROUND RESULT'});
+		},
+	});
 	const fgOut = await toolOf(fgCase.bundle, 'subagent_spawn').run({
 		input: {description: 'fg', prompt: 'work', run_in_background: false},
 	});
 	assert.equal(fgOut.ok, true, `a foreground run must return the result: ${JSON.stringify(fgOut)}`);
 	assert.match(fgOut.content[0].text, /FOREGROUND RESULT/, 'the foreground result is in the tool result');
-	assert.equal(recordOf(fgDir, fgAuto.specs[0]).background, false, 'the record carries the foreground mode');
+	assert.equal(recordOf(fgDir, fgSpecs[0]).background, false, 'the record carries the foreground mode');
 	fgCase.bundle.everyTicks.find((tick) => tick.ms === 400).fn();
 	assert.ok(
 		!fgCase.bundle.userMessages.some((message) => message.text.includes('FOREGROUND RESULT')),
