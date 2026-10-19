@@ -1387,6 +1387,9 @@ process.stdin.on('data', (data) => {
 				model: 'test-model',
 				effort: 'low',
 				permissionMode: 'acceptEdits',
+				mcpServers: [{name: 'docs', command: 'node', args: ['docs.js']}],
+				autoCompactWindow: 150000,
+				cacheTtl: '1h',
 				promptMarkerPath: markerPath,
 				...(resumeSession === undefined ? {} : {resumeSession}),
 			},
@@ -1415,7 +1418,14 @@ process.stdin.on('data', (data) => {
 	const acp = await runAcpJob('acp-job', join(acpDir, 'logs', 'acp-job.mod'));
 	assert.match(acp.log, /ARGS \["--mod","\/mod\.ts","acp"\]/, 'the worker starts cmd --mod <file> acp');
 	assert.match(acp.log, /SESSION_NEW .*"cwd"/, 'session/new carries the cwd');
-	assert.match(acp.log, /SESSION_NEW .*"mcpServers":\[\]/, 'session/new carries mcpServers');
+	assert.match(
+		acp.log,
+		/SESSION_NEW .*"mcpServers":\[\{"name":"docs","command":"node","args":\["docs.js"\]\}\]/,
+		'session/new carries this agent\'s MCP servers',
+	);
+	assert.match(acp.log, /\[acp\] mcp servers docs/, 'the adapter logs the scoped servers');
+	assert.match(acp.log, /auto-compact window 150000 requested; ACP has no option/, 'the lowered window is recorded as a deviation');
+	assert.match(acp.log, /cache TTL 1h requested; ACP has no option/, 'the cache TTL is recorded as a deviation');
 	assert.match(acp.log, /SET_MODE auto-accept/, 'acceptEdits maps to the ACP auto-accept mode');
 	assert.match(acp.log, /SET_CONFIG model=test-model/, 'the definition model is applied over ACP');
 	assert.match(acp.log, /SET_CONFIG effort=low/, 'the definition effort is applied over ACP');
@@ -4461,6 +4471,505 @@ process.stdout.write(JSON.stringify({
 	assert.equal(forkRuntime.spawnCalls.length, beforeOpenView, 'no fork starts while the agent view is open');
 	ok('/subtask forks the main conversation when the agent view is off');
 	}
+	// 77. auxiliary frontmatter: mcpServers, hooks, initialPrompt, window, cache ---
+	const auxRoot = mkdtempSync(join(tmpdir(), 'subagent-aux-'));
+	const auxRepo = join(auxRoot, 'repo');
+	const auxAgents = join(auxRepo, '.commandcode', 'agents');
+	mkdirSync(auxAgents, {recursive: true});
+	writeFileSync(
+		join(auxAgents, 'aux.md'),
+		[
+			'---',
+			'name: aux',
+			'description: auxiliary fields',
+			'mcpServers:',
+			'  listed:',
+			'  inline-srv:',
+			'    command: node',
+			'    args: ["server.js"]',
+			'    env:',
+			'      TOKEN: secret',
+			'  remote:',
+			'    url: https://example.test/mcp',
+			'hooks:',
+			'  PreToolUse:',
+			'    - matcher: Bash',
+			'      command: ./check.sh',
+			'    - matcher: "mcp__docs__*"',
+			'      command: ./docs.sh',
+			'      timeout: 5',
+			'  PostToolUse:',
+			'    - matcher: Edit',
+			'      command: ./after.sh',
+			'  Stop:',
+			'    command: ./stop.sh',
+			'initialPrompt: "start here"',
+			'autoCompactWindow: 200000',
+			'experimental:',
+			'  cacheTtl: 1h',
+			'futureField: ignored',
+			'futureMap:',
+			'  nested: value',
+			'  deeper:',
+			'    - one',
+			'    - two',
+			'---',
+			'AUX BODY',
+			'',
+		].join('\n'),
+	);
+	const auxExports = await import('../better-sub-agents.ts');
+	const auxDefinition = auxExports.agentDefinitionFromSource(
+		readFileSync(join(auxAgents, 'aux.md'), 'utf8'),
+		join(auxAgents, 'aux.md'),
+		'project',
+	);
+	assert.equal(auxDefinition.ok, true, 'an auxiliary definition parses');
+	if (auxDefinition.ok) {
+		const definition = auxDefinition.definition;
+		assert.deepEqual(
+			definition.mcpServers.map((server) => server.name),
+			['listed', 'inline-srv', 'remote'],
+			'inline and referenced MCP servers both parse',
+		);
+		assert.equal(definition.mcpServers[1].command, 'node', 'an inline server keeps its command');
+		assert.deepEqual(definition.mcpServers[1].args, ['server.js'], 'an inline server keeps its args');
+		assert.equal(definition.mcpServers[1].env.TOKEN, 'secret', 'an inline server keeps its env');
+		assert.equal(definition.mcpServers[2].url, 'https://example.test/mcp', 'a remote server keeps its url');
+		assert.equal(definition.hooks.PreToolUse.length, 2, 'two PreToolUse rules parse');
+		assert.equal(definition.hooks.PreToolUse[0].matcher, 'Bash', 'the matcher parses');
+		assert.equal(definition.hooks.PreToolUse[0].command, './check.sh', 'the command parses');
+		assert.equal(definition.hooks.PreToolUse[1].timeoutMs, 5000, 'timeout is read in seconds and stored in ms');
+		assert.equal(definition.hooks.PostToolUse[0].command, './after.sh', 'a PostToolUse rule parses');
+		assert.equal(definition.hooks.Stop[0].command, './stop.sh', 'a Stop rule parses');
+		assert.equal(definition.initialPrompt, 'start here', 'initialPrompt parses');
+		assert.equal(definition.autoCompactWindow, 200000, 'autoCompactWindow parses');
+		assert.equal(definition.cacheTtl, '1h', 'experimental.cacheTtl parses');
+		assert.ok(!('futureField' in definition), 'an unknown field is not carried on the definition');
+		assert.ok(!('futureMap' in definition), 'an unknown nested field is not carried on the definition');
+	}
+
+	const pluginFields = auxExports.agentDefinitionFromSource(
+		[
+			'---',
+			'name: security',
+			'description: plugin',
+			'permissionMode: bypassPermissions',
+			'mcpServers:',
+			'  inline-srv:',
+			'    command: node',
+			'hooks:',
+			'  PreToolUse:',
+			'    - command: ./check.sh',
+			'initialPrompt: "plugin prompt"',
+			'---',
+			'PLUGIN BODY',
+		].join('\n'),
+		join(auxRoot, 'plugin', 'security.md'),
+		'plugin',
+		{plugin: true, pluginName: 'my-plugin'},
+	);
+	const badCache = auxExports.agentDefinitionFromSource(
+		'---\nname: bad-cache\ndescription: bad cache\nexperimental:\n  cacheTtl: 2h\n---\nBODY',
+		join(auxAgents, 'bad-cache.md'),
+		'project',
+	);
+	assert.equal(badCache.ok, true, 'an unknown cache TTL does not fail a definition');
+	if (badCache.ok) assert.ok(!('cacheTtl' in badCache.definition), 'only 5m and 1h are accepted');
+
+	assert.equal(pluginFields.ok, true, 'a plugin definition with auxiliary fields still loads');
+	if (pluginFields.ok) {
+		assert.ok(!('permissionMode' in pluginFields.definition), 'a plugin ignores permissionMode');
+		assert.ok(!('mcpServers' in pluginFields.definition), 'a plugin ignores mcpServers');
+		assert.ok(!('hooks' in pluginFields.definition), 'a plugin ignores hooks');
+		assert.ok(!('initialPrompt' in pluginFields.definition), 'a plugin ignores initialPrompt');
+	}
+	ok('auxiliary frontmatter: MCP servers, hooks, initialPrompt, compact window, cache TTL, unknown fields');
+
+	// 71. MCP servers: inline vs referenced, trust, strict, allow/deny, scoping ---
+	const mcpExports = auxExports;
+	const mcpRoot = mkdtempSync(join(tmpdir(), 'subagent-mcp-'));
+	mkdirSync(join(mcpRoot, '.git'), {recursive: true});
+	mkdirSync(join(mcpRoot, '.commandcode'), {recursive: true});
+	writeFileSync(
+		join(mcpRoot, '.commandcode', 'mcp.json'),
+		JSON.stringify({
+			mcpServers: {
+				docs: {command: 'node', args: ['docs.js'], env: {DOCS: '1'}},
+				disabled: {command: 'node', enabled: false},
+			},
+		}),
+	);
+	const mcpDefinition = {
+		name: 'mcp-agent',
+		source: 'project',
+		path: join(mcpRoot, '.commandcode', 'agents', 'mcp.md'),
+	};
+	const configured = mcpExports.mcpServerConfigs(realFs, [mcpRoot]);
+	const mcpBase = {
+		defined: [
+			{name: 'docs'},
+			{name: 'inline', command: 'node', args: ['inline.js']},
+			{name: 'gone'},
+			{name: 'disabled'},
+		],
+		definition: mcpDefinition,
+		configured,
+		trusted: true,
+	};
+	const resolvedMcp = mcpExports.resolveAgentMcpServers(mcpBase);
+	assert.deepEqual(
+		resolvedMcp.servers.map((server) => server.name),
+		['docs', 'inline'],
+		'a reference resolves from config and an inline server is kept',
+	);
+	assert.deepEqual(
+		resolvedMcp.dropped.map((entry) => entry.name).sort(),
+		['disabled', 'gone'],
+		'an unknown and a disabled reference are dropped',
+	);
+	assert.equal(resolvedMcp.servers[0].command, 'node', 'a referenced server carries its command');
+	assert.deepEqual(resolvedMcp.servers[0].args, ['docs.js'], 'a referenced server carries its args');
+	assert.equal(resolvedMcp.servers[0].env.DOCS, '1', 'a referenced server carries its env');
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, env: {CLAUDE_CODE_STRICT_MCP_CONFIG: '1'}}).servers.map(
+			(server) => server.name,
+		),
+		['docs'],
+		'strict MCP config keeps only configured references',
+	);
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, env: {CLAUDE_CODE_BARE: '1'}}).servers,
+		[],
+		'bare mode loads no MCP server',
+	);
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, env: {BETTER_SUBAGENTS_MCP_ALLOW: 'inline'}}).servers.map(
+			(server) => server.name,
+		),
+		['inline'],
+		'an allow policy scopes the list',
+	);
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, env: {BETTER_SUBAGENTS_MCP_DENY: 'docs'}}).servers.map(
+			(server) => server.name,
+		),
+		['inline'],
+		'a deny policy wins over an allow policy',
+	);
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, definition: {...mcpDefinition, source: 'plugin'}}).servers,
+		[],
+		'a plugin definition loads no MCP server',
+	);
+	assert.deepEqual(
+		mcpExports.resolveAgentMcpServers({...mcpBase, trusted: false}).servers.map((server) => server.name),
+		['docs'],
+		'an untrusted folder cannot declare an inline server',
+	);
+	assert.equal(mcpExports.agentFolderTrusted(mcpDefinition, {cwd: mcpRoot, home: mcpRoot}), true, 'the project folder is trusted');
+	assert.equal(
+		mcpExports.agentFolderTrusted({name: 'x', source: 'project', path: '/elsewhere/x.md'}, {cwd: mcpRoot, home: mcpRoot}),
+		false,
+		'a definition outside the workspace is not trusted',
+	);
+	assert.equal(
+		mcpExports.agentFolderTrusted({name: 'x', source: 'plugin', path: join(mcpRoot, 'x.md')}, {cwd: mcpRoot, home: mcpRoot}),
+		false,
+		'a plugin is never trusted for inline servers',
+	);
+
+	// The resolved set is scoped to the worker: a policy in this session narrows it.
+	const mcpSpawnDir = mkdtempSync(join(tmpdir(), 'subagent-mcp-spawn-'));
+	mkdirSync(join(mcpRoot, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(mcpRoot, '.commandcode', 'agents', 'mcp.md'),
+		[
+			'---',
+			'name: mcp-agent',
+			'description: mcp scope',
+			'mcpServers:',
+			'  docs:',
+			'  inline:',
+			'    command: node',
+			'    args: ["inline.js"]',
+			'---',
+			'MCP BODY',
+		].join('\n'),
+	);
+	const mcpSpawn = makeRuntime({now: () => fixedNow, cwd: mcpRoot, env: {BETTER_SUBAGENTS_MCP_ALLOW: 'docs'}});
+	const mcpSpawnRuntime = mcpSpawn.runtime;
+	const mcpSpawnApi = makeApi({spoolDir: mcpSpawnDir, session: makeSession(), runtime: mcpSpawnRuntime});
+	mod(mcpSpawnApi.api, mcpSpawnRuntime);
+	const mcpSpawned = await toolOf(mcpSpawnApi, 'subagent_spawn').run({
+		input: {description: 'mcp', prompt: 'go', subagent_type: 'mcp-agent'},
+	});
+	assert.equal(mcpSpawned.ok, true, JSON.stringify(mcpSpawned));
+	const mcpWorkerSpec = JSON.parse(
+		mcpSpawn.spawnCalls.find((call) => call.args[0] === '-e').options.env.SUBAGENT_SPEC,
+	);
+	assert.deepEqual(
+		mcpWorkerSpec.mcpServers.map((server) => server.name),
+		['docs'],
+		'the worker spec carries only the servers this agent may use',
+	);
+	ok('MCP servers: inline and referenced, trust, strict, bare, allow/deny, and worker scoping');
+
+	// 72. hooks: matcher, PreToolUse block, PostToolUse context, Stop, project events --
+	const hookExports = auxExports;
+	assert.equal(hookExports.hookMatches(undefined, 'Bash'), true, 'no matcher matches every tool');
+	assert.equal(hookExports.hookMatches('*', 'Edit'), true, 'a wildcard matcher matches every tool');
+	assert.equal(hookExports.hookMatches('Bash', 'bash'), true, 'a tool matcher is case-insensitive');
+	assert.equal(hookExports.hookMatches('mcp__docs__*', 'mcp__docs__search'), true, 'an MCP wildcard matches the server');
+	assert.equal(hookExports.hookMatches('Read|Grep', 'Grep'), true, 'a pipe list matches one alternative');
+	assert.equal(hookExports.hookMatches('/^Ed/', 'Edit'), true, 'a /regex/ matcher is a regex');
+	assert.equal(hookExports.hookMatches('Bash', 'Read'), false, 'a non-matching tool is skipped');
+
+	const hookCalls = [];
+	const hookRun = (command, args, options) => {
+		hookCalls.push({command, args, options});
+		return {ok: false, code: 2, stdout: '', stderr: `blocked by ${args[1]}`};
+	};
+	const preOutcome = hookExports.runHookRules(
+		hookRun,
+		[
+			{matcher: 'Bash', command: './check.sh'},
+			{matcher: 'Read', command: './never.sh'},
+		],
+		{event: 'PreToolUse', cwd: '/repo', agent: 'aux', toolName: 'Bash', input: {command: 'rm -rf /'}},
+	);
+	assert.equal(preOutcome.block, 'blocked by ./check.sh', 'exit 2 blocks with the hook stderr');
+	assert.equal(hookCalls.length, 1, 'a non-matching rule does not run');
+	assert.equal(hookCalls[0].args[1], './check.sh', 'the rule runs under the shell');
+	assert.equal(hookCalls[0].options.cwd, '/repo', 'the hook runs in the agent cwd');
+	assert.equal(hookCalls[0].options.env.BETTER_SUBAGENTS_HOOK_EVENT, 'PreToolUse', 'the event reaches the hook');
+	assert.equal(hookCalls[0].options.env.BETTER_SUBAGENTS_HOOK_AGENT, 'aux', 'the agent name reaches the hook');
+	assert.equal(hookCalls[0].options.env.BETTER_SUBAGENTS_HOOK_TOOL_NAME, 'Bash', 'the tool name reaches the hook');
+	assert.equal(
+		JSON.parse(hookCalls[0].options.env.BETTER_SUBAGENTS_HOOK_TOOL_INPUT).command,
+		'rm -rf /',
+		'the tool input reaches the hook as JSON',
+	);
+	const allowRun = () => ({ok: true, code: 0, stdout: '', stderr: ''});
+	assert.equal(
+		hookExports.runHookRules(allowRun, [{command: './check.sh'}], {event: 'PreToolUse', cwd: '/repo', toolName: 'Bash'})
+			.block,
+		undefined,
+		'exit 0 allows the tool',
+	);
+	const postOutcome = hookExports.runHookRules(
+		hookRun,
+		[{matcher: 'Edit', command: './after.sh'}],
+		{event: 'PostToolUse', cwd: '/repo', toolName: 'Edit', input: {}, result: 'ok'},
+	);
+	assert.equal(postOutcome.additionalContext, 'blocked by ./after.sh', 'a PostToolUse exit 2 adds context');
+	const stopOutcome = hookExports.runHookRules(hookRun, [{command: './stop.sh'}], {
+		event: 'SubagentStop',
+		cwd: '/repo',
+		agent: 'aux',
+	});
+	assert.equal(stopOutcome.continue, true, 'a SubagentStop exit 2 keeps the run going');
+	assert.equal(stopOutcome.reason, 'blocked by ./stop.sh', 'the Stop reason is the hook output');
+
+	// The worker registers the definition's rules: PreToolUse blocks, PostToolUse
+	// adds context, and Stop is converted to SubagentStop.
+	const hookWorkerDir = mkdtempSync(join(tmpdir(), 'subagent-hook-worker-'));
+	const hookWorkerRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {
+			BETTER_SUBAGENTS_WORKER: '1',
+			SUBAGENT_SPEC: JSON.stringify({
+				hooks: {
+					PreToolUse: [{matcher: 'Bash', command: './check.sh'}],
+					PostToolUse: [{matcher: 'Edit', command: './after.sh'}],
+					Stop: [{command: './stop.sh'}],
+				},
+			}),
+		},
+		run: (command, args, options) => {
+			if (args[1] === './stop.sh') return {ok: false, code: 2, stdout: '', stderr: 'not yet'};
+			return {ok: false, code: 2, stdout: '', stderr: `blocked ${args[1]}`};
+		},
+	});
+	const hookWorkerApi = makeApi({spoolDir: hookWorkerDir, session: makeSession(), runtime: hookWorkerRuntime.runtime});
+	mod(hookWorkerApi.api, hookWorkerRuntime.runtime);
+	assert.equal(typeof hookWorkerApi.registeredHooks.beforeToolCall, 'function', 'the worker registers PreToolUse');
+	const blocked = hookWorkerApi.registeredHooks.beforeToolCall({toolName: 'Bash', input: {command: 'ls'}});
+	assert.equal(blocked.block, true, 'the PreToolUse hook blocks the tool');
+	assert.match(blocked.additionalContext, /blocked \.\/check\.sh/);
+	assert.equal(
+		hookWorkerApi.registeredHooks.beforeToolCall({toolName: 'Read', input: {}}),
+		undefined,
+		'a non-matching tool is not blocked',
+	);
+	const postHook = hookWorkerApi.registeredHooks.afterToolCall({toolName: 'Edit', input: {}, result: 'ok'});
+	assert.match(postHook.additionalContext, /blocked \.\/after\.sh/, 'the PostToolUse result reaches the model');
+	const workerStopped = hookWorkerApi.registeredHooks.onStop({lastAssistantText: 'done'});
+	assert.equal(workerStopped.continue, true, 'the Stop hook is the worker SubagentStop');
+	assert.equal(workerStopped.reason, 'not yet');
+
+	// Project SubagentStart/SubagentStop run from .commandcode/hooks.json, once.
+	const projectHookRoot = mkdtempSync(join(tmpdir(), 'subagent-project-hooks-'));
+	mkdirSync(join(projectHookRoot, '.git'), {recursive: true});
+	mkdirSync(join(projectHookRoot, '.commandcode'), {recursive: true});
+	writeFileSync(
+		join(projectHookRoot, '.commandcode', 'hooks.json'),
+		JSON.stringify({
+			SubagentStart: [{command: './start.sh'}],
+			SubagentStop: [{command: './end.sh'}],
+		}),
+	);
+	const projectHookSpool = mkdtempSync(join(tmpdir(), 'subagent-project-hooks-spool-'));
+	const projectHookCalls = [];
+	const projectHookRuntime = makeRuntime({
+		now: () => fixedNow,
+		cwd: projectHookRoot,
+		run: (command, args, options) => {
+			projectHookCalls.push({args, options});
+			return {ok: true, code: 0, stdout: '', stderr: ''};
+		},
+	});
+	const projectHookApi = makeApi({spoolDir: projectHookSpool, session: makeSession(), runtime: projectHookRuntime.runtime});
+	mod(projectHookApi.api, projectHookRuntime.runtime);
+	const projectSpawn = await toolOf(projectHookApi, 'subagent_spawn').run({
+		input: {description: 'hook job', command: 'true'},
+	});
+	assert.equal(projectSpawn.ok, true, JSON.stringify(projectSpawn));
+	const projectJobId = projectSpawn.content[0].text.match(/spawned (\S+)/)[1];
+	assert.ok(
+		projectHookCalls.some((call) => call.options.env?.BETTER_SUBAGENTS_HOOK_EVENT === 'SubagentStart'),
+		'SubagentStart fires when the job starts',
+	);
+	const projectRecordFile = join(projectHookSpool, 'jobs', `${projectJobId}.json`);
+	const projectRecord = JSON.parse(readFileSync(projectRecordFile, 'utf8'));
+	projectRecord.state = 'done';
+	projectRecord.exitCode = 0;
+	writeFileSync(projectRecordFile, JSON.stringify(projectRecord, null, 2));
+	projectHookApi.registeredHooks.onSessionStart({sessionId: 'hooks'});
+	assert.ok(
+		projectHookCalls.some((call) => call.options.env?.BETTER_SUBAGENTS_HOOK_EVENT === 'SubagentStop'),
+		'SubagentStop fires when the job is terminal',
+	);
+	const stopHookCount = projectHookCalls.filter(
+		(call) => call.options.env?.BETTER_SUBAGENTS_HOOK_EVENT === 'SubagentStop',
+	).length;
+	projectHookApi.registeredHooks.onSessionStart({sessionId: 'hooks'});
+	assert.equal(
+		projectHookCalls.filter((call) => call.options.env?.BETTER_SUBAGENTS_HOOK_EVENT === 'SubagentStop').length,
+		stopHookCount,
+		'SubagentStop does not fire twice for one job',
+	);
+	ok('hooks: matcher, PreToolUse block, PostToolUse context, Stop as SubagentStop, project start/stop once');
+
+	// 73. session agent, initialPrompt, append prompt, compact window, cache TTL ---
+	const auxiliary = auxExports;
+	assert.equal(auxiliary.resolveAutoCompactWindow(1_000_000, 200_000, false), 200_000, 'the window lowers');
+	assert.equal(auxiliary.resolveAutoCompactWindow(100_000, 200_000, false), 100_000, 'it cannot raise the window');
+	assert.equal(auxiliary.resolveAutoCompactWindow(1_000_000, 50_000, false), 100_000, 'it clamps to the minimum');
+	assert.equal(auxiliary.resolveAutoCompactWindow(1_000_000, 2_000_000, false), 1_000_000, 'it clamps to the maximum');
+	assert.equal(auxiliary.resolveAutoCompactWindow(1_000_000, 200_000, true), undefined, 'the main session has no effect');
+
+	const sessionRoot = mkdtempSync(join(tmpdir(), 'subagent-session-agent-'));
+	mkdirSync(join(sessionRoot, '.git'), {recursive: true});
+	mkdirSync(join(sessionRoot, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(sessionRoot, '.commandcode', 'agents', 'lead.md'),
+		[
+			'---',
+			'name: lead',
+			'description: session lead',
+			'initialPrompt: "start here"',
+			'autoCompactWindow: 150000',
+			'experimental:',
+			'  cacheTtl: 5m',
+			'---',
+			'LEAD BODY',
+		].join('\n'),
+	);
+	const sessionRun = makeRuntime({now: () => fixedNow, cwd: sessionRoot});
+	const sessionApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-session-spool-')),
+		session: makeSession(),
+		runtime: sessionRun.runtime,
+	});
+	sessionApi.api.setFlag('agent', 'lead');
+	mod(sessionApi.api, sessionRun.runtime);
+	assert.equal(
+		sessionApi.registeredHooks.appendSystemPrompt(),
+		'LEAD BODY',
+		'the session-wide agent supplies the main system prompt',
+	);
+	sessionApi.registeredHooks.onSessionStart({source: 'startup', sessionId: 'lead'});
+	assert.deepEqual(sessionApi.promptSubmits, ['start here'], 'initialPrompt is auto-submitted once');
+	sessionApi.registeredHooks.onSessionStart({source: 'startup', sessionId: 'lead'});
+	assert.deepEqual(sessionApi.promptSubmits, ['start here'], 'a later session start does not resubmit it');
+	sessionApi.registeredHooks.onSessionStart({source: 'resume', sessionId: 'lead'});
+	assert.deepEqual(sessionApi.promptSubmits, ['start here'], 'a resume does not replay the first turn');
+
+	// initialPrompt is a main-session field: a subagent never receives it.
+	const leadSpawn = await toolOf(sessionApi, 'subagent_spawn').run({
+		input: {description: 'lead sub', prompt: 'task', subagent_type: 'lead'},
+	});
+	assert.equal(leadSpawn.ok, true, JSON.stringify(leadSpawn));
+	const leadSpec = JSON.parse(sessionRun.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.equal(leadSpec.systemPrompt, 'LEAD BODY', 'the subagent gets the definition body only');
+	assert.ok(!leadSpec.systemPrompt.includes('start here'), 'initialPrompt never reaches a subagent');
+	assert.equal(leadSpec.prompt, 'task', 'the caller prompt is unchanged');
+	assert.equal(leadSpec.autoCompactWindow, 150000, 'the lowered window reaches the worker spec');
+	assert.equal(leadSpec.cacheTtl, '5m', 'the cache TTL reaches the worker spec');
+
+	// The fallback when the host has no prompt.submit: the first typed prompt carries
+	// the initial prompt instead of losing it.
+	const fallbackRun = makeRuntime({now: () => fixedNow, cwd: sessionRoot});
+	const fallbackApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-session-fallback-')),
+		session: makeSession(),
+		runtime: fallbackRun.runtime,
+	});
+	fallbackApi.api.setFlag('agent', 'lead');
+	mod(fallbackApi.api, fallbackRun.runtime);
+	delete fallbackApi.api.prompt;
+	fallbackApi.registeredHooks.onSessionStart({source: 'startup', sessionId: 'lead'});
+	const prefixed = fallbackApi.registeredHooks.transformInput({text: 'hello'});
+	assert.equal(prefixed.action, 'transform', 'the first typed prompt is transformed');
+	assert.equal(prefixed.text, 'start here\n\nhello', 'the initial prompt is prepended');
+	assert.equal(fallbackApi.registeredHooks.transformInput({text: 'again'}), undefined, 'only the first prompt is prefixed');
+
+	// --append-subagent-system-prompt, inline and from a file.
+	const appendRoot = mkdtempSync(join(tmpdir(), 'subagent-append-'));
+	mkdirSync(join(appendRoot, '.git'), {recursive: true});
+	const appendFile = join(appendRoot, 'append.txt');
+	writeFileSync(appendFile, 'FILE RULES');
+	const runAgent = async (flags, env = {}) => {
+		const bundle = makeRuntime({now: () => fixedNow, cwd: appendRoot, env});
+		const api = makeApi({
+			spoolDir: mkdtempSync(join(tmpdir(), 'subagent-append-spool-')),
+			session: makeSession(),
+			runtime: bundle.runtime,
+		});
+		for (const [name, value] of Object.entries(flags)) api.api.setFlag(name, value);
+		mod(api.api, bundle.runtime);
+		const spawned = await toolOf(api, 'subagent_spawn').run({
+			input: {description: 'append', prompt: 'task', subagent_type: 'general-purpose'},
+		});
+		assert.equal(spawned.ok, true, JSON.stringify(spawned));
+		return {
+			spec: JSON.parse(bundle.spawnCalls[0].options.env.SUBAGENT_SPEC),
+			env: bundle.spawnCalls[0].options.env,
+		};
+	};
+	const inlineAppend = await runAgent({append_subagent_system_prompt: 'EXTRA RULES'});
+	assert.match(inlineAppend.spec.systemPrompt, /EXTRA RULES$/, 'the inline append text is last');
+	const fileAppend = await runAgent({append_subagent_system_prompt_file: appendFile});
+	assert.match(fileAppend.spec.systemPrompt, /FILE RULES$/, 'the file form appends its content');
+	const nestedAppend = await runAgent({}, {BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT: 'NESTED RULES'});
+	assert.match(nestedAppend.spec.systemPrompt, /NESTED RULES$/, 'the environment form reaches the subagent');
+	assert.equal(
+		nestedAppend.env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT,
+		'NESTED RULES',
+		'the worker environment carries the value, so a nested subagent gets it too',
+	);
+	ok('session agent, initialPrompt only as main, append prompt (flag/file/env), compact window, cache TTL');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

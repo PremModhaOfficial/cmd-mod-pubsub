@@ -112,10 +112,39 @@ Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fa
 `general` is accepted as the host-reserved alias for `general-purpose`.
 
 Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
-`skills`, `memory`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
-with a missing name or description, a bad first line, a colon or over-256-character name, or unparseable
-YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
-skip with its reason, and `/doctor` reports each duplicate and invalid file with the fix.
+`skills`, `memory`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`, `mcpServers`, `hooks`,
+`initialPrompt`, `autoCompactWindow`, and `experimental.cacheTtl`. Unknown fields are ignored, including
+unknown nested keys. A file with a missing name or description, a bad first line, a colon or
+over-256-character name, or unparseable YAML is skipped and written to `<subagent_dir>/agents.log`;
+`/agents` lists every definition and every skip with its reason, and `/doctor` reports each duplicate and
+invalid file with the fix.
+
+`mcpServers` is either a map of names to inline definitions (`command`/`args`/`env` or `url`) or a list of
+names and inline servers. A name resolves from `.commandcode/mcp.json`; the resolved set is passed to
+`session/new`, so it is scoped to that agent. An inline server needs a trusted folder (the workspace,
+home, managed directory, or an `--add-dir`); `CLAUDE_CODE_STRICT_MCP_CONFIG=1` keeps only configured
+references, `CLAUDE_CODE_BARE=1` loads none, and `BETTER_SUBAGENTS_MCP_ALLOW`/`..._DENY` (comma lists,
+`*`) narrow the result. A plugin ignores the field.
+
+`hooks` holds `PreToolUse`, `PostToolUse`, and `Stop` rules (`matcher` plus `command`, optionally
+`timeout` in seconds). The worker registers them as the host's `beforeToolCall`, `afterToolCall`, and
+`onStop`; `Stop` is reported as `SubagentStop`. Exit 2 blocks a tool, adds PostToolUse context, or asks a
+stopping subagent for another turn; every other exit is non-blocking. Each command gets
+`BETTER_SUBAGENTS_HOOK_EVENT`, `..._AGENT`, `..._TOOL_NAME`, `..._TOOL_INPUT` (JSON) and `..._CWD`.
+Project hooks in `.commandcode/hooks.json` (`SubagentStart` / `SubagentStop`) run once per job, and a
+plugin ignores the field.
+
+`initialPrompt` is auto-submitted as the first turn only when the definition runs the whole session
+(`agent` flag or `BETTER_SUBAGENTS_AGENT`/`CLAUDE_CODE_AGENT`), never for a subagent, and a plugin
+ignores it. `autoCompactWindow` is clamped to 100,000–1,000,000 and can only lower the model's inherited
+window; it has no effect on the main session. `experimental.cacheTtl` accepts `5m` or `1h`. ACP exposes
+neither setting, so the adapter logs the resolved value as a recorded deviation
+(`docs/adr/0001-worker-and-control.md`) and the host default still governs.
+
+`--append-subagent-system-prompt` (text, `@path`, or the `append_subagent_system_prompt_file` flag) is
+appended to every subagent's system prompt. It is delivered through the mod flag or
+`BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT`/`CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT`, so a nested worker
+inherits it; a fork is exempt because it reuses the main conversation's prompt.
 
 `isolation: worktree` runs the job in a temporary `git worktree` branched from the repository's default
 branch (`origin/HEAD`, then `main`, then `master`) — never the caller's HEAD. Inside the worker, Bash and
@@ -321,6 +350,9 @@ to the background. The footer keeps the running count and a `/tasks` hint for 30
 | `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`). |
 | `plugin_dir` | empty | Comma-separated plugin roots; every child directory with an `agents/` directory is a plugin. |
 | `fork_mode` | `auto` | `auto` = interactive on, non-interactive/SDK off; `on`/`off` override. Where it is on, model-spawned agents run in the background and `run_in_background` is removed. |
+| `agent` | empty | Run the whole session as this agent definition (`--agent` is not a host flag, so use the mod option or `BETTER_SUBAGENTS_AGENT`). Its body becomes the main system prompt and its `initialPrompt` is the first turn. |
+| `append_subagent_system_prompt` | empty | Text or `@path` appended to every subagent's system prompt (`BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT` is the environment form). |
+| `append_subagent_system_prompt_file` | empty | File whose text is appended to every subagent's system prompt. |
 
 `pubsub_dir` and `pubsub_deliver` are deprecated aliases, recognised for one release when set to
 anything other than their own default.

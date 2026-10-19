@@ -203,15 +203,25 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] `skills` full-content preload; unlisted skills still invocable. (smoke 43: the named skill's
   `SKILL.md` is in the bundle; discovery order is project walk-up, then user, for `.commandcode/skills`
   and `.claude/skills`. An unlisted skill is simply not preloaded and stays with the host's Skill tool.)
-- [ ] `mcpServers` inline and referenced; trust; plugin ignored.
-- [ ] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
+- [x] `mcpServers` inline and referenced; trust; plugin ignored. (smoke 70: both forms parse; smoke 71:
+  a reference reads config, an inline server needs a trusted folder, strict/bare/allow/deny apply, a plugin
+  gets none, and the resolved set is on the worker spec, which `session/new` receives.)
+- [x] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
+  (smoke 70: every event parses and a plugin gets none; smoke 72: matcher forms, exit-2 block/context/
+  continue, the worker registers all three hooks, and `.commandcode/hooks.json` fires start/stop once.)
 - [x] `memory` scopes, `MEMORY.md` 200 lines or 25KB. (smoke 44: `memoryDirFor` for user, project and
   local, the first 200 lines or 25KB of `MEMORY.md`, and the directory is created on spawn. The field is
   parsed and recorded. `withMemoryTools` adds Read, Write and Edit (smoke 44) and spawn applies it to the
   resolved tool set before the worker spec is built.)
-- [ ] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
-- [ ] Unknown fields ignored without error.
-- [ ] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form.
+- [x] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
+  (smoke 45 covers `omitClaudeMd`; smoke 47-48 cover `effort`/`color`; smoke 70 parses the new fields and
+  rejects an invalid TTL; smoke 73 submits `initialPrompt` only as the session agent and carries the
+  lowered window and cache TTL on the spec. The adapter logs both as ACP deviations.)
+- [x] Unknown fields ignored without error. (smoke 70: an unknown scalar and an unknown nested map load
+  without error and are not carried on the definition.)
+- [x] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form. (smoke 73:
+  the `agent` flag supplies the main prompt and submits `initialPrompt`; the append flag, file form and
+  environment form all reach the worker spec, and the environment value is inherited by a nested worker.)
 - Gate: every field and resolution rule has a behavioral test.
 
 ## Phase 14: Context and persistence
