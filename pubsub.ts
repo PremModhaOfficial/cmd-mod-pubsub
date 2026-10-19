@@ -114,18 +114,38 @@ const emit = message => {
   } catch (e) {}
 };
 
-const fail = (reason, code) => {
-  const now = Date.now();
-  const durationMs = Math.max(0, now - spec.startedAt);
-  writeRecord({state: 'failed', exitCode: typeof code === 'number' ? code : undefined, finishedAt: now, durationMs, failureReason: reason});
+const readTail = () => {
+  try { return fs.readFileSync(spec.logPath, 'utf8').slice(-spec.tailMax); } catch (e) { return ''; }
+};
+
+// One constructor for "this job reached this state": the record patch and the
+// signal are derived from the same facts, so they cannot disagree. The parent has
+// the same contract in signalOf/patchOf; this copy lives here because the worker
+// runs in its own process. Sharing it outright needs the worker extracted from
+// the string, which is follow-up work.
+const settle = (state, detail, code, tail) => {
+  const finishedAt = Date.now();
+  const durationMs = Math.max(0, finishedAt - spec.startedAt);
+  const failed = state === 'failed';
+  writeRecord({
+    state: state,
+    exitCode: typeof code === 'number' ? code : undefined,
+    finishedAt: finishedAt,
+    durationMs: durationMs,
+    failureReason: failed ? detail : undefined,
+    awaitingInput: state === 'waiting-input' ? true : undefined
+  });
   emit({
-    id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner, state: 'failed',
+    id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner, state: state,
     exitCode: typeof code === 'number' ? code : null,
-    startedAt: spec.startedAt, finishedAt: now, durationMs, logPath: spec.logPath,
-    sessionId: spec.sessionId, title: spec.label + ' failed',
-    body: reason
+    startedAt: spec.startedAt, finishedAt: finishedAt, durationMs: durationMs,
+    logPath: spec.logPath, sessionId: spec.sessionId,
+    title: spec.label + ' ' + state,
+    body: detail + (tail ? '\\n\\n' + tail : '')
   });
 };
+
+const fail = (reason, code) => settle('failed', reason, code, '');
 
 let out;
 try {
@@ -148,14 +168,10 @@ const finish = (code, spawnError, signal) => {
   // The cancel tool has already written the record and emitted its own signal.
   if (record.state === 'canceled') return;
 
-  let tail = '';
-  try { tail = fs.readFileSync(spec.logPath, 'utf8').slice(-spec.tailMax); } catch (e) {}
-  const finishedAt = Date.now();
+  const tail = readTail();
   const failed = spawnError !== undefined || code !== 0;
   const lastLine = tail.trimEnd().split('\\n').filter(line => line.trim()).pop() || '';
   const wantsInput = !failed && spec.prompt !== undefined && /\\?\\s*$/.test(lastLine);
-  const state = failed ? 'failed' : wantsInput ? 'waiting-input' : 'done';
-  const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const detail = spawnError !== undefined
     ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
     : typeof code === 'number' && code !== 0
@@ -163,31 +179,7 @@ const finish = (code, spawnError, signal) => {
       : signal
         ? 'terminated by ' + signal
         : 'exit 0';
-  const failureReason = failed ? detail : undefined;
-
-  writeRecord({
-    state: state,
-    exitCode: typeof code === 'number' ? code : undefined,
-    finishedAt: finishedAt,
-    durationMs: durationMs,
-    failureReason: failureReason,
-    awaitingInput: wantsInput || undefined
-  });
-  emit({
-    id: spec.id,
-    label: spec.label,
-    kind: spec.kind,
-    owner: spec.owner,
-    state: state,
-    exitCode: typeof code === 'number' ? code : null,
-    startedAt: spec.startedAt,
-    finishedAt: finishedAt,
-    durationMs: durationMs,
-    logPath: spec.logPath,
-    sessionId: spec.sessionId,
-    title: spec.label + ' ' + state,
-    body: detail + (tail ? '\\n\\n' + tail : '')
-  });
+  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
 };
 
 if (typeof child.pid === 'number') {
@@ -303,44 +295,103 @@ function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
 	};
 }
 
-interface Signal {
-	readonly id: string;
-	readonly owner?: string;
-	readonly label?: string;
-	readonly kind?: string;
-	readonly state?: string;
-	readonly exitCode?: number | null;
-	readonly startedAt?: number;
-	readonly finishedAt?: number;
-	readonly durationMs?: number;
-	readonly title?: string;
-	readonly body?: string;
-	readonly logPath?: string;
-	readonly sessionId?: string;
-}
-
-interface JobRecord {
+// The identity a job record and its signal share. Declared once, so the two
+// shapes cannot drift: the record adds durable bookkeeping, the signal adds the
+// message that reaches the session.
+interface JobIdentity {
 	id: string;
 	owner?: string;
 	label?: string;
 	kind?: string;
 	state?: string;
-	command?: string;
-	prompt?: string;
-	cwd?: string;
-	logPath?: string;
 	startedAt?: number;
 	finishedAt?: number;
 	durationMs?: number;
+	logPath?: string;
+	sessionId?: string;
+}
+
+interface Signal extends JobIdentity {
+	readonly exitCode?: number | null;
+	readonly title?: string;
+	readonly body?: string;
+}
+
+interface JobRecord extends JobIdentity {
+	command?: string;
+	prompt?: string;
+	cwd?: string;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;
-	sessionId?: string;
 	deliveredAt?: number;
 	updatedAt?: number;
 	failureReason?: string;
 	canceledAt?: number;
 	awaitingInput?: boolean;
+}
+
+// The record write a signal implies.
+interface JobPatch {
+	state?: string;
+	exitCode?: number;
+	finishedAt?: number;
+	durationMs?: number;
+	failureReason?: string;
+	awaitingInput?: boolean;
+}
+
+// Legacy state aliases are normalized in exactly one place.
+function canonicalState(value: unknown): string {
+	const state = String(value ?? 'unknown');
+	if (state === 'completed' || state === 'agent-done' || state === 'command-done') return 'done';
+	return state;
+}
+
+// ---------------------------------------------------------------------------
+// Envelope
+//
+// One contract for "this job reached this state", in both directions:
+// signalOf(record, result) is the signal, patchOf(signal) is the record write the
+// signal implies. Both are pure, so no writer can invent its own field list.
+// ---------------------------------------------------------------------------
+
+function signalOf(
+	record: JobRecord,
+	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+): Signal {
+	const label = String(record.label ?? record.id);
+	const state = canonicalState(result.state);
+	return {
+		id: record.id,
+		owner: record.owner,
+		label,
+		kind: String(record.kind ?? 'command'),
+		state,
+		exitCode: typeof result.exitCode === 'number' ? result.exitCode : null,
+		startedAt: record.startedAt,
+		finishedAt: result.finishedAt,
+		durationMs: result.durationMs,
+		logPath: record.logPath,
+		sessionId: record.sessionId,
+		title: result.title ?? `${label} ${state}`,
+		body: result.body,
+	};
+}
+
+function patchOf(signal: Signal): JobPatch {
+	const patch: JobPatch = {
+		exitCode: typeof signal.exitCode === 'number' ? signal.exitCode : undefined,
+		finishedAt: signal.finishedAt,
+		durationMs: signal.durationMs,
+	};
+	if (signal.state !== undefined) {
+		const state = canonicalState(signal.state);
+		patch.state = state;
+		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
+		if (state === 'waiting-input') patch.awaitingInput = true;
+	}
+	return patch;
 }
 
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
@@ -482,12 +533,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					: 'This result arrived automatically. Read it now and use it in your current work; ' +
 						'do not poll for it and do not wait for it.';
 		return `[pubsub] ${title}\n${facts}${log}` + (body.length > 0 ? `\n\n${body}` : '') + `\n\n${next}`;
-	}
-
-	function canonicalState(value: unknown): string {
-		const state = String(value ?? 'unknown');
-		if (state === 'completed' || state === 'agent-done' || state === 'command-done') return 'done';
-		return state;
 	}
 
 	function readJob(id: string): JobRecord | undefined {
@@ -928,13 +973,16 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 		const now = runtime.now();
 		const startedAt = Number(job.startedAt ?? now) || now;
-		job.state = 'canceled';
-		job.canceledAt = now;
-		job.finishedAt = now;
-		job.durationMs = Math.max(0, now - startedAt);
-		job.failureReason = 'canceled by request';
-		job.updatedAt = now;
-		writeJob(job);
+		// Signal from the record, record write from the signal: one envelope.
+		const signal = signalOf(
+			{
+				...job,
+				owner: typeof job.owner === 'string' && job.owner.length > 0 ? job.owner : requireOwner(),
+				startedAt,
+			},
+			{state: 'canceled', exitCode: null, finishedAt: now, durationMs: Math.max(0, now - startedAt), body: 'canceled by request'},
+		);
+		writeJob({...job, ...patchOf(signal), canceledAt: now, updatedAt: now});
 
 		killPid(job.pid, 'SIGTERM');
 		killPid(job.workerPid, 'SIGTERM');
@@ -948,21 +996,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			setTimeout(escalate, 1000).unref?.();
 		}
 
-		enqueueSignal({
-			id: job.id,
-			owner: typeof job.owner === 'string' && job.owner.length > 0 ? job.owner : requireOwner(),
-			label: String(job.label ?? job.id),
-			kind: String(job.kind ?? 'command'),
-			state: 'canceled',
-			exitCode: null,
-			startedAt,
-			finishedAt: now,
-			durationMs: job.durationMs,
-			logPath: typeof job.logPath === 'string' ? job.logPath : undefined,
-			sessionId: typeof job.sessionId === 'string' ? job.sessionId : undefined,
-			title: `${String(job.label ?? job.id)} canceled`,
-			body: 'canceled by request',
-		});
+		enqueueSignal(signal);
 		safeDrain();
 		refreshJobs();
 		return `pubsub: canceled ${id} (${String(job.label ?? 'unlabelled')})`;
@@ -1117,19 +1151,17 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				});
 			} catch (error) {
 				const now = runtime.now();
-				record.state = 'failed';
-				record.failureReason = `spawn error: ${String((error as Error)?.message ?? error)}`;
-				record.finishedAt = now;
-				record.updatedAt = now;
-				record.durationMs = now - startedAt;
-				writeJob(record);
-				enqueueSignal({
-					id, owner, label, kind, state: 'failed', exitCode: null, startedAt,
-					finishedAt: now, durationMs: record.durationMs, logPath,
-					sessionId, title: `${label} failed`, body: record.failureReason,
+				const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
+				const signal = signalOf(record, {
+					state: 'failed',
+					finishedAt: now,
+					durationMs: Math.max(0, now - startedAt),
+					body: reason,
 				});
+				writeJob({...record, ...patchOf(signal), updatedAt: now});
+				enqueueSignal(signal);
 				refreshJobs();
-				return {ok: false, error: record.failureReason};
+				return {ok: false, error: reason};
 			}
 
 			// A spawn failure is an async 'error' event; without a listener it is an
@@ -1139,42 +1171,32 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				const current = readJob(id);
 				if (current !== undefined && canonicalState(current.state) === 'canceled') return;
 				const now = runtime.now();
-				writeJob({
-					...(current ?? record),
-					id,
-					owner,
-					label,
-					kind,
+				const reason = `worker spawn error: ${String((error as Error)?.message ?? error)}`;
+				const signal = signalOf(current ?? record, {
 					state: 'failed',
-					failureReason: `worker spawn error: ${String((error as Error)?.message ?? error)}`,
 					finishedAt: now,
 					durationMs: Math.max(0, now - startedAt),
-					updatedAt: now,
+					body: reason,
 				});
-				enqueueSignal({
-					id, owner, label, kind, state: 'failed', exitCode: null, startedAt, finishedAt: now,
-					durationMs: Math.max(0, now - startedAt), logPath, sessionId,
-					title: `${label} failed`, body: `worker spawn error: ${String((error as Error)?.message ?? error)}`,
-				});
+				writeJob({...(current ?? record), ...patchOf(signal), updatedAt: now});
+				enqueueSignal(signal);
 				refreshJobs();
 			});
 			worker.unref();
 
 			if (typeof worker.pid !== 'number') {
 				const now = runtime.now();
-				record.state = 'failed';
-				record.failureReason = 'the worker process did not start';
-				record.finishedAt = now;
-				record.durationMs = now - startedAt;
-				record.updatedAt = now;
-				writeJob(record);
-				enqueueSignal({
-					id, owner, label, kind, state: 'failed', exitCode: null, startedAt, finishedAt: now,
-					durationMs: record.durationMs, logPath, sessionId,
-					title: `${label} failed`, body: record.failureReason,
+				const reason = 'the worker process did not start';
+				const signal = signalOf(record, {
+					state: 'failed',
+					finishedAt: now,
+					durationMs: Math.max(0, now - startedAt),
+					body: reason,
 				});
+				writeJob({...record, ...patchOf(signal), updatedAt: now});
+				enqueueSignal(signal);
 				refreshJobs();
-				return {ok: false, error: record.failureReason};
+				return {ok: false, error: reason};
 			}
 
 			// Merge the pid onto the freshest record: the worker may already have written

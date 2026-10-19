@@ -18,6 +18,7 @@ import assert from 'node:assert/strict';
 import {existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
+import {Script} from 'node:vm';
 
 import mod from '../pubsub.ts';
 
@@ -223,6 +224,17 @@ function ownerEntries(session) {
 		.filter((token) => typeof token === 'string' && token.length > 0);
 }
 
+// The detached worker is a string in the mod, so a syntax error in it would only
+// surface inside a process nobody is watching. Compile it here instead.
+function workerSource() {
+	const source = readFileSync(new URL('../pubsub.ts', import.meta.url), 'utf8');
+	const start = source.indexOf('const WORKER_SOURCE = `');
+	const end = source.indexOf('\n`;', start);
+	assert.ok(start > 0 && end > start, 'WORKER_SOURCE must be findable in pubsub.ts');
+	const literal = source.slice(start + 'const WORKER_SOURCE = '.length, end + 2);
+	return Function(`"use strict"; return ${literal};`)();
+}
+
 // --------------------------------------------------------------------- run
 
 try {
@@ -391,6 +403,23 @@ try {
 	escalate.fn();
 	assert.deepEqual(seamRuntime.kills.at(-1), {pid: 424242, signal: 'SIGKILL'}, 'escalation also uses the runtime');
 	ok('spawn, kill and the clock all cross the runtime seam');
+
+	// 10. envelope ---------------------------------------------------------
+	// signalOf/patchOf are the only constructors of a job result, so the record
+	// and the signal for one state change cannot carry different facts.
+	const canceledRecord = JSON.parse(readFileSync(recordPath, 'utf8'));
+	assert.equal(canceledRecord.state, 'canceled', 'the canceled record is written from the signal');
+	assert.equal(canceledRecord.failureReason, 'canceled by request', 'the record carries the signal reason');
+	assert.ok(
+		c.userMessages.some((message) => message.text.includes('canceled by request')),
+		'the canceled signal carries the same reason as the record',
+	);
+	assert.equal(canceledRecord.durationMs, 0, 'duration comes from the envelope, not from a hand-written literal');
+
+	const worker = workerSource();
+	new Script(worker, {filename: 'PUBSUB_WORKER_SOURCE'});
+	assert.match(worker, /PUBSUB_SPEC/, 'the worker reads its spec from the environment');
+	ok('one envelope for record and signal; the inline worker source compiles');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
