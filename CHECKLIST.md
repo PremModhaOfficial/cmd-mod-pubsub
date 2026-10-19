@@ -124,13 +124,16 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 8: Output and permissions
 
-- [ ] Scan worker output for instruction-shaped text.
-- [ ] Insert the backslash into imitated system tags.
-- [ ] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
-- [x] Map `permissionMode` to the worker CLI flags.
-- [x] Put a worker that needs approval into `waiting-input`.
-- [x] Signal the parent with the question or the approval request.
-- [x] Do not hang the worker.
+- [x] Scan worker output for instruction-shaped text. (T6: `scanOutput`, embedded in the worker;
+  smoke 37)
+- [x] Insert the backslash into imitated system tags. (smoke 37, 38: `<system-reminder>`,
+  `Human:`, `Assistant:`)
+- [x] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
+  (smoke 37-39; permission mentions are marked and left as written; failed signals carry the tail)
+- [x] Map `permissionMode` to the worker CLI flags. (T5: `permissionModes` table; smoke 42)
+- [x] Put a worker that needs approval into `waiting-input`. (smoke 44)
+- [x] Signal the parent with the question or the approval request. (smoke 44, 47)
+- [x] Do not hang the worker. (bounded inline wait, then `waiting-input`; smoke 45)
 - Gate: scanning and `waiting-input` tests pass.
 
 ## Phase 9: UI and persistence
