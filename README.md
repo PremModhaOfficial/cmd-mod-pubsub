@@ -88,6 +88,23 @@ Discovery walks up from the working directory to the repository root (the closes
 `.commandcode/agents/` wins), then scans `~/.commandcode/agents/`, then adds the built-ins. Directories
 are scanned recursively, and a project definition overrides a user or built-in definition by name.
 
+Every Claude Code scope is loaded, highest priority first:
+
+| Priority | Scope | Location |
+| --- | --- | --- |
+| 1 | `managed` | `<managed_dir>/agents/**/*.md` (organization-wide) |
+| 2 | `cli` | `--mod-option agents=<inline JSON \| JSON file>` (this session only) |
+| 3 | `project` | `.commandcode/agents/**/*.md` from the cwd up to the repository root, plus every `--add-dir` directory |
+| 4 | `user` | `~/.commandcode/agents/**/*.md` |
+| 5 | `plugin` | `<plugin root>/<plugin>/agents/**/*.md`; a subfolder becomes `plugin:review:security` |
+| 6 | `builtin` | the four built-ins below, overridable by any definition above |
+
+A same-directory duplicate loads the first file in read order; the rest are reported by `/doctor`.
+A CLI definition is session-only and accepts the same fields as frontmatter except `color` and
+`experimental`; an interactive session refuses a file path and requires inline JSON. A plugin definition
+ignores `hooks`, `mcpServers`, and `permissionMode`, and a plugin file with no name (or unparseable
+frontmatter) still loads under its filename.
+
 Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fallback) and `claude`.
 `general` is accepted as the host-reserved alias for `general-purpose`.
 
@@ -95,7 +112,7 @@ Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `perm
 `skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
 with a missing name or description, a bad first line, a colon or over-256-character name, or unparseable
 YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
-skip with its reason.
+skip with its reason, and `/doctor` reports each duplicate and invalid file with the fix.
 
 `subagent_type` is canonical; `agent_type` is a deprecated alias. Omitting the type uses
 `general-purpose`; with no `general-purpose` definition the call fails with `subagent_type is required`.
@@ -123,6 +140,7 @@ the `/pubsub` command and the `pubsub_dir` / `pubsub_deliver` flags.
 /subagents cancel <id>   # cancel a queued/running job
 /subagents open <id>     # one job: state, exit code, duration, log
 /agents [name|path]      # subagent definitions: scope, validity, source file
+/doctor [plugins]        # duplicate, invalid, and plugin-file problems, with the fix
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
@@ -134,6 +152,10 @@ The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` runni
 | --- | --- | --- |
 | `subagent_dir` | `~/.commandcode/subagents` | Where the spool, logs and job records live. Point several sessions at one shared spool (the default) or give a project its own. |
 | `subagent_deliver` | `steer` | How a signal reaches the session: `steer` delivers right after the current tool batch; `follow-up` waits until the run would otherwise stop. |
+| `managed_dir` | `~/.commandcode/managed` | The managed settings directory; `agents/` under it wins every other scope. |
+| `agents` | empty | Session-only definitions as inline JSON, or a JSON file path in a non-interactive session (`--mod-option agents=...`). |
+| `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`). |
+| `plugin_dir` | empty | Comma-separated plugin roots; every child directory with an `agents/` directory is a plugin. |
 
 `pubsub_dir` and `pubsub_deliver` are deprecated aliases, recognised for one release when set to
 anything other than their own default.
