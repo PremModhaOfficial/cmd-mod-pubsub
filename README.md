@@ -143,8 +143,22 @@ the first 200 lines or 25KB of its `MEMORY.md`, whichever comes first. The worke
 the bundle when the `appendSystemPrompt` hook is live; otherwise it precedes the task in the prompt.
 
 `permission_mode` and `isolation` are **refused explicitly** rather than silently ignored: they
-arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
-background path is the only one that exists yet.
+arrive in phase 8.
+
+### Foreground and background
+
+A run is background by default: `subagent_spawn` returns the moment the worker is detached and the result
+arrives later as a signal. `run_in_background: false` is a foreground run: the call waits (bounded to 30
+minutes) and returns the agent's output as its result, and the same result is not delivered again as a
+signal. Precedence is fixed: `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (alias
+`BETTER_SUBAGENTS_DISABLE_BACKGROUND=1`) forces every run into the foreground, a definition's
+`background: true` forces background over the caller's request, and otherwise the request decides.
+
+A foreground run cut off by an API error (rate limit, overload, server error) returns the text it already
+produced plus a cut-off note. With no agent text — nothing, or only tool calls — the call fails with
+`Agent terminated early due to an API error` and the error detail. A background run that hits the same
+error is marked `failed`, and its delivered message names the error and carries the last output. Partial
+work is never discarded.
 
 ### Tool access, model, and effort
 
