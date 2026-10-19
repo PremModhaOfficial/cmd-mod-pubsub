@@ -870,6 +870,15 @@ try {
 		'through the same implementation',
 	);
 
+	// subagent_list filters by state and bounds the rows.
+	const listTool = toolOf(alias, 'subagent_list');
+	const queuedOnly = await listTool.run({input: {state: 'queued'}});
+	assert.match(queuedOnly.content[0].text, /1 job\(s\) matching queued/, 'state filters the list');
+	const doneOnly = await listTool.run({input: {state: 'done'}});
+	assert.match(doneOnly.content[0].text, /^0 job\(s\) matching done/, 'a state with no jobs says zero');
+	const limited = await listTool.run({input: {limit: 1}});
+	assert.equal(limited.content[0].text.split('\n').filter((line) => line.trim().startsWith('◌') || line.trim().startsWith('●')).length <= 1, true, 'limit bounds the rows');
+
 	// The command and the flags have the same treatment.
 	const aliasCommands = commandNames(alias).filter((name) => name === 'pubsub' || name === 'subagents').sort();
 	assert.deepEqual(aliasCommands, ['pubsub', 'subagents'], '/subagents and /pubsub are both registered');
@@ -880,7 +889,7 @@ try {
 	const legacyFlag = makeApi({spoolDir: legacyFlagDir, dirFlag: 'pubsub_dir', session: makeSession(), runtime: makeRuntime().runtime});
 	mod(legacyFlag.api, legacyFlag.runtime);
 	assert.ok(existsSync(join(legacyFlagDir, 'inbox')), 'pubsub_dir still selects the spool');
-	ok('pubsub_* tools, /pubsub and pubsub_dir are deprecated aliases of the subagent surface');
+	ok('pubsub_* tools, /pubsub and pubsub_dir are deprecated aliases; subagent_list filters by state and limit');
 
 	// 27. /subagents open <id> ---------------------------------------------
 	const openOut = alias.commandDefs.find((def) => def.name === 'subagents').handler({args: 'open does-not-exist'});

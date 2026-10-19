@@ -84,8 +84,8 @@ Verification command: `node test/smoke.mjs`
 ## Phase 5: Tools and command
 
 - [x] Add `subagent_spawn`. (smoke 9: validation and rejections; 10: the spawn itself)
-- [x] Add `subagent_list`. (smoke 8: state, model, elapsed, owner, pending count; `state` / `limit`
-  filters)
+- [x] Add `subagent_list`. (smoke 8: state, model, elapsed, owner, pending count; smoke 29: the `state`
+  and `limit` filters)
 - [x] Add `subagent_output`. (smoke 27: tail, `offset` + `max_chars` window, bounded `wait`, unknown id)
 - [x] Add `subagent_cancel`. (smoke 9, 10, 22)
 - [x] Add `subagent_resume`. (smoke 28: unknown, shell and running jobs refused; a finished agent job
