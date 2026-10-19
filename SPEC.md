@@ -561,11 +561,11 @@ Frontmatter and resolution:
 - [ ] `skills` preloads full content; unlisted skills remain invocable.
 - [ ] `mcpServers` scopes an inline server and a referenced server.
 - [ ] Frontmatter hooks fire; project `SubagentStart` and `SubagentStop` fire.
-- [x] `memory` creates the right directory and loads `MEMORY.md` within the limit. (smoke 37)
+- [x] `memory` creates the right directory and loads `MEMORY.md` within the limit. (smoke 44)
 - [ ] `autoCompactWindow` lowers the window and has no effect as main.
 - [ ] `experimental.cacheTtl` selects the cache lifetime.
 - [ ] `initialPrompt` applies only as the main session agent.
-- [x] `omitClaudeMd` behaves as specified. (smoke 38: managed policy stays; user, project and local
+- [x] `omitClaudeMd` behaves as specified. (smoke 45: managed policy stays; user, project and local
   CLAUDE.md and AGENTS.md are skipped; a subdirectory CLAUDE.md still loads.)
 - [ ] `effort` resolves with the environment precedence.
 - [ ] `color` renders in the task list.
