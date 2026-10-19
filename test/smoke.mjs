@@ -112,9 +112,9 @@ try {
 
 	// 4. cross-session isolation -------------------------------------------
 	// Session A fires a signal. A's drain delivers it; B's drain must not.
-	const send = toolOf(a, 'subagent_send');
+	const send = toolOf(a, 'pubsub_send');
 	const sendResult = await send.run({input: {title: 'smoke signal', body: 'hello from A'}});
-	assert.equal(sendResult.ok, true, 'subagent_send must succeed');
+	assert.equal(sendResult.ok, true, 'pubsub_send must succeed');
 	assert.equal(a.userMessages.length, 1, 'A must receive its own signal');
 	assert.match(a.userMessages[0].text, /\[subagent\] smoke signal/, 'signal text must be addressed');
 	assert.equal(a.userMessages[0].options?.deliverAs, 'steer', 'default delivery is steer');
@@ -578,7 +578,7 @@ try {
 	const replaySession = makeSession();
 	const replayOne = makeApi({spoolDir: replayDir, session: replaySession, runtime: makeRuntime().runtime});
 	mod(replayOne.api, replayOne.runtime);
-	await toolOf(replayOne, 'subagent_send').run({input: {title: 'once only', body: 'first'}});
+	await toolOf(replayOne, 'pubsub_send').run({input: {title: 'once only', body: 'first'}});
 	assert.equal(replayOne.userMessages.length, 1, 'the first factory delivers once');
 	const deliveredId = replayOne.userMessages[0].text.match(/job (\S+)/)[1];
 	const replayOwner = ownerEntries(replaySession)[0];
@@ -865,7 +865,6 @@ try {
 		['subagent_spawn', 'pubsub_fire'],
 		['subagent_list', 'pubsub_list'],
 		['subagent_cancel', 'pubsub_cancel'],
-		['subagent_send', 'pubsub_send'],
 	];
 	for (const [canonical, deprecated] of aliasPairs) {
 		const target = toolOf(alias, canonical);
@@ -875,6 +874,10 @@ try {
 		assert.equal(old.run, target.run, `${deprecated} must delegate to ${canonical}`);
 		assert.match(old.schema.description, new RegExp(`deprecated: use ${canonical}`), `${deprecated} must say it is deprecated`);
 	}
+	// pubsub_send is the legacy NOTE channel, deliberately not a live-message alias.
+	const legacyNote = toolOf(alias, 'pubsub_send');
+	assert.deepEqual(Object.keys(legacyNote.schema.input_schema.properties).sort(), ['body', 'title'], 'pubsub_send keeps title/body');
+	assert.notEqual(legacyNote.run, toolOf(alias, 'subagent_send').run, 'pubsub_send is not subagent_send');
 	assert.deepEqual(toolNames(alias).filter((name) => name.startsWith('pubsub_')).sort(), [
 		'pubsub_fire',
 		'pubsub_list',
@@ -1586,6 +1589,92 @@ process.stdin.on('data', (data) => {
 	);
 	await liveIdle.exited;
 	ok('live worker: a message to an idle agent starts a turn');
+
+	// 39. live messaging: send routing ---------------------------------------
+	// The parent resolves a name to a job record. A live worker gets the message
+	// appended to its control file; a finished agent is resumed as a new job with
+	// the recorded ACP session. The fake runtime proves both without a process.
+	const liveSpool = mkdtempSync(join(tmpdir(), 'subagent-send-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(liveSpool, dir), {recursive: true});
+	const sendSession = makeSession();
+	const livePid = 555555;
+	const sendRuntime = makeRuntime({alive: (pid) => pid === livePid});
+	const sendBundle = makeApi({spoolDir: liveSpool, session: sendSession, runtime: sendRuntime.runtime});
+	mod(sendBundle.api, sendBundle.runtime);
+	const sendOwner = ownerEntries(sendSession)[0];
+	const sendTool = toolOf(sendBundle, 'subagent_send');
+	const noteTool = toolOf(sendBundle, 'pubsub_send');
+	assert.deepEqual(Object.keys(sendTool.schema.input_schema.properties).sort(), ['message', 'to'], 'subagent_send takes to and message');
+	assert.deepEqual(Object.keys(noteTool.schema.input_schema.properties).sort(), ['body', 'title'], 'pubsub_send stays the legacy note tool');
+	assert.ok(!/deprecated: use subagent_send/.test(noteTool.schema.description), 'pubsub_send is not an alias of subagent_send');
+
+	const liveRecord = {
+		id: 'live-1',
+		owner: sendOwner,
+		name: 'Tester',
+		label: 'tester',
+		kind: 'agent',
+		state: 'running',
+		startedAt: 1,
+		workerPid: livePid,
+		cwd: liveSpool,
+		logPath: join(liveSpool, 'logs', 'live-1.log'),
+	};
+	writeFileSync(join(liveSpool, 'jobs', 'live-1.json'), JSON.stringify(liveRecord));
+	const queued = await sendTool.run({input: {to: 'Tester', message: 'first'}});
+	assert.equal(queued.ok, true, JSON.stringify(queued));
+	assert.match(queued.content[0].text, /next safe point/, 'a busy worker queues');
+	const sendFile = join(liveSpool, 'control', 'live-1', 'send.jsonl');
+	const firstLine = JSON.parse(readFileSync(sendFile, 'utf8').trim().split('\n')[0]);
+	assert.equal(firstLine.message, 'first', 'the message reaches the control file');
+	assert.equal(firstLine.from, 'main', 'the sender is recorded');
+	assert.equal(typeof firstLine.at, 'number', 'the queue entry is stamped');
+
+	mkdirSync(join(liveSpool, 'control', 'live-1'), {recursive: true});
+	writeFileSync(join(liveSpool, 'control', 'live-1', 'state.json'), JSON.stringify({busy: false}));
+	const startedLive = await sendTool.run({input: {to: 'Tester', message: 'second'}});
+	assert.match(startedLive.content[0].text, /starts a turn/, 'an idle worker starts a turn');
+	assert.equal(readFileSync(sendFile, 'utf8').trim().split('\n').length, 2, 'the idle message is queued too');
+
+	const unknownTarget = await sendTool.run({input: {to: 'Nobody', message: 'hi'}});
+	assert.equal(unknownTarget.ok, false, 'an unknown target is an error');
+	assert.match(unknownTarget.error, /no agent named "Nobody"/, 'the error names the target');
+	assert.match(unknownTarget.error, /Tester/, 'the error lists the addressable names');
+
+	writeFileSync(
+		join(liveSpool, 'jobs', 'live-1.json'),
+		JSON.stringify({...liveRecord, state: 'done', workerPid: undefined, acpSessionId: 'acp-old', finishedAt: 2, durationMs: 1}),
+	);
+	const spawnsBefore = sendRuntime.spawnCalls.length;
+	const resumedLive = await sendTool.run({input: {to: 'Tester', message: 'after finish'}});
+	assert.equal(resumedLive.ok, true, JSON.stringify(resumedLive));
+	assert.equal(sendRuntime.spawnCalls.length, spawnsBefore + 1, 'a finished target is resumed in a new worker');
+	const resumeSpec = JSON.parse(sendRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(resumeSpec.resumeSession, 'acp-old', 'the recorded ACP session is resumed');
+	assert.equal(resumeSpec.name, 'Tester', 'the resumed job keeps the addressable name');
+	assert.equal(resumeSpec.prompt, 'after finish', 'the live message is the resumed turn');
+	assert.match(resumedLive.content[0].text, /resumed/i, 'the tool reports a resume');
+
+	const toMain = await sendTool.run({input: {to: 'main', message: 'note to self'}});
+	assert.equal(toMain.ok, true, JSON.stringify(toMain));
+	assert.match(sendBundle.userMessages.at(-1).text, /note to self/, 'main receives a message addressed to main');
+
+	writeFileSync(
+		join(liveSpool, 'jobs', 'helper.json'),
+		JSON.stringify({id: 'helper', owner: sendOwner, name: 'Helper', label: 'helper', kind: 'agent', state: 'done', startedAt: 0}),
+	);
+	const spawnTool = toolOf(sendBundle, 'subagent_spawn');
+	const named = await spawnTool.run({input: {description: 'named spawn', prompt: 'hello', name: 'Scout'}});
+	assert.equal(named.ok, true, JSON.stringify(named));
+	const namedSpec = JSON.parse(sendRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(namedSpec.name, 'Scout', 'the spawn carries the name');
+	assert.equal(namedSpec.live, true, 'an agent job accepts live messages');
+	assert.match(namedSpec.controlDir, /control/, 'the worker gets its control directory');
+	assert.match(namedSpec.roster, /\bmain\b/, 'the roster lists main');
+	assert.match(namedSpec.roster, /Helper/, 'the roster lists a named sibling');
+	assert.ok(!/Scout/.test(namedSpec.roster), 'the new agent is not in its own roster');
+	assert.ok(namedSpec.rosterNames.includes('Helper'), 'the roster names travel as data');
+	ok('subagent_send: running queues, idle starts a turn, finished resumes, main is addressable');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

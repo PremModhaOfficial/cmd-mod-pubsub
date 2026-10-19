@@ -1783,8 +1783,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const logsDir = join(root, 'logs');
 	const jobsDir = join(root, 'jobs');
 	const worktreesDir = join(root, 'worktrees');
+	const controlRoot = join(root, 'control');
 	const ledgerPath = join(root, 'delivered.jsonl');
-	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir]) {
+	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir, controlRoot]) {
 		spool.mkdir(dir);
 	}
 
@@ -2026,6 +2027,85 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			}
 		}
 		return jobs;
+	}
+
+	// ------------------------------------------------------------------ live
+	//
+	// One live-message queue per job. A sender appends a JSON line; the worker
+	// consumes it at the next safe point (see WORKER_SOURCE). A worker's state.json
+	// says whether a turn is active, so the tool can report "queued" vs "starts a
+	// turn" without guessing. Names resolve inside this session's jobs only: another
+	// session's roster is not this session's to message.
+
+	function rosterNames(): string[] {
+		if (workerMode) return Array.isArray(workerSpec?.rosterNames) ? workerSpec.rosterNames : [];
+		const own = ownerId();
+		const names: string[] = [];
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (typeof job.name !== 'string' || job.name.length === 0) continue;
+			if (own !== undefined && job.owner !== own) continue;
+			if (!names.includes(job.name)) names.push(job.name);
+		}
+		return names;
+	}
+
+	function namedJob(name: string): JobRecord | undefined {
+		const wanted = name.trim();
+		if (wanted.length === 0) return undefined;
+		const own = workerMode ? workerSpec?.owner : ownerId();
+		const allowed = workerMode ? rosterNames() : undefined;
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (job.name !== wanted) continue;
+			if (!workerMode && own !== undefined && job.owner !== undefined && job.owner !== own) continue;
+			if (allowed !== undefined && !allowed.includes(wanted)) continue;
+			return job;
+		}
+		return undefined;
+	}
+
+	// `alive` decides queue-vs-resume; `busy` decides the wording of a queue. No
+	// state file means the worker has not published yet, so a live worker is assumed
+	// to be in a turn.
+	function liveState(record: JobRecord): {alive: boolean; busy: boolean} {
+		const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
+		let busy = true;
+		try {
+			const state = JSON.parse(spool.readFile(join(controlRoot, record.id, 'state.json'))) as {busy?: unknown};
+			busy = state.busy !== false;
+		} catch {
+			/* no state file yet */
+		}
+		return {alive, busy};
+	}
+
+	function appendLive(id: string, from: string, message: string): boolean {
+		const dir = join(controlRoot, id);
+		try {
+			spool.mkdir(dir);
+			spool.appendFile(join(dir, 'send.jsonl'), `${JSON.stringify({from, message, at: runtime.now()})}\n`);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	// The snapshot a new agent receives: main plus every other named agent owned by
+	// this session, newest record per name. `rosterNames` is the same set as data, so
+	// the worker can validate a `to` without parsing the rendered text.
+	function rosterFor(selfName: string | undefined): {roster?: string; rosterNames: string[]} {
+		const own = ownerId();
+		const entries: RosterEntry[] = [];
+		const names: string[] = [];
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (typeof job.name !== 'string' || job.name.length === 0) continue;
+			if (job.name === selfName) continue;
+			if (own !== undefined && job.owner !== own) continue;
+			if (names.includes(job.name)) continue;
+			names.push(job.name);
+			entries.push({name: job.name, state: canonicalState(job.state), jobId: job.id});
+		}
+		const roster = buildRoster(entries, selfName);
+		return {...(roster.length > 0 ? {roster} : {}), rosterNames: names};
 	}
 
 	function enqueueSignal(message: Signal): void {
@@ -2495,6 +2575,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		/** resume this ACP session id first */
 		readonly resumeSession?: string;
 		readonly resumedFrom?: string;
+		/** addressable name; a named agent can be messaged after it finishes */
+		readonly name?: string;
+		/** override the owner (a worker resuming a session it did not create) */
+		readonly owner?: string;
+		/** keep the ACP session open for live messages after the first turn */
+		readonly live?: boolean;
 	}
 
 	type Launch = {readonly ok: true; readonly id: string; readonly pid: number} | {readonly ok: false; readonly error: string};
@@ -2534,6 +2620,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			owner,
 			label: intent.label,
 			kind: intent.kind,
+			...(intent.name !== undefined ? {name: intent.name} : {}),
 			state: 'queued',
 			cwd: intent.cwd,
 			logPath,
@@ -2601,7 +2688,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
-		const owner = ownerId();
+		const owner = intent.owner ?? ownerId();
 		const record = makeRecord(intent, id, logPath, startedAt, owner);
 		writeJob(record);
 		try {
@@ -2614,6 +2701,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 
 		const isAgent = intent.prompt !== undefined;
+		const live = isAgent && intent.live !== false;
+		const roster = isAgent ? rosterFor(intent.name) : {rosterNames: []};
+		if (live) {
+			try {
+				spool.mkdir(join(controlRoot, id));
+			} catch {
+				/* the first send retries the mkdir */
+			}
+		}
 		const spec = buildSpec(
 			{
 				id,
@@ -2628,6 +2724,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				tailMax: LOG_TAIL_BYTES_MAX,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
+				...(intent.name !== undefined ? {name: intent.name} : {}),
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
@@ -2637,6 +2734,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
 				...(intent.resumeSession !== undefined ? {resumeSession: intent.resumeSession} : {}),
 				...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+				...(roster.roster !== undefined ? {roster: roster.roster} : {}),
+				...(roster.rosterNames.length > 0 ? {rosterNames: roster.rosterNames} : {}),
+				...(live ? {live: true, controlDir: join(controlRoot, id)} : {}),
 				...(isAgent ? {promptMarkerPath: join(logsDir, `${id}.mod`)} : {}),
 			},
 			MOD_PATH,
@@ -2761,6 +2861,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
+		const name = typeof input.name === 'string' && input.name.trim().length > 0 ? input.name.trim() : undefined;
 		const requestedMaxTurns = Number(input.max_turns);
 		const timeoutMs = Number(input.timeout_ms);
 		// `subagent_type` is canonical; `agent_type` is the 1.x alias and must behave
@@ -2796,6 +2897,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			command,
 			prompt,
 			cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
+			...(name !== undefined ? {name} : {}),
 			agentType: definition?.name,
 			systemPrompt: definition?.systemPrompt,
 			model: prompt === undefined ? undefined : model ?? definitionModel,
@@ -2918,6 +3020,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (record.prompt === undefined) {
 			return badInput(`subagent: job ${id} is a shell job; there is no agent session to resume`);
 		}
+		// A live worker already owns this session. Starting a second worker would race
+		// the first over it, so the live path is the message path.
+		if (liveState(record).alive) {
+			return badInput(
+				`subagent: job ${id} is still running; send it a live message with subagent_send` +
+					(record.name === undefined ? ' once it finishes, or wait for its result' : `({to: "${record.name}", message}) instead`),
+			);
+		}
 		// Resume the ACP session the first run created, so the new instruction continues
 		// with the context the worker already has. An older record without one starts a
 		// fresh session (the definition body still applies).
@@ -2936,6 +3046,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			timeoutMs: record.timeoutMs,
 			resumeSession: record.acpSessionId,
 			resumedFrom: id,
+			...(record.name !== undefined ? {name: record.name} : {}),
+			...(record.owner !== undefined ? {owner: record.owner} : {}),
 		});
 		if (!launched.ok) return badInput(launched.error);
 		return okText(
@@ -2945,7 +3057,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		);
 	};
 
-	const sendRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+	const noteRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
 		const title = typeof input.title === 'string' ? input.title : '';
 		if (title.length === 0) return badInput('title is required');
 		const body = typeof input.body === 'string' ? input.body : '';
@@ -2967,6 +3079,79 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return okText(ledger.has(id) ? 'delivered' : 'queued for this session');
 	};
 
+	// Live messaging. The target is a name, never a pid: the record decides whether
+	// the message is queued to a live worker or starts a new turn in its finished
+	// session, so a resume keeps the session the agent already has.
+	const sendLiveRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const to = String(input.to ?? '').trim();
+		const message = typeof input.message === 'string' ? input.message : '';
+		if (to.length === 0) return badInput('to is required: a named agent or main');
+		if (message.trim().length === 0) return badInput('message is required and must not be empty');
+		const from = workerMode ? String(workerSpec?.name ?? 'worker') : ROSTER_MAIN;
+		if (to === ROSTER_MAIN) {
+			const id = `live-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			enqueueSignal({
+				id,
+				owner: workerMode ? workerSpec?.owner : ownerId(),
+				label: `message from ${from}`,
+				kind: 'message',
+				state: 'note',
+				exitCode: null,
+				title: `message from ${from}`,
+				body: message,
+				sessionId: workerMode ? workerSpec?.sessionId : sessionId,
+			});
+			if (!workerMode) {
+				safeDrain();
+				refreshJobs();
+			}
+			return okText(`sent a message to ${ROSTER_MAIN} from ${from}`);
+		}
+		const record = namedJob(to);
+		if (record === undefined) {
+			const names = rosterNames();
+			return badInput(
+				`no agent named "${to}"${names.length > 0 ? `; addressable: ${names.join(', ')}` : '; no named agents in this session'}`,
+			);
+		}
+		const {alive, busy} = liveState(record);
+		if (alive) {
+			if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${to}: its control queue is not writable`);
+			return okText(
+				`${busy ? `queued for ${to}'s next safe point` : `sent to idle ${to}; it starts a turn`} (job ${record.id}).\n` +
+					`The reply arrives here as its own message signal.`,
+			);
+		}
+		if (record.acpSessionId === undefined) {
+			return badInput(`${to} has finished and has no resumable session; spawn it again`);
+		}
+		// A finished agent resumes the ACP session it already has, with the same
+		// definition, model, effort and permissions. The message is the new turn.
+		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const launched = fire({
+			label: `${String(record.label ?? record.id)} (message)`,
+			kind: 'agent',
+			prompt: message,
+			cwd: String(record.cwd ?? cmd.cwd),
+			agentType: record.agentType,
+			systemPrompt: definition?.ok === true ? definition.definition.systemPrompt : undefined,
+			model: record.model,
+			maxTurns: record.maxTurns,
+			effort: record.effort,
+			permissionMode: record.permissionMode,
+			timeoutMs: record.timeoutMs,
+			resumeSession: record.acpSessionId,
+			resumedFrom: record.id,
+			name: record.name,
+			owner: record.owner,
+		});
+		if (!launched.ok) return badInput(launched.error);
+		return okText(
+			`resumed ${to} as ${launched.id} "${String(record.label ?? record.id)} (message)", pid ${launched.pid}.\n` +
+				`The reply arrives here as its own signal.`,
+		);
+	};
+
 	addSurface(
 		'subagent_spawn',
 		'Start a background subagent and return immediately. When it finishes, its result is delivered to this session as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. The result returns later as an agent-to-agent signal, so neither side blocks on the other; it is not this tool result.',
@@ -2975,6 +3160,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			properties: {
 				description: {type: 'string', description: 'Short name for this job, used in the signal title.'},
 				label: {type: 'string', description: 'Alias for description.'},
+				name: {type: 'string', description: 'Address this agent later with subagent_send. A named agent appears in its siblings\' roster.'},
 				prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
 				command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
 				agent_type: {type: 'string', description: "Deprecated alias for subagent_type. Use subagent_type."},
@@ -3056,7 +3242,24 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	addSurface(
 		'subagent_send',
-		'Publish a signal into the agent loop of THIS session. This is the AGENT-TO-AGENT channel: worker and peer agents signal a session so neither side blocks on the other or polls for a result. It is delivered as a visible user turn in the session (echoed in the TUI), and it is durable if no session is bound yet. NEVER use it to notify the human - to reach the human, reply in the session.',
+		'Send a live message to a named agent (or "main"). A running agent queues it and answers at its next safe point; an idle agent starts a turn; a finished agent resumes its session with full context. The reply arrives later as its own message signal, so do not wait for it here.',
+		{
+			type: 'object',
+			properties: {
+				to: {type: 'string', description: 'A named agent, or "main" for this conversation.'},
+				message: {type: 'string', description: 'The message to deliver. The target acts on it in its own session.'},
+			},
+			required: ['to', 'message'],
+		},
+		sendLiveRun,
+	);
+
+	// The 0.1.0 note channel. It is NOT an alias of live messaging: it publishes a
+	// note into this session, while subagent_send delivers to another agent. It is
+	// removed one release after the rename.
+	addSurface(
+		'pubsub_send',
+		'[deprecated: live messaging moved to subagent_send] Publish a note into the agent loop of THIS session. It is delivered as a visible user turn. This is not live messaging to another agent.',
 		{
 			type: 'object',
 			properties: {
@@ -3065,8 +3268,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			},
 			required: ['title'],
 		},
-		sendRun,
-		{aliases: ['pubsub_send']},
+		noteRun,
 	);
 
 	// ------------------------------------------------------------------ command
