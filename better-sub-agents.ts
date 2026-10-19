@@ -143,6 +143,20 @@ const CLI_AGENTS_OPTION = 'agents';
 const ADD_DIRS_OPTION = 'add_dir';
 const PLUGIN_DIRS_OPTION = 'plugin_dir';
 
+// Execution policy. A run is either foreground (the tool call waits and returns
+// the result) or background (the tool returns and the result arrives as a signal).
+// The disable envs force the foreground, so they win over everything; a definition's
+// `background: true` wins over the caller but never over the env.
+const BACKGROUND_DISABLE_ENV = 'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS';
+const BACKGROUND_DISABLE_ENV_ALIAS = 'BETTER_SUBAGENTS_DISABLE_BACKGROUND';
+// Foreground is bounded: a tool call must not hold the turn open forever. Past the
+// bound the run is demoted to background, so its result still reaches the session.
+const FOREGROUND_WAIT_MAX_MS = 30 * 60 * 1000;
+const FOREGROUND_POLL_MS = 200;
+// The worker settles an ACP turn cut off by a rate limit, an overload, or a server
+// error with this exact lead. The parent uses the lead to tell a partial result
+// apart from any other failure. Keep the text verbatim: it is the documented error.
+export const AGENT_API_ERROR = 'Agent terminated early due to an API error';
 // ---------------------------------------------------------------------------
 // Output scanning
 //
@@ -307,6 +321,9 @@ const settle = (state, detail, code, tail) => {
 
 // A failed worker still returns its last output: partial work is never discarded.
 const fail = (reason, code) => settle('failed', reason, code, readReportTail());
+// A cut-off is not a plain failure: the last output is part of the result, so the
+// foreground can return it as partial work and the background can deliver it.
+const failApi = detail => settle('failed', ${JSON.stringify(AGENT_API_ERROR)} + (detail ? ': ' + detail : ''), null, readReportTail());
 
 let out;
 try {
@@ -372,7 +389,7 @@ const finish = (code, spawnError, signal) => {
       : spawnError !== undefined
         ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
         : 'ACP exited before the prompt completed (exit ' + String(code) + ')';
-    fail(detail, code);
+    if (timedOut || spawnError !== undefined) fail(detail, code); else failApi(detail);
     shutdown();
     return;
   }
@@ -608,7 +625,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     shutdown();
   };
   runPrompt().catch(error => {
-    fail('ACP session failed: ' + String(error && error.message || error), null);
+    failApi('ACP session failed: ' + String(error && error.message || error));
     shutdown();
   });
 }
@@ -2011,6 +2028,11 @@ export interface WorkerSpecInput {
 	resumeSession?: string;
 	prompt?: string;
 	command?: string;
+	/** The resolved execution policy; the worker and ListAgents gating read it. */
+	background?: boolean;
+	/** Foreground runs answer permission prompts inline; background runs settle. */
+	interactive?: boolean;
+	controlDir?: string;
 	/** Written by the mod when the ACP child loaded it; proves the prompt hook is live. */
 	promptMarkerPath?: string;
 	/** The worktree this job runs in, when isolation created one. */
@@ -2749,6 +2771,8 @@ interface JobRecord extends JobIdentity {
 	depth?: number;
 	parentJobId?: string;
 	agentType?: string;
+	/** The resolved execution policy: false is a foreground run. */
+	background?: boolean;
 	model?: string;
 	tools?: string[];
 	color?: string;
@@ -2903,6 +2927,91 @@ export const jobStates = {
 	marker: stateMarker,
 	color: stateColor,
 };
+
+// ---------------------------------------------------------------------------
+// Execution policy
+//
+// One rule set for "does this run block the conversation or report back later".
+// Pure, so the precedence table is asserted without spawning a worker: the disable
+// env wins over everything, a definition's `background: true` wins over the caller,
+// and the caller's `run_in_background` wins over the default. The default is
+// background, because a background run never holds the turn open.
+// ---------------------------------------------------------------------------
+
+export type ExecutionMode = 'foreground' | 'background';
+
+export interface ExecutionPolicyInput {
+	/** The caller's `run_in_background`; undefined means "no preference". */
+	readonly requested?: boolean;
+	/** The resolved definition's frontmatter `background`. */
+	readonly definitionBackground?: boolean;
+	readonly env: Record<string, string | undefined>;
+}
+
+export function resolveExecutionPolicy(input: ExecutionPolicyInput): ExecutionMode {
+	const isSet = (value: string | undefined): boolean => {
+		if (value === undefined) return false;
+		const normalized = value.trim().toLowerCase();
+		return normalized.length > 0 && normalized !== '0' && normalized !== 'false' && normalized !== 'no';
+	};
+	if (isSet(input.env[BACKGROUND_DISABLE_ENV]) || isSet(input.env[BACKGROUND_DISABLE_ENV_ALIAS])) return 'foreground';
+	if (input.definitionBackground === true) return 'background';
+	if (input.requested === false) return 'foreground';
+	return 'background';
+}
+
+export interface ForegroundJob {
+	readonly state?: unknown;
+	readonly failureReason?: unknown;
+	readonly label?: unknown;
+	readonly id?: unknown;
+	readonly kind?: unknown;
+}
+
+export type ForegroundResult =
+	| {readonly ok: true; readonly text: string; readonly partial: boolean}
+	| {readonly ok: false; readonly error: string};
+
+// A line that is only worker plumbing is not agent output. "Produced nothing, or
+// only tool calls" is decided here, once, for both the partial and the empty path.
+const PLUMBING_LINE = /^\s*\[(tool|permission|acp)\b/;
+
+export function hasAgentOutput(log: string): boolean {
+	for (const line of log.split('\n')) {
+		if (line.trim().length === 0) continue;
+		if (PLUMBING_LINE.test(line)) continue;
+		return true;
+	}
+	return false;
+}
+
+// The foreground result is the job's own result, shaped for a tool call: success
+// returns the output, a cut-off returns the partial output plus a note, and any
+// other failure returns the reason. Nothing is invented and nothing is dropped.
+export function foregroundOutcome(job: ForegroundJob, log: string): ForegroundResult {
+	const state = canonicalState(job.state);
+	const label = String(job.label ?? job.id ?? 'subagent');
+	const full = reportText(log, String(job.kind ?? 'agent')).trim();
+	// The tool result is the model's context, so the inline result is bounded like
+	// every other read. The full log stays at the job's log path.
+	const text = full.length > OUTPUT_MAX_CHARS_DEFAULT ? `…${full.slice(-OUTPUT_MAX_CHARS_DEFAULT)}` : full;
+	if (state === 'done') {
+		return {ok: true, partial: false, text: text.length > 0 ? text : `${label} finished with no output.`};
+	}
+	if (state === 'waiting-input') {
+		return {
+			ok: true,
+			partial: true,
+			text: `${text.length > 0 ? `${text}\n\n` : ''}${label} stopped with a question; answer it here or resume the job.`,
+		};
+	}
+	const reason =
+		typeof job.failureReason === 'string' && job.failureReason.length > 0 ? job.failureReason : `${label} ${state}`;
+	if (state === 'failed' && reason.startsWith(AGENT_API_ERROR) && hasAgentOutput(log)) {
+		return {ok: true, partial: true, text: `${text}\n\n[cut off: ${reason}]`};
+	}
+	return {ok: false, error: reason};
+}
 
 // ---------------------------------------------------------------------------
 // Envelope
@@ -3649,6 +3758,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				settle(claim, 'held');
 				continue;
 			}
+			// A foreground run already returned this exact result inside the tool call.
+			// Its durable signal is the same result, so accept it here: delivering it
+			// again would report the work twice.
+			const settledJob = readJob(signal.id);
+			if (settledJob !== undefined && settledJob.background === false) {
+				markDelivered(signal.id);
+				settle(claim, 'accepted');
+				continue;
+			}
 			return claim;
 		}
 		return undefined;
@@ -4052,6 +4170,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly color?: string;
 		readonly permissionMode?: string;
 		readonly isolation?: string;
+		/** The resolved execution policy: false waits for the result in the tool call. */
+		readonly background?: boolean;
 		/** SIGTERM then SIGKILL after this long; 0 or absent means no timeout */
 		readonly timeoutMs?: number;
 		/** resume this ACP session id first */
@@ -4059,7 +4179,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly resumedFrom?: string;
 	}
 
-	type Launch = {readonly ok: true; readonly id: string; readonly pid: number} | {readonly ok: false; readonly error: string};
+	type Launch =
+		| {readonly ok: true; readonly id: string; readonly pid: number; readonly result?: ForegroundResult}
+		| {readonly ok: false; readonly error: string};
 
 	function failJob(job: JobRecord, reason: string): void {
 		const now = runtime.now();
@@ -4097,6 +4219,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			label: intent.label,
 			kind: intent.kind,
 			state: 'queued',
+			// The resolved policy, not the raw `run_in_background`: env and definition
+			// overrides are already applied by the caller.
+			background: intent.background !== false,
 			cwd: intent.cwd,
 			logPath,
 			startedAt,
@@ -4178,7 +4303,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return count;
 	}
 
-	function fire(intent: JobIntent): Launch {
+	async function fire(intent: JobIntent): Promise<Launch> {
 		// Both limits are checked before a record exists, so a refused spawn leaves no
 		// job behind and emits no signal.
 		const depth = depthOf(workerSpec) + 1;
@@ -4198,7 +4323,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`,
 			};
 		}
-
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
@@ -4251,6 +4375,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				tailMax: LOG_TAIL_BYTES_MAX,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
+				background: intent.background !== false,
+				// A foreground caller answers permission prompts inline; a background run
+				// settles with the request instead of holding a worker that nobody watches.
+				...(intent.background === false
+					? {interactive: true, controlDir: join(jobsDir, '..', 'control', id)}
+					: {}),
 				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
@@ -4269,7 +4399,35 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			},
 			MOD_PATH,
 		);
-		return startWorker(record, spec);
+		const launched = startWorker(record, spec);
+		if (!launched.ok || intent.background !== false) return launched;
+		return settleForeground(launched);
+	}
+
+	// Foreground is a bounded wait on the same durable record a background job
+	// leaves behind. Completion is the record, never the process: a worker that died
+	// after writing its result must still return it.
+	async function settleForeground(launched: {readonly id: string; readonly pid: number}): Promise<Launch> {
+		const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
+		let record = readJob(launched.id);
+		for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
+			await runtime.sleep(FOREGROUND_POLL_MS);
+			record = readJob(launched.id);
+		}
+		if (record === undefined || !isTerminalState(record.state)) {
+			// Past the bound the run keeps going. Demote it so its result is delivered as
+			// a signal instead of being lost with the tool call that gave up on it.
+			if (record !== undefined) writeJob({...record, background: true, updatedAt: runtime.now()});
+			refreshJobs();
+			return {
+				ok: false,
+				error:
+					`foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1000)}s; ` +
+					'it continues in the background, and its result will arrive as a signal',
+			};
+		}
+		const log = readLog(String(record.logPath ?? join(logsDir, `${launched.id}.log`)));
+		return {...launched, result: foregroundOutcome(record, log)};
 	}
 
 	// ------------------------------------------------------------------ dashboard
@@ -4381,13 +4539,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			return badInput('pass either prompt (a headless agent) or command (a shell command)');
 		}
 		if (command !== undefined && prompt !== undefined) return badInput('pass prompt or command, not both');
-		// Explicitly refused rather than silently ignored: a caller must not believe a
-		// foreground wait or an isolation mode happened when neither landed yet.
-		if (input.run_in_background === false) {
-			return badInput(
-				'foreground runs are not implemented in this release; omit run_in_background (background is the default)',
-			);
-		}
 		for (const unsupported of ['permission_mode', 'isolation']) {
 			if (input[unsupported] === undefined) continue;
 			return badInput(
@@ -4423,6 +4574,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			prompt === undefined ? undefined : (listField(input.tools) ?? definition?.tools);
 		const requestedDisallowed =
 			prompt === undefined ? undefined : (listField(input.disallowed_tools) ?? definition?.disallowedTools);
+		// Three inputs, one precedence table: the disable env, the definition's pinned
+		// background, then the caller's request. The default is background.
+		const background =
+			resolveExecutionPolicy({
+				requested: typeof input.run_in_background === 'boolean' ? input.run_in_background : undefined,
+				definitionBackground: definition?.background,
+				env: runtime.env,
+			}) === 'background';
 		const launch = resolveLaunch({
 			...(model !== undefined ? {requestedModel: model} : {}),
 			...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
@@ -4434,9 +4593,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(requestedTools !== undefined ? {tools: requestedTools} : {}),
 			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
 			...(definition?.permissionMode !== undefined ? {permissionMode: definition.permissionMode} : {}),
-			// The execution mode decides this once foreground runs land; until then every
-			// job is background.
-			background: input.run_in_background !== false,
+			background,
 			mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
 		});
 		if (!launch.ok) return badInput(launch.error);
@@ -4449,11 +4606,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					? Math.round(requestedMaxTurns)
 					: definition?.maxTurns;
 		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
-		const launched = fire({
+		const launched = await fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
 			command,
 			prompt,
+			background,
 			cwd: runCwd,
 			agentType: definition?.name,
 			systemPrompt: definition?.systemPrompt,
@@ -4469,6 +4627,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
 		if (!launched.ok) return badInput(launched.error);
+		// A foreground run returns its result here; a background run returns the moment
+		// the worker is detached.
+		if (launched.result !== undefined) {
+			return launched.result.ok ? okText(launched.result.text) : badInput(launched.result.error);
+		}
 		const kind = definition !== undefined ? `agent (${definition.name})` : 'shell (/bin/sh -c)';
 		return okText(
 			`spawned ${launched.id} "${label}" as ${kind}, pid ${launched.pid}.\n` +
@@ -4590,10 +4753,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
 		const resumeCwd = String(record.cwd ?? cmd.cwd);
 		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
-		const launched = fire({
+		// A resume is a fresh job: it follows the default (background) and the
+		// definition's pinned background, not the mode of the run it resumes.
+		const background =
+			resolveExecutionPolicy({
+				definitionBackground: definition?.ok === true ? definition.definition.background : undefined,
+				env: runtime.env,
+			}) === 'background';
+		const launched = await fire({
 			label: `${String(record.label ?? id)} (resume)`,
 			kind: 'agent',
 			prompt: instruction,
+			background,
 			cwd: resumeCwd,
 			agentType: record.agentType,
 			systemPrompt: resumeDefinition?.systemPrompt,
@@ -4609,6 +4780,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			resumedFrom: id,
 		});
 		if (!launched.ok) return badInput(launched.error);
+		if (launched.result !== undefined) {
+			return launched.result.ok ? okText(launched.result.text) : badInput(launched.result.error);
+		}
 		return okText(
 			`resumed ${id} as ${launched.id} "${String(record.label ?? id)} (resume)", pid ${launched.pid}.\n` +
 				`log ${join(logsDir, `${launched.id}.log`)}\n` +
@@ -4640,7 +4814,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	addSurface(
 		'subagent_spawn',
-		'Start a background subagent and return immediately. When it finishes, its result is delivered to this session as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. The result returns later as an agent-to-agent signal, so neither side blocks on the other; it is not this tool result.',
+		'Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode.',
 		{
 			type: 'object',
 			properties: {
@@ -4660,7 +4834,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				disallowed_tools: {type: 'string', description: 'Comma-separated tool list (or an array) to remove. Wins over tools.'},
 				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
 				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
-				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
+				run_in_background: {
+					type: 'boolean',
+					description:
+						'false waits for the run and returns its result in this call; true (or omitted) returns immediately and delivers the result as a signal. A definition pinned to background, or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, can override this.',
+				},
 				cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
 			},
 			required: [],
