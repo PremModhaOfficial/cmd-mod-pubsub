@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
@@ -1435,6 +1435,157 @@ process.stdin.on('data', (data) => {
 	assert.equal(buildRoster([{name: 'Tester', jobId: 'j1'}], 'Tester'), '', 'no named sibling means no roster');
 	assert.equal(buildRoster([], undefined), '', 'no agents means no roster');
 	ok('buildRoster: main plus named siblings only, self excluded, newest wins');
+
+	// 37. live messaging: the worker control channel -------------------------
+	// A real worker process, a real fake ACP child, and the real control file. A
+	// message appended while a prompt runs is queued and becomes the next prompt
+	// (the turn is not restarted); a message appended while the agent is idle
+	// starts a turn. Each message turn emits its own `message` signal, so main
+	// gets the reply without waiting for the agent to exit.
+	const appendLine = (file, value) => appendFileSync(file, JSON.stringify(value) + '\n');
+	const waitUntil = async (check, label, timeout = 6000) => {
+		const deadline = Date.now() + timeout;
+		while (Date.now() < deadline) {
+			const value = check();
+			if (value) return value;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		throw new Error(`timed out waiting for ${label}`);
+	};
+	const liveCmd = join(acpDir, 'live-cmd.mjs');
+	writeFileSync(
+		liveCmd,
+		`#!/usr/bin/env node
+let buffer = '';
+let turn = 0;
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+const chunk = (text) => send({method: 'session/update', params: {sessionId: 'acp-live', update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text}}}});
+const delay = Number(process.env.FAKE_PROMPT_DELAY || 0);
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') send({id: message.id, result: {protocolVersion: 1}});
+    else if (message.method === 'session/new') send({id: message.id, result: {sessionId: 'acp-live', modes: {currentModeId: 'default', availableModes: []}, configOptions: []}});
+    else if (message.method === 'session/set_mode' || message.method === 'session/set_config_option') send({id: message.id, result: {}});
+    else if (message.method === 'session/prompt') {
+      turn += 1;
+      const text = message.params.prompt?.[0]?.text ?? '';
+      chunk('PROMPT' + turn + ' ' + JSON.stringify(text) + '\\n');
+      setTimeout(() => {
+        chunk('REPLY' + turn + ' ' + JSON.stringify(text) + '\\n');
+        send({id: message.id, result: {stopReason: 'end_turn'}});
+      }, delay);
+    }
+  }
+});
+`,
+	);
+	chmodSync(liveCmd, 0o755);
+	const liveDir = mkdtempSync(join(tmpdir(), 'subagent-live-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(liveDir, dir), {recursive: true});
+	const startLive = (id, delay, idleMs) => {
+		const controlDir = join(liveDir, 'control', id);
+		mkdirSync(controlDir, {recursive: true});
+		const spec = seam.buildSpec(
+			{
+				id,
+				label: id,
+				kind: 'agent',
+				owner: 'owner-live',
+				cwd: liveDir,
+				logPath: join(liveDir, 'logs', `${id}.log`),
+				inboxDir: join(liveDir, 'inbox'),
+				jobsDir: join(liveDir, 'jobs'),
+				startedAt: Date.now(),
+				tailMax: 8000,
+				bin: liveCmd,
+				prompt: 'first task',
+				agentType: 'general-purpose',
+				systemPrompt: 'You are live.',
+				name: id,
+				live: true,
+				idleMs,
+				controlPollMs: 20,
+				controlDir,
+			},
+			'/mod.ts',
+		);
+		writeFileSync(join(liveDir, 'jobs', `${id}.json`), JSON.stringify({id, name: id, state: 'queued'}));
+		const child = spawn(process.execPath, ['-e', workerText], {
+			cwd: liveDir,
+			env: {
+				...process.env,
+				SUBAGENT_SPEC: JSON.stringify(spec),
+				BETTER_SUBAGENTS_WORKER: '1',
+				FAKE_PROMPT_DELAY: String(delay),
+			},
+		});
+		const exited = new Promise((resolve) => child.on('exit', resolve));
+		return {
+			id,
+			controlDir,
+			exited,
+			log: () => {
+				try {
+					return readFileSync(join(liveDir, 'logs', `${id}.log`), 'utf8');
+				} catch {
+					return '';
+				}
+			},
+			signals: () =>
+				readdirSync(join(liveDir, 'inbox'))
+					.filter((name) => name.includes(id))
+					.map((name) => JSON.parse(readFileSync(join(liveDir, 'inbox', name), 'utf8'))),
+		};
+	};
+
+	// running: the message lands while turn 1 is still going.
+	const liveRunning = startLive('live-running', 600, 400);
+	appendLine(join(liveRunning.controlDir, 'send.jsonl'), {from: 'main', message: 'queued while busy', at: Date.now()});
+	const runningLog = await waitUntil(() => {
+		const text = liveRunning.log();
+		return /REPLY2/.test(text) ? text : undefined;
+	}, 'the queued message to run after turn 1');
+	assert.match(runningLog, /PROMPT2 "queued while busy"/, 'the queued message becomes the next prompt');
+	assert.ok(runningLog.indexOf('REPLY1') < runningLog.indexOf('PROMPT2'), 'turn 1 was not restarted');
+	await liveRunning.exited;
+	const runningSignals = liveRunning.signals();
+	assert.equal(
+		runningSignals.filter((signal) => signal.kind === 'message').length,
+		1,
+		'one message signal per message turn',
+	);
+	assert.match(runningSignals.find((signal) => signal.kind === 'message').body, /REPLY2/, 'the reply is in the signal');
+	ok('live worker: a message during a turn is queued to the next safe point');
+
+	// idle: turn 1 is done and the agent is waiting; the message starts a turn.
+	const liveIdle = startLive('live-idle', 0, 3000);
+	await waitUntil(
+		() =>
+			liveIdle.signals().some((signal) => signal.state === 'done' && signal.kind === 'agent') &&
+			(() => {
+				try {
+					return JSON.parse(readFileSync(join(liveIdle.controlDir, 'state.json'), 'utf8')).busy === false;
+				} catch {
+					return false;
+				}
+			})(),
+		'the idle state after turn 1',
+	);
+	appendLine(join(liveIdle.controlDir, 'send.jsonl'), {from: 'main', message: 'wake up', at: Date.now()});
+	const idleLog = await waitUntil(() => (/REPLY2/.test(liveIdle.log()) ? liveIdle.log() : undefined), 'the idle message to start a turn');
+	assert.match(idleLog, /PROMPT2 "wake up"/, 'the idle message starts a turn');
+	await waitUntil(
+		() => liveIdle.signals().some((signal) => signal.kind === 'message' && /REPLY2/.test(String(signal.body))),
+		'the idle reply signal',
+	);
+	await liveIdle.exited;
+	ok('live worker: a message to an idle agent starts a turn');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

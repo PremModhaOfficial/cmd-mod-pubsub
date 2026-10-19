@@ -187,6 +187,19 @@ const settle = (state, detail, code, tail) => {
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
+  // SubagentHandback already sent the report to the parent. Record the terminal
+  // state, but do not emit a second signal for the same run.
+  if (readRecord().handbackAt) {
+    writeRecord({
+      state: state,
+      exitCode: typeof code === 'number' ? code : undefined,
+      finishedAt: finishedAt,
+      durationMs: durationMs,
+      failureReason: failed ? detail : undefined,
+      awaitingInput: state === 'waiting-input' ? true : undefined
+    });
+    return;
+  }
   writeRecord({
     state: state,
     exitCode: typeof code === 'number' ? code : undefined,
@@ -397,6 +410,187 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     manual: 'default'
   };
 
+  // ---- live messaging ----
+  // One control directory per job: send.jsonl is appended by the sender, cancel is
+  // a marker, and state.json says whether a turn is active. Polling (not watch)
+  // keeps this portable; the send file is append-only and a byte offset means each
+  // line is read exactly once, even while a turn is running.
+  const controlDir = typeof spec.controlDir === 'string' ? spec.controlDir : '';
+  const sendPath = controlDir.length > 0 ? path.join(controlDir, 'send.jsonl') : '';
+  const cancelPath = controlDir.length > 0 ? path.join(controlDir, 'cancel') : '';
+  const statePath = controlDir.length > 0 ? path.join(controlDir, 'state.json') : '';
+  const queue = [];
+  let sendOffset = 0;
+  let sendPartial = '';
+  let canceled = false;
+  let cancelSent = false;
+  let activeSessionId;
+  let turnCount = 0;
+  let waiting = null;
+  let childGone = false;
+
+  const wake = () => {
+    const resolve = waiting;
+    waiting = null;
+    if (resolve) resolve();
+  };
+
+  // The parent reads this to tell "queued for the next safe point" from "starts a
+  // turn now". Atomic rename, so a reader never sees a half-written file.
+  const writeState = busy => {
+    if (statePath.length === 0) return;
+    try {
+      fs.mkdirSync(controlDir, {recursive: true});
+      const tmp = statePath + '.tmp-' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify({busy: !!busy, turns: turnCount, updatedAt: Date.now()}));
+      fs.renameSync(tmp, statePath);
+    } catch (e) {}
+  };
+
+  const readSend = () => {
+    if (sendPath.length === 0) return;
+    let size;
+    try { size = fs.statSync(sendPath).size; } catch (e) { return; }
+    if (size <= sendOffset) return;
+    let chunk = '';
+    try {
+      const fd = fs.openSync(sendPath, 'r');
+      const length = size - sendOffset;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, sendOffset);
+      fs.closeSync(fd);
+      sendOffset = size;
+      chunk = buffer.toString('utf8');
+    } catch (e) { return; }
+    const lines = (sendPartial + chunk).split('\\n');
+    sendPartial = lines.pop() || '';
+    let added = false;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry.message === 'string' && entry.message.length > 0) {
+          queue.push(entry);
+          added = true;
+        }
+      } catch (e) {}
+    }
+    if (added) wake();
+  };
+
+  const pollControl = () => {
+    if (cancelPath.length > 0 && !canceled) {
+      try {
+        if (fs.existsSync(cancelPath)) {
+          canceled = true;
+          logWrite('[live] cancel requested\\n');
+          wake();
+        }
+      } catch (e) {}
+    }
+    readSend();
+    if (canceled && !cancelSent && typeof activeSessionId === 'string') {
+      cancelSent = true;
+      sendMessage({id: nextId++, method: 'session/cancel', params: {sessionId: activeSessionId}});
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      childGone = true;
+      wake();
+    }
+  };
+  const pollMs = typeof spec.controlPollMs === 'number' && spec.controlPollMs > 0 ? spec.controlPollMs : 100;
+  const controlTimer = setInterval(pollControl, pollMs);
+  if (controlTimer.unref) controlTimer.unref();
+  pollControl();
+
+  // A turn's terminal reason, or undefined for a completed turn. The first turn
+  // settles the job (existing behavior); a live turn emits a message signal and
+  // leaves the session open.
+  const turnOutcome = result => {
+    clearTimers();
+    const stopReason = result && result.stopReason;
+    if (stopReason === 'end_turn') return undefined;
+    if (stopReason === 'cancelled') return 'cancelled';
+    if (stopReason === 'max_tokens') return 'max tokens reached; result is partial';
+    if (stopReason === 'max_turn_requests') return 'max turns reached; result is partial';
+    return 'ACP turn ended: ' + String(stopReason || 'unknown');
+  };
+
+  const emitTurn = (from, start, failure) => {
+    turnCount += 1;
+    let tail = '';
+    try { tail = fs.readFileSync(spec.logPath, 'utf8').slice(start); } catch (e) { tail = ''; }
+    const prefix = failure === undefined
+      ? 'reply to ' + String(from || 'main') + ':'
+      : failure + '\\nreply to ' + String(from || 'main') + ':';
+    emit(signalEnvelope({
+      id: spec.id + '-msg-' + turnCount,
+      label: spec.label + ' (message)',
+      kind: 'message',
+      owner: spec.owner,
+      startedAt: Date.now(),
+      logPath: spec.logPath,
+      sessionId: spec.sessionId
+    }, {
+      state: failure === undefined ? 'done' : 'failed',
+      exitCode: failure === undefined ? 0 : null,
+      finishedAt: Date.now(),
+      durationMs: 0,
+      title: (spec.name || spec.label) + (failure === undefined ? ' replied' : ' failed a live turn'),
+      body: prefix + '\\n' + tail
+    }));
+  };
+
+  // After the first turn: wait for a message, run it as its own prompt, and only
+  // exit once the idle window passes. A message that arrives mid-turn is queued by
+  // the poller and picked up here, so the running turn is never restarted.
+  const liveLoop = async () => {
+    if (spec.live !== true) return;
+    const idleMs = typeof spec.idleMs === 'number' && spec.idleMs >= 0 ? spec.idleMs : 30000;
+    writeState(false);
+    while (!canceled && !childGone) {
+      if (queue.length === 0) {
+        const {promise, resolve} = Promise.withResolvers();
+        waiting = resolve;
+        if (queue.length > 0 || canceled || childGone) {
+          waiting = null;
+          resolve();
+        }
+        const deadline = setTimeout(resolve, idleMs);
+        if (deadline.unref) deadline.unref();
+        await promise;
+        clearTimeout(deadline);
+        waiting = null;
+        if (queue.length === 0) {
+          if (!canceled && !childGone) logWrite('[live] idle window elapsed\\n');
+          return;
+        }
+      }
+      if (canceled || childGone) return;
+      const entry = queue.shift();
+      const from = typeof entry.from === 'string' ? entry.from : 'main';
+      const text = String(entry.message);
+      logWrite('\\n[live] message from ' + from + ': ' + text + '\\n');
+      writeState(true);
+      let start = 0;
+      try { start = fs.statSync(spec.logPath).size; } catch (e) { start = 0; }
+      let result;
+      try {
+        result = await request('session/prompt', {sessionId: activeSessionId, prompt: [{type: 'text', text: text}]});
+      } catch (error) {
+        logWrite('[live] turn failed: ' + String(error && error.message || error) + '\\n');
+        emitTurn(from, start, 'live turn failed: ' + String(error && error.message || error));
+        writeState(false);
+        continue;
+      }
+      const outcome = turnOutcome(result);
+      if (canceled && (outcome === 'cancelled' || outcome === undefined)) return;
+      emitTurn(from, start, outcome);
+      writeState(false);
+      if (outcome !== undefined) return;
+    }
+  };
+
   const runPrompt = async () => {
     await request('initialize', {
       protocolVersion: 1,
@@ -423,6 +617,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       configOptions = Array.isArray(session.configOptions) ? session.configOptions : [];
     }
     writeRecord({acpSessionId: sessionId});
+    activeSessionId = sessionId;
     logWrite('[acp] session ' + sessionId + ' cwd ' + spec.cwd + '\\n');
     if (typeof spec.permissionMode === 'string') {
       if (modeIds[spec.permissionMode]) {
@@ -473,13 +668,17 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       logWrite('[acp] mod not loaded in the ACP child; the definition body is in the prompt\\n');
     }
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
-    clearTimers();
-    const stopReason = result && result.stopReason;
-    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readTail());
-    else if (stopReason === 'cancelled') fail('cancelled', null);
-    else if (stopReason === 'max_tokens') fail('max tokens reached; result is partial', null);
-    else if (stopReason === 'max_turn_requests') fail('max turns reached; result is partial', null);
-    else fail('ACP turn ended: ' + String(stopReason || 'unknown'), null);
+    const outcome = turnOutcome(result);
+    if (outcome !== undefined) {
+      fail(outcome, null);
+      shutdown();
+      return;
+    }
+    // The first turn is the job's result, as before. With live messaging the
+    // session then stays open: the record is done, but the process (and its ACP
+    // session) keeps accepting messages until the idle window passes.
+    settle('done', 'exit 0', 0, readTail());
+    await liveLoop();
     shutdown();
   };
   runPrompt().catch(error => {
