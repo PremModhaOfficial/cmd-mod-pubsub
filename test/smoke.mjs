@@ -1710,13 +1710,33 @@ process.stdin.on('data', (data) => {
 		join(fireDir, 'inbox', `${fixedNow}-${isoId}-test.json`),
 		JSON.stringify({id: isoId, owner: doneRecord.owner, label: doneRecord.label, kind: 'agent', state: 'done', body: 'exit 0'}),
 	);
-	fireApi.listeners.get('run_start')[0]({sessionId: 'wt'});
+	// Session start reconciles first and drains second: the record is finalized by the
+	// reconcile, and delivery still has to report the kept path.
+	fireApi.registeredHooks.onSessionStart({sessionId: 'wt'});
 	const delivered = fireApi.userMessages.at(-1)?.text ?? '';
 	assert.match(delivered, /worktree kept at/, 'a changed worktree path is reported with the result');
 	assert.match(delivered, new RegExp(expectedWorktree.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 	const finalized = JSON.parse(readFileSync(join(fireDir, 'jobs', `${isoId}.json`), 'utf8'));
 	assert.equal(finalized.worktreeKept, true, 'the record says the worktree was kept');
 	assert.equal(finalized.worktreeFinalized, true, 'finalization is recorded once');
+
+	// Per-call isolation is refused with the place it actually lives.
+	const refusedIsolation = await toolOf(fireApi, 'subagent_spawn').run({
+		input: {description: 'refuse', prompt: 'x', subagent_type: 'iso', isolation: 'worktree'},
+	});
+	assert.equal(refusedIsolation.ok, false);
+	assert.match(refusedIsolation.error, /frontmatter/, 'the refusal points at the definition field');
+
+	// A repository that cannot provide a worktree fails before any worker is spawned.
+	const noRepoRuntime = makeRuntime({now: () => fixedNow, cwd: project, execPath: '/usr/bin/node'});
+	const noRepoApi = makeApi({spoolDir: fireDir, session: makeSession(), runtime: noRepoRuntime.runtime});
+	mod(noRepoApi.api, noRepoRuntime.runtime);
+	const noRepo = await toolOf(noRepoApi, 'subagent_spawn').run({
+		input: {description: 'no repo', prompt: 'x', subagent_type: 'iso'},
+	});
+	assert.equal(noRepo.ok, false, 'a failed worktree fails the spawn');
+	assert.match(noRepo.error, /git repository/, 'the error says why');
+	assert.equal(noRepoRuntime.spawnCalls.length, 0, 'no worker starts without its worktree');
 	ok('worktree isolation: fire creates it, the result removes or keeps and reports it');
 	// limits: the concurrency pool, nesting depth, and the shared TTL sweeper ---
 	const limits = await import('../better-sub-agents.ts');

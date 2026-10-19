@@ -1858,10 +1858,6 @@ export function commandEscapesWorktree(command: string, roots: IsolationRoots): 
 			return `a ${kind} to ${target} escapes the worktree (${resolved})`;
 		}
 	}
-	if (/\b(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)\s*=/.test(command)) {
-		return 'the command overrides the git directory or work tree';
-	}
-	if (/\bgit\b[^\n;&|]*\s--prefix[=\s]/.test(command)) return 'the command overrides git --prefix';
 	return undefined;
 }
 
@@ -2615,6 +2611,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (job === undefined) return undefined;
 		const state = normalizeState(job.state);
 		if (state !== 'done' && state !== 'failed' && state !== 'canceled') return undefined;
+		if (typeof job.worktree !== 'string' || job.worktree.length === 0) return undefined;
+		// Already decided by the restart reconcile or an earlier format: report the kept
+		// path again without touching git, so delivery never loses the note.
+		if (job.worktreeFinalized === true) return {kept: job.worktreeKept === true, path: job.worktree};
 		const decision = finalizeWorktree(runtime, job);
 		if (decision === undefined) return undefined;
 		job.worktreeFinalized = true;
@@ -3513,7 +3513,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			);
 		}
 		for (const unsupported of ['permission_mode', 'isolation', 'tools']) {
-			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
+			if (input[unsupported] === undefined) continue;
+			return badInput(
+				unsupported === 'isolation'
+					? "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it"
+					: `${unsupported} is not implemented in this release; omit it`,
+			);
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
 		const requestedMaxTurns = Number(input.max_turns);
