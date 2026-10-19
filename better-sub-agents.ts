@@ -74,7 +74,6 @@ const ORPHANED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // jobs are never swept, however old their record is.
 const RETENTION_DAYS_DEFAULT = 30;
 const RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const RECORD_SWEEP_MAX = 500;
 // A queued/running record with no live pid is only declared lost after this grace,
 // so a worker that has been spawned but has not written its pid yet is not failed.
 const LOST_GRACE_MS = 30 * 1000;
@@ -124,8 +123,84 @@ const JOB_ENTRY_TYPE = 'subagent/job';
 const WORKER_ENV = 'BETTER_SUBAGENTS_WORKER';
 const WORKER_SPEC_ENV = 'SUBAGENT_SPEC';
 const RETENTION_ENV = 'BETTER_SUBAGENTS_RETENTION_DAYS';
+// Limits. The concurrency limit is per session; the depth limit caps nesting.
+const MAX_CONCURRENT_DEFAULT = 20;
+const MAX_CONCURRENT_ENV = 'BETTER_SUBAGENTS_MAX_CONCURRENT';
+const MAX_CONCURRENT_ENV_ALIAS = 'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS';
+const MAX_DEPTH_DEFAULT = 3;
+const MAX_DEPTH_ENV = 'BETTER_SUBAGENTS_MAX_DEPTH';
+const MAX_DEPTH_ENV_ALIAS = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH';
+// The pool scans recent records; the spool is long-lived and a session's active
+// jobs are always among the newest.
+const ACTIVE_JOB_SCAN_MAX = 500;
 const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
 const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
+
+// ---------------------------------------------------------------------------
+// Output scanning
+//
+// A subagent's report is data, never instructions. Before the text becomes a
+// signal it is scanned once: an imitation of the host's own output gets a
+// backslash (so `<system-reminder>` reads as text), and a tag imitation or a
+// permission-setting mention gets a marker the parent cannot miss. Nothing else
+// is rewritten - a permission mention stays exactly as written.
+//
+// Self-contained on purpose: WORKER_SOURCE embeds this function's source, so the
+// worker and the parent run one rule table (the same contract as signalEnvelope).
+// ---------------------------------------------------------------------------
+
+export interface ScanResult {
+	readonly text: string;
+	readonly matches: string[];
+	readonly marked: boolean;
+}
+
+export function scanOutput(text: string): ScanResult {
+	// Inline the marker and the rule names: this body is embedded in WORKER_SOURCE,
+	// so it cannot read module constants.
+	const marker = '[harness: subagent output matched instruction-shaped pattern(s): ';
+	const settings = [
+		['bypassPermissions', 'bypassPermissions permission setting'],
+		['--dangerously-skip-permissions', '--dangerously-skip-permissions permission setting'],
+	];
+	const matches: string[] = [];
+	let marked = false;
+	let out = String(text ?? '');
+	// A tag imitation is escaped, never removed: the text stays readable and can no
+	// longer be mistaken for host output.
+	out = out.replace(/<\/?system-reminder\b[^>]*>/gi, match => {
+		if (!matches.includes('system-reminder tag')) matches.push('system-reminder tag');
+		marked = true;
+		return '\\' + match;
+	});
+	// A role label only counts at the start of a line, after indentation.
+	out = out.replace(/^([ \t]*)(Human|Assistant):/gm, (_match, space: string, label: string) => {
+		const name = label + ': role label';
+		if (!matches.includes(name)) matches.push(name);
+		return space + '\\' + label + ':';
+	});
+	// A permission-setting mention is reported, not rewritten: rewriting a flag
+	// would hide what the subagent actually said.
+	for (const [needle, name] of settings) {
+		if (out.includes(needle) && !matches.includes(name)) {
+			matches.push(name);
+			marked = true;
+		}
+	}
+	if (marked) out = marker + matches.join(', ') + ']\n' + out;
+	return {text: out, matches, marked};
+}
+
+// The report the parent reads: the worker's own progress lines (`[tool] ...`) are
+// not part of it. They stay in the log for the task view; a tool call is never a
+// result the parent is asked to act on. Shell output is returned as written.
+export function reportText(text: string, kind: string): string {
+	const visible =
+		kind === 'agent'
+			? text.split('\n').filter(line => !/^\[tool[ \]]/.test(line)).join('\n')
+			: text;
+	return scanOutput(visible).text;
+}
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -172,6 +247,20 @@ const readTail = () => {
 // sides therefore construct a signal from the same field list.
 const signalEnvelope = ${signalEnvelope.toString()};
 
+// The scanner is the parent's scanOutput, injected the same way: one rule table.
+const scanOutput = ${scanOutput.toString()};
+
+// The report tail drops the worker's own tool-call progress. Those lines stay in
+// the log for the task view; the parent is never asked to act on a tool call.
+// Shell output is passed through as written.
+const readReportTail = () => {
+  try {
+    const tail = readTail();
+    if (spec.kind !== 'agent') return tail;
+    return tail.split('\\n').filter(line => !/^\\[tool[ \\]]/.test(line)).join('\\n');
+  } catch (e) { return ''; }
+};
+
 let settled = false;
 
 // One constructor for "this job reached this state": the record patch and the
@@ -182,13 +271,18 @@ const settle = (state, detail, code, tail) => {
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
+  // Scan is the last step before the text can reach the parent; the record and
+  // the signal carry the same facts.
+  const scan = scanOutput(detail + (tail ? '\\n\\n' + tail : ''));
   writeRecord({
     state: state,
     exitCode: typeof code === 'number' ? code : undefined,
     finishedAt: finishedAt,
     durationMs: durationMs,
     failureReason: failed ? detail : undefined,
-    awaitingInput: state === 'waiting-input' ? true : undefined
+    awaitingInput: state === 'waiting-input' ? true : undefined,
+    scanned: true,
+    scanMatches: scan.matches
   });
   emit(signalEnvelope({
     id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
@@ -198,11 +292,14 @@ const settle = (state, detail, code, tail) => {
     exitCode: typeof code === 'number' ? code : null,
     finishedAt: finishedAt,
     durationMs: durationMs,
-    body: detail + (tail ? '\\n\\n' + tail : '')
+    body: scan.text,
+    scanned: true,
+    scanMatches: scan.matches
   }));
 };
 
-const fail = (reason, code) => settle('failed', reason, code, '');
+// A failed worker still returns its last output: partial work is never discarded.
+const fail = (reason, code) => settle('failed', reason, code, readReportTail());
 
 let out;
 try {
@@ -285,7 +382,7 @@ const finish = (code, spawnError, signal) => {
         : signal
           ? 'terminated by ' + signal
           : 'exit 0';
-  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
+  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, readReportTail());
 };
 
 if (typeof child.pid === 'number') {
@@ -485,7 +582,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
     clearTimers();
     const stopReason = result && result.stopReason;
-    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readTail());
+    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readReportTail());
     else if (stopReason === 'cancelled') fail('cancelled', null);
     else if (stopReason === 'max_tokens') fail('max tokens reached; result is partial', null);
     else if (stopReason === 'max_turn_requests') fail('max turns reached; result is partial', null);
@@ -1123,6 +1220,8 @@ export interface WorkerSpecInput {
 	tailMax: number;
 	bin: string;
 	sessionId?: string;
+	/** This job's nesting level: the caller's depth plus one. */
+	depth?: number;
 	agentType?: string;
 	systemPrompt?: string;
 	model?: string;
@@ -1555,12 +1654,18 @@ interface Signal extends JobIdentity {
 	readonly exitCode?: number | null;
 	readonly title?: string;
 	readonly body?: string;
+	/** The report was scanned before it could reach the parent. */
+	readonly scanned?: boolean;
+	readonly scanMatches?: string[];
 }
 
 interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
 	cwd?: string;
+	/** This job's nesting level, and the job that spawned it. */
+	depth?: number;
+	parentJobId?: string;
 	agentType?: string;
 	model?: string;
 	tools?: string[];
@@ -1582,6 +1687,8 @@ interface JobRecord extends JobIdentity {
 	failureReason?: string;
 	canceledAt?: number;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // The record write a signal implies.
@@ -1592,6 +1699,8 @@ interface JobPatch {
 	durationMs?: number;
 	failureReason?: string;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1714,7 +1823,16 @@ export const jobStates = {
 
 function signalOf(
 	record: JobRecord,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	return signalEnvelope(record, {...result, state: canonicalState(result.state)});
 }
@@ -1724,7 +1842,16 @@ function signalOf(
 // a signal with different fields. Keep the body plain JS and self-contained.
 export function signalEnvelope(
 	record: JobIdentity,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	const label = String(record.label ?? record.id);
 	const state = String(result.state);
@@ -1742,6 +1869,10 @@ export function signalEnvelope(
 		sessionId: record.sessionId,
 		title: result.title ?? `${label} ${state}`,
 		body: result.body,
+		// Omitted when the writer did not scan, so a legacy signal keeps its shape.
+		...(result.scanned === undefined
+			? {}
+			: {scanned: result.scanned === true, scanMatches: result.scanMatches ?? []}),
 	};
 }
 
@@ -1769,6 +1900,10 @@ function patchOf(signal: Signal): JobPatch {
 		patch.state = state;
 		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
 		if (state === 'waiting-input') patch.awaitingInput = true;
+	}
+	if (signal.scanned !== undefined) {
+		patch.scanned = signal.scanned;
+		patch.scanMatches = signal.scanMatches ?? [];
 	}
 	return patch;
 }
@@ -1867,6 +2002,93 @@ function createLedger(deps: LedgerDeps): Ledger {
 
 // Exported for the tests, which prove the guard survives retention and a restart.
 export const ledgerFactory = createLedger;
+
+// ---------------------------------------------------------------------------
+// Limits and the shared TTL sweeper
+//
+// Two limits bound a session: how many jobs may run at once and how deep
+// subagents may nest. Both are resolved from the environment in one place, with
+// the Claude Code spelling accepted as an alias. The spawn guard lives in fire(),
+// so a refused spawn writes no record and emits no signal.
+// ---------------------------------------------------------------------------
+
+export type LimitEnv = Record<string, string | undefined>;
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+	const value = Number(raw);
+	return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+export function resolveMaxConcurrent(env: LimitEnv): number {
+	return positiveInt(env[MAX_CONCURRENT_ENV] || env[MAX_CONCURRENT_ENV_ALIAS], MAX_CONCURRENT_DEFAULT);
+}
+
+export function resolveMaxDepth(env: LimitEnv): number {
+	return positiveInt(env[MAX_DEPTH_ENV] || env[MAX_DEPTH_ENV_ALIAS], MAX_DEPTH_DEFAULT);
+}
+
+// A session's nesting depth: 0 for the main conversation, the job's own depth for
+// a worker (the spec is the worker's environment).
+function depthOf(spec: WorkerSpec | undefined): number {
+	const depth = Number(spec?.depth);
+	return Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
+}
+
+// The environment for a worker: the caller's env minus every worker marker, then
+// this job's spec and flag. A nested spawn therefore cannot inherit the parent
+// spec or a stale worker flag.
+export function workerEnv(
+	parent: Record<string, string | undefined>,
+	spec: WorkerSpec,
+): Record<string, string | undefined> {
+	const env = {...parent};
+	delete env[WORKER_SPEC_ENV];
+	delete env[WORKER_ENV];
+	delete env.PUBSUB_WORKER;
+	env[WORKER_SPEC_ENV] = JSON.stringify(spec);
+	env[WORKER_ENV] = '1';
+	return env;
+}
+
+// One TTL sweeper for every directory the spool grows: claimed/orphaned signals,
+// job records, logs and worktrees. `expired` covers entries whose age lives in
+// their contents (a job record's finishedAt); `ttlMs` covers the rest.
+export interface SweepIo {
+	readdir(dir: string): string[];
+	stat(file: string): {mtimeMs: number};
+	remove(file: string): void;
+}
+
+export interface SweepOptions {
+	ttlMs?: number;
+	expired?: (name: string) => boolean;
+	/** Keep an entry even when it is past the TTL (a live job owns its log). */
+	skip?: (name: string) => boolean;
+}
+
+export function sweepExpiredEntries(io: SweepIo, dir: string, now: number, options: SweepOptions = {}): string[] {
+	let names: string[];
+	try {
+		names = io.readdir(dir);
+	} catch {
+		return [];
+	}
+	const removed: string[] = [];
+	for (const name of names) {
+		const file = join(dir, name);
+		try {
+			if (options.skip?.(name) === true) continue;
+			const expired = options.expired?.(name) === true;
+			const old = options.ttlMs !== undefined && now - io.stat(file).mtimeMs > options.ttlMs;
+			if (!expired && !old) continue;
+			io.remove(file);
+			removed.push(name);
+		} catch {
+			/* another process won it */
+		}
+	}
+	return removed;
+}
 
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
@@ -2330,45 +2552,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
 	// that died between claim and remove so a long-lived spool cannot grow forever.
 	function sweepClaimed(): void {
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(claimedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(claimedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > CLAIMED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another drain won it */
-			}
-		}
+		sweepExpiredEntries(spool, claimedDir, runtime.now(), {ttlMs: CLAIMED_TTL_MS});
 	}
 
 	function sweepOrphaned(): void {
 		if (workerMode) return;
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(orphanedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(orphanedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > ORPHANED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another process won it */
-			}
-		}
+		sweepExpiredEntries(spool, orphanedDir, runtime.now(), {ttlMs: ORPHANED_TTL_MS});
 	}
 
-	// Retention. A finished job keeps its record and its log for RETENTION_DAYS_DEFAULT
-	// (or BETTER_SUBAGENTS_RETENTION_DAYS), so `subagent_output` still works on a job
-	// from last week. A running job is never swept, however old its record is.
+	// Retention. A finished job keeps its record, its log and its worktree for
+	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS), so
+	// `subagent_output` still works on a job from last week. A running job is never
+	// swept, however old its record is.
 	function retentionMs(): number {
 		const days = Number(runtime.env[RETENTION_ENV]);
 		const value = Number.isFinite(days) && days > 0 ? days : RETENTION_DAYS_DEFAULT;
@@ -2377,23 +2572,51 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	function sweepExpired(): void {
 		if (workerMode) return;
-		const cutoff = runtime.now() - retentionMs();
-		for (const job of readRecentJobs(RECORD_SWEEP_MAX)) {
-			const state = normalizeState(job.state);
-			if (state === undefined || !isTerminal(state)) continue;
-			const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
-			if (settledAt === 0 || settledAt > cutoff) continue;
+		const now = runtime.now();
+		const ttlMs = retentionMs();
+		const cutoff = now - ttlMs;
+		const expired: string[] = [];
+		// A record's age lives in its timestamps, not its mtime: one sweeper, but the
+		// predicate decides. A running job is never expired.
+		sweepExpiredEntries(spool, jobsDir, now, {
+			expired: name => {
+				if (!name.endsWith('.json') || name.includes('.tmp-')) return false;
+				try {
+					const job = JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord;
+					const state = normalizeState(job.state);
+					if (state === undefined || !isTerminal(state)) return false;
+					const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
+					if (settledAt === 0 || settledAt > cutoff) return false;
+					if (typeof job.id === 'string' && job.id.length > 0) expired.push(job.id);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
+		for (const id of expired) {
 			try {
-				spool.remove(join(jobsDir, `${job.id}.json`));
-			} catch {
-				/* another process won it */
-			}
-			try {
-				spool.remove(join(logsDir, `${job.id}.log`));
+				spool.remove(join(logsDir, `${id}.log`));
 			} catch {
 				/* the log is already gone */
 			}
+			try {
+				spool.remove(join(worktreesDir, id));
+			} catch {
+				/* the worktree is already gone */
+			}
 		}
+		// An abandoned log or worktree with no live record is bounded by the same TTL.
+		sweepExpiredEntries(spool, logsDir, now, {
+			ttlMs,
+			skip: name => {
+				const job = readJob(name.replace(/\.log$/, ''));
+				if (job === undefined) return false;
+				const state = normalizeState(job.state);
+				return state === undefined || !isTerminal(state);
+			},
+		});
+		sweepExpiredEntries(spool, worktreesDir, now, {ttlMs});
 	}
 
 	function hasPendingSignal(id: string): boolean {
@@ -2613,6 +2836,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly cwd: string;
 		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
+		/** This job's nesting level, and the job that spawned it. */
+		readonly depth?: number;
+		readonly parentJobId?: string;
 		/** the definition body, delivered as the worker's system prompt */
 		readonly systemPrompt?: string;
 		readonly model?: string;
@@ -2674,6 +2900,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startedAt,
 			sessionId,
 			updatedAt: startedAt,
+			...(intent.depth !== undefined ? {depth: intent.depth} : {}),
+			...(intent.parentJobId !== undefined ? {parentJobId: intent.parentJobId} : {}),
 			...(isAgent
 				? {
 						agentType: intent.agentType ?? 'general-purpose',
@@ -2702,7 +2930,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				cwd: spec.cwd,
 				detached: true,
 				stdio: 'ignore',
-				env: {...runtime.env, [WORKER_SPEC_ENV]: JSON.stringify(spec), [WORKER_ENV]: '1'},
+				env: workerEnv(runtime.env, spec),
 			});
 		} catch (error) {
 			const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
@@ -2733,12 +2961,53 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return {ok: true, id, pid: worker.pid};
 	}
 
+	// The pool is per session: only this session's queued and running jobs occupy
+	// slots. Records are the source of truth, so a cancel in another process frees
+	// one, and a job waiting for input has no worker process to count.
+	function activeJobCount(): number {
+		const owner = ownerId();
+		let count = 0;
+		for (const job of readRecentJobs(ACTIVE_JOB_SCAN_MAX)) {
+			if (job.owner !== owner) continue;
+			const state = normalizeState(job.state);
+			if (state !== undefined && state !== 'queued' && state !== 'running') continue;
+			count += 1;
+		}
+		return count;
+	}
+
 	function fire(intent: JobIntent): Launch {
+		// Both limits are checked before a record exists, so a refused spawn leaves no
+		// job behind and emits no signal.
+		const depth = depthOf(workerSpec) + 1;
+		if (intent.prompt !== undefined) {
+			const maxDepth = resolveMaxDepth(runtime.env);
+			if (depth > maxDepth) {
+				return {
+					ok: false,
+					error: `Subagent nesting depth limit reached (${maxDepth}). This subagent cannot spawn children; do not retry.`,
+				};
+			}
+		}
+		const maxConcurrent = resolveMaxConcurrent(runtime.env);
+		if (activeJobCount() >= maxConcurrent) {
+			return {
+				ok: false,
+				error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`,
+			};
+		}
+
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
 		const owner = ownerId();
-		const record = makeRecord(intent, id, logPath, startedAt, owner);
+		const record = makeRecord(
+			{...intent, depth, ...(workerSpec?.id !== undefined ? {parentJobId: workerSpec.id} : {})},
+			id,
+			logPath,
+			startedAt,
+			owner,
+		);
 		writeJob(record);
 		try {
 			cmd.session?.appendCustomEntry({
@@ -2764,6 +3033,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				tailMax: LOG_TAIL_BYTES_MAX,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
+				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
@@ -3038,9 +3308,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			state === 'queued' || state === 'running'
 				? `\n(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1000))}s; the result will arrive as a signal)`
 				: '';
+		// Reading the log is still worker output reaching the parent: scan it here too,
+		// and hide the worker's own tool-call progress.
+		const visible = reportText(body, String(record.kind ?? 'command'));
 		return okText(
 			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}${timing}\n\n` +
-				(body.length > 0 ? body : '(no output yet)') +
+				(visible.length > 0 ? visible : '(no output yet)') +
 				note,
 		);
 	}

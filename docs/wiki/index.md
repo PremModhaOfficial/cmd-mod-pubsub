@@ -8,6 +8,10 @@ Memory for the long-running parity goal. Sources are cited, not copied. Claims a
 - [Ticket graph](ticket-graph.md) — the task graph and the frontier, as of 2026-10-20.
 - [Pipeline](pipeline.md) — implement-spec, then code-review, then pr; worktrees and agents.
 
+## Progress
+
+- [Progress log](progress.md) — dated landings and dispatches, as of 2026-10-20.
+
 ## Decisions
 
 - [Transport](transport.md) — ACP for non-fork jobs and one-shot `cmd --resume -p` for forks, as of ADR 0001.
