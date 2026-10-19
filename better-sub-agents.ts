@@ -74,7 +74,6 @@ const ORPHANED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // jobs are never swept, however old their record is.
 const RETENTION_DAYS_DEFAULT = 30;
 const RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const RECORD_SWEEP_MAX = 500;
 // A queued/running record with no live pid is only declared lost after this grace,
 // so a worker that has been spawned but has not written its pid yet is not failed.
 const LOST_GRACE_MS = 30 * 1000;
@@ -124,6 +123,16 @@ const JOB_ENTRY_TYPE = 'subagent/job';
 const WORKER_ENV = 'BETTER_SUBAGENTS_WORKER';
 const WORKER_SPEC_ENV = 'SUBAGENT_SPEC';
 const RETENTION_ENV = 'BETTER_SUBAGENTS_RETENTION_DAYS';
+// Limits. The concurrency limit is per session; the depth limit caps nesting.
+const MAX_CONCURRENT_DEFAULT = 20;
+const MAX_CONCURRENT_ENV = 'BETTER_SUBAGENTS_MAX_CONCURRENT';
+const MAX_CONCURRENT_ENV_ALIAS = 'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS';
+const MAX_DEPTH_DEFAULT = 3;
+const MAX_DEPTH_ENV = 'BETTER_SUBAGENTS_MAX_DEPTH';
+const MAX_DEPTH_ENV_ALIAS = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH';
+// The pool scans recent records; the spool is long-lived and a session's active
+// jobs are always among the newest.
+const ACTIVE_JOB_SCAN_MAX = 500;
 const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
 const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
 
@@ -1517,6 +1526,8 @@ export interface WorkerSpecInput {
 	tailMax: number;
 	bin: string;
 	sessionId?: string;
+	/** This job's nesting level: the caller's depth plus one. */
+	depth?: number;
 	agentType?: string;
 	systemPrompt?: string;
 	model?: string;
@@ -1577,6 +1588,9 @@ interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
 	cwd?: string;
+	/** This job's nesting level, and the job that spawned it. */
+	depth?: number;
+	parentJobId?: string;
 	agentType?: string;
 	model?: string;
 	maxTurns?: number;
@@ -1881,6 +1895,93 @@ function createLedger(deps: LedgerDeps): Ledger {
 
 // Exported for the tests, which prove the guard survives retention and a restart.
 export const ledgerFactory = createLedger;
+
+// ---------------------------------------------------------------------------
+// Limits and the shared TTL sweeper
+//
+// Two limits bound a session: how many jobs may run at once and how deep
+// subagents may nest. Both are resolved from the environment in one place, with
+// the Claude Code spelling accepted as an alias. The spawn guard lives in fire(),
+// so a refused spawn writes no record and emits no signal.
+// ---------------------------------------------------------------------------
+
+export type LimitEnv = Record<string, string | undefined>;
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+	const value = Number(raw);
+	return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+export function resolveMaxConcurrent(env: LimitEnv): number {
+	return positiveInt(env[MAX_CONCURRENT_ENV] || env[MAX_CONCURRENT_ENV_ALIAS], MAX_CONCURRENT_DEFAULT);
+}
+
+export function resolveMaxDepth(env: LimitEnv): number {
+	return positiveInt(env[MAX_DEPTH_ENV] || env[MAX_DEPTH_ENV_ALIAS], MAX_DEPTH_DEFAULT);
+}
+
+// A session's nesting depth: 0 for the main conversation, the job's own depth for
+// a worker (the spec is the worker's environment).
+function depthOf(spec: WorkerSpec | undefined): number {
+	const depth = Number(spec?.depth);
+	return Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
+}
+
+// The environment for a worker: the caller's env minus every worker marker, then
+// this job's spec and flag. A nested spawn therefore cannot inherit the parent
+// spec or a stale worker flag.
+export function workerEnv(
+	parent: Record<string, string | undefined>,
+	spec: WorkerSpec,
+): Record<string, string | undefined> {
+	const env = {...parent};
+	delete env[WORKER_SPEC_ENV];
+	delete env[WORKER_ENV];
+	delete env.PUBSUB_WORKER;
+	env[WORKER_SPEC_ENV] = JSON.stringify(spec);
+	env[WORKER_ENV] = '1';
+	return env;
+}
+
+// One TTL sweeper for every directory the spool grows: claimed/orphaned signals,
+// job records, logs and worktrees. `expired` covers entries whose age lives in
+// their contents (a job record's finishedAt); `ttlMs` covers the rest.
+export interface SweepIo {
+	readdir(dir: string): string[];
+	stat(file: string): {mtimeMs: number};
+	remove(file: string): void;
+}
+
+export interface SweepOptions {
+	ttlMs?: number;
+	expired?: (name: string) => boolean;
+	/** Keep an entry even when it is past the TTL (a live job owns its log). */
+	skip?: (name: string) => boolean;
+}
+
+export function sweepExpiredEntries(io: SweepIo, dir: string, now: number, options: SweepOptions = {}): string[] {
+	let names: string[];
+	try {
+		names = io.readdir(dir);
+	} catch {
+		return [];
+	}
+	const removed: string[] = [];
+	for (const name of names) {
+		const file = join(dir, name);
+		try {
+			if (options.skip?.(name) === true) continue;
+			const expired = options.expired?.(name) === true;
+			const old = options.ttlMs !== undefined && now - io.stat(file).mtimeMs > options.ttlMs;
+			if (!expired && !old) continue;
+			io.remove(file);
+			removed.push(name);
+		} catch {
+			/* another process won it */
+		}
+	}
+	return removed;
+}
 
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
@@ -2383,45 +2484,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
 	// that died between claim and remove so a long-lived spool cannot grow forever.
 	function sweepClaimed(): void {
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(claimedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(claimedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > CLAIMED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another drain won it */
-			}
-		}
+		sweepExpiredEntries(spool, claimedDir, runtime.now(), {ttlMs: CLAIMED_TTL_MS});
 	}
 
 	function sweepOrphaned(): void {
 		if (workerMode) return;
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(orphanedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(orphanedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > ORPHANED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another process won it */
-			}
-		}
+		sweepExpiredEntries(spool, orphanedDir, runtime.now(), {ttlMs: ORPHANED_TTL_MS});
 	}
 
-	// Retention. A finished job keeps its record and its log for RETENTION_DAYS_DEFAULT
-	// (or BETTER_SUBAGENTS_RETENTION_DAYS), so `subagent_output` still works on a job
-	// from last week. A running job is never swept, however old its record is.
+	// Retention. A finished job keeps its record, its log and its worktree for
+	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS), so
+	// `subagent_output` still works on a job from last week. A running job is never
+	// swept, however old its record is.
 	function retentionMs(): number {
 		const days = Number(runtime.env[RETENTION_ENV]);
 		const value = Number.isFinite(days) && days > 0 ? days : RETENTION_DAYS_DEFAULT;
@@ -2430,23 +2504,51 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	function sweepExpired(): void {
 		if (workerMode) return;
-		const cutoff = runtime.now() - retentionMs();
-		for (const job of readRecentJobs(RECORD_SWEEP_MAX)) {
-			const state = normalizeState(job.state);
-			if (state === undefined || !isTerminal(state)) continue;
-			const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
-			if (settledAt === 0 || settledAt > cutoff) continue;
+		const now = runtime.now();
+		const ttlMs = retentionMs();
+		const cutoff = now - ttlMs;
+		const expired: string[] = [];
+		// A record's age lives in its timestamps, not its mtime: one sweeper, but the
+		// predicate decides. A running job is never expired.
+		sweepExpiredEntries(spool, jobsDir, now, {
+			expired: name => {
+				if (!name.endsWith('.json') || name.includes('.tmp-')) return false;
+				try {
+					const job = JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord;
+					const state = normalizeState(job.state);
+					if (state === undefined || !isTerminal(state)) return false;
+					const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
+					if (settledAt === 0 || settledAt > cutoff) return false;
+					if (typeof job.id === 'string' && job.id.length > 0) expired.push(job.id);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
+		for (const id of expired) {
 			try {
-				spool.remove(join(jobsDir, `${job.id}.json`));
-			} catch {
-				/* another process won it */
-			}
-			try {
-				spool.remove(join(logsDir, `${job.id}.log`));
+				spool.remove(join(logsDir, `${id}.log`));
 			} catch {
 				/* the log is already gone */
 			}
+			try {
+				spool.remove(join(worktreesDir, id));
+			} catch {
+				/* the worktree is already gone */
+			}
 		}
+		// An abandoned log or worktree with no live record is bounded by the same TTL.
+		sweepExpiredEntries(spool, logsDir, now, {
+			ttlMs,
+			skip: name => {
+				const job = readJob(name.replace(/\.log$/, ''));
+				if (job === undefined) return false;
+				const state = normalizeState(job.state);
+				return state === undefined || !isTerminal(state);
+			},
+		});
+		sweepExpiredEntries(spool, worktreesDir, now, {ttlMs});
 	}
 
 	function hasPendingSignal(id: string): boolean {
@@ -2664,6 +2766,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly cwd: string;
 		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
+		/** This job's nesting level, and the job that spawned it. */
+		readonly depth?: number;
+		readonly parentJobId?: string;
 		/** The definition body, delivered as the worker's system prompt */
 		readonly systemPrompt?: string;
 		/** The rendered startup bundle: instructions, git status, skills, memory */
@@ -2723,6 +2828,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startedAt,
 			sessionId,
 			updatedAt: startedAt,
+			...(intent.depth !== undefined ? {depth: intent.depth} : {}),
+			...(intent.parentJobId !== undefined ? {parentJobId: intent.parentJobId} : {}),
 			...(isAgent
 				? {
 						agentType: intent.agentType ?? 'general-purpose',
@@ -2749,7 +2856,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				cwd: spec.cwd,
 				detached: true,
 				stdio: 'ignore',
-				env: {...runtime.env, [WORKER_SPEC_ENV]: JSON.stringify(spec), [WORKER_ENV]: '1'},
+				env: workerEnv(runtime.env, spec),
 			});
 		} catch (error) {
 			const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
@@ -2780,12 +2887,53 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return {ok: true, id, pid: worker.pid};
 	}
 
+	// The pool is per session: only this session's queued and running jobs occupy
+	// slots. Records are the source of truth, so a cancel in another process frees
+	// one, and a job waiting for input has no worker process to count.
+	function activeJobCount(): number {
+		const owner = ownerId();
+		let count = 0;
+		for (const job of readRecentJobs(ACTIVE_JOB_SCAN_MAX)) {
+			if (job.owner !== owner) continue;
+			const state = normalizeState(job.state);
+			if (state !== undefined && state !== 'queued' && state !== 'running') continue;
+			count += 1;
+		}
+		return count;
+	}
+
 	function fire(intent: JobIntent): Launch {
+		// Both limits are checked before a record exists, so a refused spawn leaves no
+		// job behind and emits no signal.
+		const depth = depthOf(workerSpec) + 1;
+		if (intent.prompt !== undefined) {
+			const maxDepth = resolveMaxDepth(runtime.env);
+			if (depth > maxDepth) {
+				return {
+					ok: false,
+					error: `Subagent nesting depth limit reached (${maxDepth}). This subagent cannot spawn children; do not retry.`,
+				};
+			}
+		}
+		const maxConcurrent = resolveMaxConcurrent(runtime.env);
+		if (activeJobCount() >= maxConcurrent) {
+			return {
+				ok: false,
+				error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`,
+			};
+		}
+
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
 		const owner = ownerId();
-		const record = makeRecord(intent, id, logPath, startedAt, owner);
+		const record = makeRecord(
+			{...intent, depth, ...(workerSpec?.id !== undefined ? {parentJobId: workerSpec.id} : {})},
+			id,
+			logPath,
+			startedAt,
+			owner,
+		);
 		writeJob(record);
 		try {
 			cmd.session?.appendCustomEntry({
@@ -2811,6 +2959,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				tailMax: LOG_TAIL_BYTES_MAX,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
+				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
