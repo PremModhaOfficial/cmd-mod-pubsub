@@ -124,9 +124,12 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 8: Output and permissions
 
-- [ ] Scan worker output for instruction-shaped text.
-- [ ] Insert the backslash into imitated system tags.
-- [ ] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
+- [x] Scan worker output for instruction-shaped text. (T6: `scanOutput`, embedded in the worker;
+  smoke 37)
+- [x] Insert the backslash into imitated system tags. (smoke 37, 38: `<system-reminder>`,
+  `Human:`, `Assistant:`)
+- [x] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
+  (smoke 37-39; permission mentions are marked and left as written; failed signals carry the tail)
 - [ ] Map `permissionMode` to the worker CLI flags.
 - [ ] Put a worker that needs approval into `waiting-input`.
 - [ ] Signal the parent with the question or the approval request.
@@ -169,12 +172,22 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 12: Scopes, discovery, and built-ins
 
-- [ ] Managed, CLI, project, user, and plugin scopes with the documented precedence.
-- [ ] `--agents` JSON and JSON-file form; interactive refuses a file path.
-- [ ] Project walk-up, nested closest wins, `--add-dir`, recursive scanning.
-- [ ] Plugin scoped names; plugin ignores `hooks`, `mcpServers`, `permissionMode`.
-- [ ] Name rules; same-directory duplicates by read order; `/doctor` reports them.
-- [ ] Invalid-file skip rules and debug log; a plugin file with no name loads under its filename.
+- [x] Managed, CLI, project, user, and plugin scopes with the documented precedence. (smoke 42: one name
+  defined in all five scopes resolves to the managed definition; removing scopes one at a time resolves to
+  CLI, nested project, outer project, then user.)
+- [x] `--agents` JSON and JSON-file form; interactive refuses a file path. (The host has no `--agents`, so
+  the CLI scope arrives as `--mod-option agents=<inline JSON|path>`; smoke 42: inline and file both load,
+  interactive mode records a refusal with a reason, and a second registry without the flag has no CLI
+  definition.)
+- [x] Project walk-up, nested closest wins, `--add-dir`, recursive scanning. (smoke 42: the walk stops at
+  `.git`, a nested `.commandcode/agents` wins, an `add_dir` directory and its subfolder both load.)
+- [x] Plugin scoped names; plugin ignores `hooks`, `mcpServers`, `permissionMode`. (smoke 42:
+  `my-plugin:review:security` spawns and lists; `security` does not resolve; all three fields are absent.)
+- [x] Name rules; same-directory duplicates by read order; `/doctor` reports them. (smoke 42: the first
+  file wins, the duplicate entry names the kept path and proposes rename-or-remove; `/doctor` prints both.)
+- [x] Invalid-file skip rules and debug log; a plugin file with no name loads under its filename. (smoke 33
+  and 42: the skip reasons reach `agents.log`; a nameless and an unparseable plugin file load with a
+  warning that `/doctor` and `/doctor plugins` report.)
 - [ ] Built-ins: Explore, Plan, general-purpose, claude, statusline-setup, claude-code-guide.
 - [ ] Explore and Plan are read-only, one-shot, no agent id; Explore thoroughness; both skip CLAUDE.md and git status.
 - [ ] Disable controls: `permissions.deny`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS`, `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`.
@@ -183,14 +196,19 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 13: Frontmatter and resolution
 
-- [ ] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure.
-- [ ] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility.
-- [ ] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance.
+- [x] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure. (smoke 47: every branch of `filterTools`; smoke 48: the resolved set reaches the worker spec and survives resume.)
+- [x] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility. (smoke 47: universal removals, the background allowlist with every MCP tool, and foreground-only `ListAgents`.)
+- [x] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance. (smoke 47: every `resolveModel` branch including `inherit` and FORCE; smoke 48: the resolved model reaches the spec and the job record. Worker-side catalog substitution and thinking inheritance are asserted in smoke 48.)
 - [ ] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual.
-- [ ] `skills` full-content preload; unlisted skills still invocable.
+- [x] `skills` full-content preload; unlisted skills still invocable. (smoke 43: the named skill's
+  `SKILL.md` is in the bundle; discovery order is project walk-up, then user, for `.commandcode/skills`
+  and `.claude/skills`. An unlisted skill is simply not preloaded and stays with the host's Skill tool.)
 - [ ] `mcpServers` inline and referenced; trust; plugin ignored.
 - [ ] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
-- [ ] `memory` scopes, `MEMORY.md` 200 lines or 25KB, automatic Read/Write/Edit.
+- [x] `memory` scopes, `MEMORY.md` 200 lines or 25KB. (smoke 44: `memoryDirFor` for user, project and
+  local, the first 200 lines or 25KB of `MEMORY.md`, and the directory is created on spawn. The field is
+  parsed and recorded. `withMemoryTools` adds Read, Write and Edit (smoke 44) and spawn applies it to the
+  resolved tool set before the worker spec is built.)
 - [ ] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
 - [ ] Unknown fields ignored without error.
 - [ ] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form.
@@ -198,8 +216,8 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 14: Context and persistence
 
-- [ ] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window.
-- [ ] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads.
+- [x] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window. (smoke 43: `buildStartupBundle` exposes each component and the rendered text. The roster field is rendered when supplied; the live roster is T9.)
+- [x] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads. (smoke 45: Explore/Plan drop the hierarchy, AGENTS.md and the snapshot; `omitClaudeMd` keeps managed policy only; a path-scoped CLAUDE.md still loads in both cases.)
 - [ ] Resume by agent id; Explore/Plan return no id; `maxTurns` partial; per-invocation model and effort survive resume.
 - [ ] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept.
 - [ ] Auto-compaction and the `compact_boundary` event.

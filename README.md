@@ -45,8 +45,8 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `name`, `subagent_type` (or the deprecated `agent_type`), `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. A `name` makes the agent addressable with `subagent_send`. |
-| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, elapsed time and owner, plus how many signals are still waiting for this session. |
+| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `name`, `subagent_type` (or the deprecated `agent_type`), `model`, `effort`, `tools`, `disallowed_tools`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. A `name` makes the agent addressable with `subagent_send`. |
+| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, effort, color, elapsed time and owner, plus how many signals are still waiting for this session. |
 | `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
 | `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. The resumed run is a new job with its own signal. |
@@ -91,14 +91,31 @@ Discovery walks up from the working directory to the repository root (the closes
 `.commandcode/agents/` wins), then scans `~/.commandcode/agents/`, then adds the built-ins. Directories
 are scanned recursively, and a project definition overrides a user or built-in definition by name.
 
+Every Claude Code scope is loaded, highest priority first:
+
+| Priority | Scope | Location |
+| --- | --- | --- |
+| 1 | `managed` | `<managed_dir>/agents/**/*.md` (organization-wide) |
+| 2 | `cli` | `--mod-option agents=<inline JSON \| JSON file>` (this session only) |
+| 3 | `project` | `.commandcode/agents/**/*.md` from the cwd up to the repository root, plus every `--add-dir` directory |
+| 4 | `user` | `~/.commandcode/agents/**/*.md` |
+| 5 | `plugin` | `<plugin root>/<plugin>/agents/**/*.md`; a subfolder becomes `plugin:review:security` |
+| 6 | `builtin` | the four built-ins below, overridable by any definition above |
+
+A same-directory duplicate loads the first file in read order; the rest are reported by `/doctor`.
+A CLI definition is session-only and accepts the same fields as frontmatter except `color` and
+`experimental`; an interactive session refuses a file path and requires inline JSON. A plugin definition
+ignores `hooks`, `mcpServers`, and `permissionMode`, and a plugin file with no name (or unparseable
+frontmatter) still loads under its filename.
+
 Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fallback) and `claude`.
 `general` is accepted as the host-reserved alias for `general-purpose`.
 
 Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
-`skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
+`skills`, `memory`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
 with a missing name or description, a bad first line, a colon or over-256-character name, or unparseable
 YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
-skip with its reason.
+skip with its reason, and `/doctor` reports each duplicate and invalid file with the fix.
 
 `subagent_type` is canonical; `agent_type` is a deprecated alias. Omitting the type uses
 `general-purpose`; with no `general-purpose` definition the call fails with `subagent_type is required`.
@@ -107,7 +124,28 @@ With the mod installed, the body is injected through the host's `appendSystemPro
 worker. When the mod is loaded only with `--mod` (development), this host's `cmd acp` ignores `--mod`, so
 the worker carries the body at the front of the task prompt instead; the job log says which path ran.
 
-`permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
+### Startup context
+
+Every agent job starts from a bundle built in the parent, not from the parent's conversation:
+
+- the definition body, the working directory, platform, date, model, and that model's context window;
+- the CLAUDE.md hierarchy (managed policy, user, each project directory from the root down, `CLAUDE.local.md`)
+  and `AGENTS.md`, loaded as project instructions;
+- a bounded `git status --short --branch` snapshot;
+- the full content of every skill named in `skills`;
+- the sibling roster, the output style, and the agent's own `MEMORY.md`.
+
+Explore and Plan skip the instruction hierarchy and the git snapshot. `omitClaudeMd` skips the user,
+project, and local CLAUDE.md files and `AGENTS.md`, keeping managed policy unless the agent is managed. A
+CLAUDE.md in a subdirectory the agent works with still loads in both cases. A subagent never inherits the
+parent's auto memory.
+
+`memory: user | project | local` creates `~/.commandcode/agent-memory/<name>/`,
+`<cwd>/.commandcode/agent-memory/<name>/`, or `<cwd>/.commandcode/agent-memory-local/<name>/`, and injects
+the first 200 lines or 25KB of its `MEMORY.md`, whichever comes first. The worker's system prompt carries
+the bundle when the `appendSystemPrompt` hook is live; otherwise it precedes the task in the prompt.
+
+`permission_mode` and `isolation` are **refused explicitly** rather than silently ignored: they
 arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
 background path is the only one that exists yet.
 
@@ -140,6 +178,32 @@ message from a worker to a peer is accepted only for a name in that roster.
 
 `SubagentHandback` is the explicit final-report path for an agent that reports through it: the report is
 delivered as one signal and the wrapper suppresses the duplicate end-of-turn result.
+### Tool access, model, and effort
+
+`tools` and `disallowedTools` are comma strings or YAML lists, and the spawn arguments `tools` /
+`disallowed_tools` override the definition for one invocation.
+
+- `tools` only: only the listed tools remain. `disallowedTools` only: the listed tools are removed from
+  the inherited set. Both: `disallowedTools` wins, so a tool in both lists is removed.
+- `mcp__server__*` selects one server's tools, `mcp__*` selects every MCP tool, and `mcp__server` or
+  `mcp__server__*` in `disallowedTools` withholds them. A specifier such as `Bash(git push *)` removes
+  the whole tool.
+- Every subagent loses `AskUserQuestion`, `EndConversation`, `EnterPlanMode`, `ScheduleWakeup`,
+  `WaitForMcpServers`, `Workflow`, and `ExitPlanMode` unless its permission mode is `plan`.
+- A background subagent keeps every MCP tool but only the allowlisted built-ins, so `ListAgents` is
+  foreground-only.
+- A `tools` list that resolves to nothing fails the launch and names the entries.
+
+Model: the per-invocation `model`, then the definition's `model`, then `BETTER_SUBAGENTS_SUBAGENT_MODEL`
+(or `CLAUDE_CODE_SUBAGENT_MODEL`), then the main model. `inherit` selects the main model.
+`BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE=1` (or the Claude Code alias) makes the environment value win over
+the parameter and the definition. Family aliases resolve against the session's model catalog; a value the
+allowlist blocks falls back to the inherited model and is logged.
+
+Effort: the per-invocation `effort`, then the definition's `effort`, then `BETTER_SUBAGENTS_EFFORT_LEVEL`
+(or `CLAUDE_CODE_EFFORT_LEVEL`). Effort is `low`, `medium`, `high`, `xhigh`, or `max`. Extended thinking
+is inherited from the main conversation; there is no per-subagent thinking setting. The definition's
+`color` appears in the job list and the jobs pane.
 
 ### Deprecated aliases (one release)
 
@@ -159,6 +223,7 @@ note into this session; `subagent_send` takes `to`/`message` and delivers a live
 /subagents cancel <id>   # cancel a queued/running job
 /subagents open <id>     # one job: state, exit code, duration, log
 /agents [name|path]      # subagent definitions: scope, validity, source file
+/doctor [plugins]        # duplicate, invalid, and plugin-file problems, with the fix
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
@@ -170,6 +235,10 @@ The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` runni
 | --- | --- | --- |
 | `subagent_dir` | `~/.commandcode/subagents` | Where the spool, logs and job records live. Point several sessions at one shared spool (the default) or give a project its own. |
 | `subagent_deliver` | `steer` | How a signal reaches the session: `steer` delivers right after the current tool batch; `follow-up` waits until the run would otherwise stop. |
+| `managed_dir` | `~/.commandcode/managed` | The managed settings directory; `agents/` under it wins every other scope. |
+| `agents` | empty | Session-only definitions as inline JSON, or a JSON file path in a non-interactive session (`--mod-option agents=...`). |
+| `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`). |
+| `plugin_dir` | empty | Comma-separated plugin roots; every child directory with an `agents/` directory is a plugin. |
 
 `pubsub_dir` and `pubsub_deliver` are deprecated aliases, recognised for one release when set to
 anything other than their own default.

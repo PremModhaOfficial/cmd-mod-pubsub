@@ -45,7 +45,7 @@
 // "Internals" in the README.
 
 import type {ModApi} from '@commandcode/harness';
-import {spawn} from 'node:child_process';
+import {execFileSync, spawn} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {
 	appendFileSync,
@@ -58,7 +58,7 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import {homedir} from 'node:os';
-import {dirname, join} from 'node:path';
+import {dirname, isAbsolute, join} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 // Bounds. Every loop and buffer below is capped on purpose.
@@ -74,7 +74,6 @@ const ORPHANED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // jobs are never swept, however old their record is.
 const RETENTION_DAYS_DEFAULT = 30;
 const RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
-const RECORD_SWEEP_MAX = 500;
 // A queued/running record with no live pid is only declared lost after this grace,
 // so a worker that has been spawned but has not written its pid yet is not failed.
 const LOST_GRACE_MS = 30 * 1000;
@@ -100,8 +99,8 @@ const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
 const ROSTER_MAIN = 'main';
 
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
-// body is the worker's system prompt. Project discovery walks up from the working
-// directory, so the closest `.commandcode/agents/` wins, then user, then built-ins.
+// body is the worker's system prompt. Discovery follows the scope table: managed,
+// CLI, project (closest directory upward, then --add-dir), user, plugin, built-in.
 const AGENT_NAME_MAX = 256;
 const AGENT_SCAN_MAX = 1000;
 const AGENT_SCAN_DEPTH_MAX = 8;
@@ -129,8 +128,91 @@ const JOB_ENTRY_TYPE = 'subagent/job';
 const WORKER_ENV = 'BETTER_SUBAGENTS_WORKER';
 const WORKER_SPEC_ENV = 'SUBAGENT_SPEC';
 const RETENTION_ENV = 'BETTER_SUBAGENTS_RETENTION_DAYS';
+// Limits. The concurrency limit is per session; the depth limit caps nesting.
+const MAX_CONCURRENT_DEFAULT = 20;
+const MAX_CONCURRENT_ENV = 'BETTER_SUBAGENTS_MAX_CONCURRENT';
+const MAX_CONCURRENT_ENV_ALIAS = 'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS';
+const MAX_DEPTH_DEFAULT = 3;
+const MAX_DEPTH_ENV = 'BETTER_SUBAGENTS_MAX_DEPTH';
+const MAX_DEPTH_ENV_ALIAS = 'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH';
+// The pool scans recent records; the spool is long-lived and a session's active
+// jobs are always among the newest.
+const ACTIVE_JOB_SCAN_MAX = 500;
 const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
 const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
+// Definition scopes. The host has no `--agents`; the CLI scope arrives as
+// `--mod-option agents=<json|path>`. The managed settings directory is the host's
+// organization-wide config root; `agents/` under it beats every other scope.
+const MANAGED_SETTINGS_DEFAULT = join(homedir(), '.commandcode', 'managed');
+const CLI_AGENTS_OPTION = 'agents';
+const ADD_DIRS_OPTION = 'add_dir';
+const PLUGIN_DIRS_OPTION = 'plugin_dir';
+
+// ---------------------------------------------------------------------------
+// Output scanning
+//
+// A subagent's report is data, never instructions. Before the text becomes a
+// signal it is scanned once: an imitation of the host's own output gets a
+// backslash (so `<system-reminder>` reads as text), and a tag imitation or a
+// permission-setting mention gets a marker the parent cannot miss. Nothing else
+// is rewritten - a permission mention stays exactly as written.
+//
+// Self-contained on purpose: WORKER_SOURCE embeds this function's source, so the
+// worker and the parent run one rule table (the same contract as signalEnvelope).
+// ---------------------------------------------------------------------------
+
+export interface ScanResult {
+	readonly text: string;
+	readonly matches: string[];
+	readonly marked: boolean;
+}
+
+export function scanOutput(text: string): ScanResult {
+	// Inline the marker and the rule names: this body is embedded in WORKER_SOURCE,
+	// so it cannot read module constants.
+	const marker = '[harness: subagent output matched instruction-shaped pattern(s): ';
+	const settings = [
+		['bypassPermissions', 'bypassPermissions permission setting'],
+		['--dangerously-skip-permissions', '--dangerously-skip-permissions permission setting'],
+	];
+	const matches: string[] = [];
+	let marked = false;
+	let out = String(text ?? '');
+	// A tag imitation is escaped, never removed: the text stays readable and can no
+	// longer be mistaken for host output.
+	out = out.replace(/<\/?system-reminder\b[^>]*>/gi, match => {
+		if (!matches.includes('system-reminder tag')) matches.push('system-reminder tag');
+		marked = true;
+		return '\\' + match;
+	});
+	// A role label only counts at the start of a line, after indentation.
+	out = out.replace(/^([ \t]*)(Human|Assistant):/gm, (_match, space: string, label: string) => {
+		const name = label + ': role label';
+		if (!matches.includes(name)) matches.push(name);
+		return space + '\\' + label + ':';
+	});
+	// A permission-setting mention is reported, not rewritten: rewriting a flag
+	// would hide what the subagent actually said.
+	for (const [needle, name] of settings) {
+		if (out.includes(needle) && !matches.includes(name)) {
+			matches.push(name);
+			marked = true;
+		}
+	}
+	if (marked) out = marker + matches.join(', ') + ']\n' + out;
+	return {text: out, matches, marked};
+}
+
+// The report the parent reads: the worker's own progress lines (`[tool] ...`) are
+// not part of it. They stay in the log for the task view; a tool call is never a
+// result the parent is asked to act on. Shell output is returned as written.
+export function reportText(text: string, kind: string): string {
+	const visible =
+		kind === 'agent'
+			? text.split('\n').filter(line => !/^\[tool[ \]]/.test(line)).join('\n')
+			: text;
+	return scanOutput(visible).text;
+}
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -177,6 +259,20 @@ const readTail = () => {
 // sides therefore construct a signal from the same field list.
 const signalEnvelope = ${signalEnvelope.toString()};
 
+// The scanner is the parent's scanOutput, injected the same way: one rule table.
+const scanOutput = ${scanOutput.toString()};
+
+// The report tail drops the worker's own tool-call progress. Those lines stay in
+// the log for the task view; the parent is never asked to act on a tool call.
+// Shell output is passed through as written.
+const readReportTail = () => {
+  try {
+    const tail = readTail();
+    if (spec.kind !== 'agent') return tail;
+    return tail.split('\\n').filter(line => !/^\\[tool[ \\]]/.test(line)).join('\\n');
+  } catch (e) { return ''; }
+};
+
 let settled = false;
 
 // One constructor for "this job reached this state": the record patch and the
@@ -200,13 +296,18 @@ const settle = (state, detail, code, tail) => {
     });
     return;
   }
+  // Scan is the last step before the text can reach the parent; the record and
+  // the signal carry the same facts.
+  const scan = scanOutput(detail + (tail ? '\\n\\n' + tail : ''));
   writeRecord({
     state: state,
     exitCode: typeof code === 'number' ? code : undefined,
     finishedAt: finishedAt,
     durationMs: durationMs,
     failureReason: failed ? detail : undefined,
-    awaitingInput: state === 'waiting-input' ? true : undefined
+    awaitingInput: state === 'waiting-input' ? true : undefined,
+    scanned: true,
+    scanMatches: scan.matches
   });
   emit(signalEnvelope({
     id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
@@ -216,11 +317,14 @@ const settle = (state, detail, code, tail) => {
     exitCode: typeof code === 'number' ? code : null,
     finishedAt: finishedAt,
     durationMs: durationMs,
-    body: detail + (tail ? '\\n\\n' + tail : '')
+    body: scan.text,
+    scanned: true,
+    scanMatches: scan.matches
   }));
 };
 
-const fail = (reason, code) => settle('failed', reason, code, '');
+// A failed worker still returns its last output: partial work is never discarded.
+const fail = (reason, code) => settle('failed', reason, code, readReportTail());
 
 let out;
 try {
@@ -303,7 +407,7 @@ const finish = (code, spawnError, signal) => {
         : signal
           ? 'terminated by ' + signal
           : 'exit 0';
-  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
+  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, readReportTail());
 };
 
 if (typeof child.pid === 'number') {
@@ -523,6 +627,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     const prefix = failure === undefined
       ? 'reply to ' + String(from || 'main') + ':'
       : failure + '\\nreply to ' + String(from || 'main') + ':';
+    const scan = scanOutput(prefix + '\\n' + tail);
     emit(signalEnvelope({
       id: spec.id + '-msg-' + turnCount,
       label: spec.label + ' (message)',
@@ -537,7 +642,9 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       finishedAt: Date.now(),
       durationMs: 0,
       title: (spec.name || spec.label) + (failure === undefined ? ' replied' : ' failed a live turn'),
-      body: prefix + '\\n' + tail
+      body: scan.text,
+      scanned: true,
+      scanMatches: scan.matches
     }));
   };
 
@@ -632,9 +739,18 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
         logWrite('[acp] permissionMode ' + spec.permissionMode + ' is not applied in this phase\\n');
       }
     }
+    // The tool set is resolved in the parent: the worker only makes it visible and
+    // never widens it.
+    if (Array.isArray(spec.tools)) {
+      logWrite('[acp] tools ' + spec.tools.length + (spec.tools.length > 0 ? ': ' + spec.tools.join(', ') : '') + '\\n');
+    }
     // Family aliases resolve to the newest model the session offers, matching the
-    // host's catalog order. A full id passes through unchanged.
-    const modelOptions = (configOptions.find(option => option && option.id === 'model')?.options) || [];
+    // host's catalog order. A full id passes through unchanged. When the catalog is
+    // known and blocks the value, the inherited (main) model is used and the
+    // substitution is logged: resolution never silently picks another model.
+    const modelOption = configOptions.find(option => option && option.id === 'model');
+    const modelOptions = (modelOption && modelOption.options) || [];
+    const inheritedModel = modelOption && typeof modelOption.currentValue === 'string' ? modelOption.currentValue : undefined;
     const modelAliases = {sonnet: /sonnet/i, opus: /opus/i, haiku: /haiku/i, fable: /fable/i};
     let modelValue = spec.model;
     if (typeof modelValue === 'string' && modelAliases[modelValue.toLowerCase()]) {
@@ -642,7 +758,13 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       if (match && typeof match.value === 'string') {
         logWrite('[acp] model alias ' + modelValue + ' -> ' + match.value + '\\n');
         modelValue = match.value;
+      } else if (modelOptions.length > 0) {
+        logWrite('[acp] model alias ' + modelValue + ' is not in the allowed catalog; inheriting ' + String(inheritedModel || 'the session default') + '\\n');
+        modelValue = inheritedModel;
       }
+    } else if (typeof modelValue === 'string' && modelOptions.length > 0 && !modelOptions.some(option => option && String(option.value) === modelValue)) {
+      logWrite('[acp] model ' + modelValue + ' is not in the allowed catalog; inheriting ' + String(inheritedModel || 'the session default') + '\\n');
+      modelValue = inheritedModel;
     }
     for (const option of ['model', 'effort']) {
       const value = option === 'model' ? modelValue : spec[option];
@@ -658,14 +780,25 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // its factory. When the marker is absent, the body is carried in the prompt so
     // it can never silently disappear.
     const body = typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+    const rosterText = typeof spec.roster === 'string' ? spec.roster : '';
+    const startupText = typeof spec.startup === 'string' ? spec.startup : '';
     let hookReady = false;
     if (typeof spec.promptMarkerPath === 'string' && spec.promptMarkerPath.length > 0) {
       try { hookReady = fs.existsSync(spec.promptMarkerPath); } catch (e) { hookReady = false; }
     }
     let promptText = spec.prompt;
+    const preamble = [];
+    if (body.length > 0 && !hookReady) preamble.push('AGENT DEFINITION (your system prompt):\\n' + body);
+    if (rosterText.length > 0 && !hookReady) preamble.push(rosterText);
+    if (startupText.length > 0 && !hookReady) preamble.push(startupText);
+    if (preamble.length > 0) {
+      promptText = preamble.join('\\n\\n') + '\\n\\nTASK:\\n' + String(spec.prompt);
+    }
     if (body.length > 0 && !hookReady) {
-      promptText = 'AGENT DEFINITION (your system prompt):\\n' + body + '\\n\\nTASK:\\n' + String(spec.prompt);
       logWrite('[acp] mod not loaded in the ACP child; the definition body is in the prompt\\n');
+    }
+    if (startupText.length > 0) {
+      logWrite('[acp] startup context ' + startupText.length + ' chars (hook ' + (hookReady ? 'live' : 'absent') + ')\\n');
     }
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
     const outcome = turnOutcome(result);
@@ -677,7 +810,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // The first turn is the job's result, as before. With live messaging the
     // session then stays open: the record is done, but the process (and its ACP
     // session) keeps accepting messages until the idle window passes.
-    settle('done', 'exit 0', 0, readTail());
+    settle('done', 'exit 0', 0, readReportTail());
     await liveLoop();
     shutdown();
   };
@@ -742,7 +875,14 @@ export interface Runtime {
 	readonly cwd: string;
 	/** The user home: `~/.commandcode/agents` lives under it. */
 	readonly home: string;
+	/** Whether a human is driving. A CLI agent file is refused when one is. */
+	readonly interactive: boolean;
 	readonly fs: SpoolFs;
+	/**
+	 * One bounded, synchronous command, used only for the startup git snapshot.
+	 * Optional so a test can leave git out entirely; a failure is never fatal.
+	 */
+	run?(command: string, args: string[], options: {cwd?: string}): {ok: boolean; stdout: string};
 }
 
 export type RuntimeOverrides = Partial<Omit<Runtime, 'fs'>> & {fs?: Partial<SpoolFs>};
@@ -798,7 +938,22 @@ const OS_RUNTIME: Runtime = {
 	env: process.env,
 	cwd: process.cwd(),
 	home: homedir(),
+	interactive: process.stdin.isTTY === true,
 	fs: osSpoolFs(),
+	run: (command, args, options) => {
+		try {
+			const stdout = execFileSync(command, args, {
+				cwd: options.cwd,
+				encoding: 'utf8',
+				timeout: 2000,
+				maxBuffer: 64 * 1024,
+				stdio: ['ignore', 'pipe', 'ignore'],
+			});
+			return {ok: true, stdout};
+		} catch {
+			return {ok: false, stdout: ''};
+		}
+	},
 };
 
 // The test adapter is the same interface with functions swapped out.
@@ -817,13 +972,22 @@ function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
 // not the host's. Only `name` and `description` are required; every other T1 field
 // is parsed and carried on the definition even when a later phase applies it.
 //
-// Discovery order is precedence order: project directories from the working
-// directory upward (closest first), then the user directory, then built-ins. The
-// first definition of a name wins. Invalid files never fail the session: they are
-// recorded with a reason, written to agents.log, and reported by `/agents`.
+// Discovery order is precedence order: the managed settings directory, the CLI
+// definitions, project directories from the working directory upward (closest
+// first) and every --add-dir directory, the user directory, plugin roots, and
+// finally the built-ins. The first definition of a name wins. Invalid files never
+// fail the session: they are recorded with a reason, written to agents.log, and
+// reported by `/agents` and `/doctor`.
 // ---------------------------------------------------------------------------
 
-export type AgentScope = 'project' | 'user' | 'builtin';
+// The scopes, highest priority first. The order is the precedence rule: managed
+// wins over CLI, CLI over project, project over user, user over plugin, and every
+// one over a built-in. It is also the display order in `/agents`.
+export const AGENT_SCOPES = ['managed', 'cli', 'project', 'user', 'plugin', 'builtin'] as const;
+
+export type AgentScope = (typeof AGENT_SCOPES)[number];
+
+export type AgentEntryKind = 'valid' | 'invalid' | 'duplicate';
 
 export interface AgentDefinition {
 	name: string;
@@ -831,12 +995,16 @@ export interface AgentDefinition {
 	systemPrompt: string;
 	source: AgentScope;
 	path?: string;
+	/** The plugin whose `agents/` directory provided this definition. */
+	plugin?: string;
 	tools?: string[];
 	disallowedTools?: string[];
 	model?: string;
 	permissionMode?: string;
 	maxTurns?: number;
 	skills?: string[];
+	/** `user`, `project`, or `local`: the agent's own memory directory. */
+	memory?: AgentMemoryScope;
 	isolation?: string;
 	background?: boolean;
 	color?: string;
@@ -851,7 +1019,12 @@ export interface AgentEntry {
 	source: AgentScope;
 	path: string;
 	valid: boolean;
+	kind: AgentEntryKind;
 	reason?: string;
+	/** A definition that loaded but has a problem worth reporting (`/doctor`). */
+	warning?: string;
+	/** For a duplicate: the file whose definition was kept. */
+	duplicateOf?: string;
 	definition?: AgentDefinition;
 }
 
@@ -868,6 +1041,14 @@ export interface AgentRegistryDeps {
 	readonly home: string;
 	readonly builtins: AgentDefinition[];
 	readonly log: (message: string) => void;
+	/** The managed settings root; `agents/` under it wins every other scope. */
+	readonly managedDir?: string;
+	/** Plugin roots: each child directory is a plugin with an `agents/` directory. */
+	readonly pluginRoots?: string[];
+	/** `--mod-option agents=<json|path>`, plus whether a human is driving. */
+	readonly cli?: {readonly value: string; readonly interactive: boolean};
+	/** `--add-dir` directories: `.commandcode/agents/` under each is project scope. */
+	readonly addDirs?: string[];
 }
 
 export type FrontmatterResult =
@@ -1049,23 +1230,100 @@ function numberField(value: unknown): number | undefined {
 	return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : undefined;
 }
 
+export interface AgentDefinitionOptions {
+	/** A plugin definition: an unparseable file or one without a name still loads. */
+	plugin?: boolean;
+	/** The plugin that owns the file, recorded on the definition. */
+	pluginName?: string;
+	/** The scoped prefix the raw name is appended to, e.g. `my-plugin:review:`. */
+	scopedPrefix?: string;
+	/** The filename stem, used as the name when frontmatter provides none. */
+	fallbackName?: string;
+}
+
+export type AgentDefinitionResult =
+	| {ok: true; definition: AgentDefinition; warning?: string}
+	| {ok: false; reason: string};
+
+/** Every name rule in one place, so a file and a CLI definition agree. */
+function validateAgentName(name: string): string | undefined {
+	if ([...name].length > AGENT_NAME_MAX) return `name: must be at most ${AGENT_NAME_MAX} characters`;
+	if (name.includes(':')) return 'name: must not contain ":" (plugin-scoped identifiers reserve it)';
+	if (name.startsWith('-')) return 'name: must not start with "-"';
+	return undefined;
+}
+
+// The body of a file whose frontmatter did not parse: everything after the closing
+// `---` when one is findable, otherwise the whole file.
+function fallbackBody(source: string): string {
+	const text = source.startsWith('\uFEFF') ? source.slice(1) : source;
+	const lines = text.split('\n');
+	if (lines[0]?.trim() !== '---') return text.trim();
+	for (let index = 1; index < lines.length; index += 1) {
+		if (lines[index].trim() === '---') return lines.slice(index + 1).join('\n').trim();
+	}
+	return text.trim();
+}
+
+function fallbackDescription(body: string, name: string): string {
+	const line = body
+		.split('\n')
+		.map(part => part.trim())
+		.find(part => part.length > 0);
+	return line !== undefined ? line.slice(0, 200) : `Plugin agent ${name}`;
+}
+
+function pluginFallbackDefinition(body: string, path: string, options: AgentDefinitionOptions): AgentDefinition {
+	const raw = options.fallbackName !== undefined && options.fallbackName.length > 0 ? options.fallbackName : 'agent';
+	const name = `${options.scopedPrefix ?? ''}${raw}`;
+	const definition: AgentDefinition = {
+		name,
+		description: fallbackDescription(body, name),
+		systemPrompt: body,
+		source: 'plugin',
+		path,
+	};
+	if (options.pluginName !== undefined) definition.plugin = options.pluginName;
+	return definition;
+}
+
 export function agentDefinitionFromSource(
 	source: string,
 	path: string,
 	scope: AgentScope,
-): {ok: true; definition: AgentDefinition} | {ok: false; reason: string} {
+	options: AgentDefinitionOptions = {},
+): AgentDefinitionResult {
 	const frontmatter = parseFrontmatter(source);
-	if (!frontmatter.ok) return frontmatter;
-	const fields = frontmatter.fields;
-
-	const name = stringField(fields.name) ?? '';
-	if (name.length === 0) return {ok: false, reason: 'name: required'};
-	// Characters, not UTF-16 code units: the limit is on the name a human sees.
-	if ([...name].length > AGENT_NAME_MAX) {
-		return {ok: false, reason: `name: must be at most ${AGENT_NAME_MAX} characters`};
+	if (!frontmatter.ok) {
+		if (options.plugin !== true) return frontmatter;
+		// A plugin contract differs from a project one: the file still loads under
+		// its filename, and the parse failure is reported instead of hidden.
+		return {
+			ok: true,
+			definition: pluginFallbackDefinition(fallbackBody(source), path, options),
+			warning: `frontmatter: ${frontmatter.reason}; loaded under its filename`,
+		};
 	}
-	if (name.includes(':')) return {ok: false, reason: 'name: must not contain ":" (plugin-scoped identifiers reserve it)'};
-	if (name.startsWith('-')) return {ok: false, reason: 'name: must not start with "-"'};
+	const fields = frontmatter.fields;
+	const fallbackDefinition = (warning: string): AgentDefinitionResult => {
+		const definition = pluginFallbackDefinition(frontmatter.body, path, options);
+		// A usable description in an otherwise unusable file is still worth keeping.
+		const parsedDescription = stringField(fields.description);
+		if (parsedDescription !== undefined) definition.description = parsedDescription;
+		return {ok: true, definition, warning};
+	};
+
+	const rawName = stringField(fields.name) ?? '';
+	if (rawName.length === 0) {
+		if (options.plugin !== true) return {ok: false, reason: 'name: required'};
+		return fallbackDefinition('name: required; loaded under its filename');
+	}
+	const nameError = validateAgentName(rawName);
+	if (nameError !== undefined) {
+		if (options.plugin !== true) return {ok: false, reason: nameError};
+		return fallbackDefinition(`${nameError}; loaded under its filename`);
+	}
+	const name = options.scopedPrefix !== undefined ? `${options.scopedPrefix}${rawName}` : rawName;
 	const description = stringField(fields.description);
 	if (description === undefined) return {ok: false, reason: 'description: required'};
 
@@ -1076,6 +1334,7 @@ export function agentDefinitionFromSource(
 		source: scope,
 		path,
 	};
+	if (options.pluginName !== undefined) definition.plugin = options.pluginName;
 	const tools = listField(fields.tools);
 	const disallowed = listField(fields.disallowedTools);
 	const skills = listField(fields.skills);
@@ -1088,7 +1347,8 @@ export function agentDefinitionFromSource(
 	const color = stringField(fields.color);
 	const effort = stringField(fields.effort);
 	if (model !== undefined) definition.model = model;
-	if (permissionMode !== undefined) definition.permissionMode = permissionMode;
+	// A plugin's permissionMode is ignored by contract; the host decides its policy.
+	if (permissionMode !== undefined && options.plugin !== true) definition.permissionMode = permissionMode;
 	if (maxTurns !== undefined) definition.maxTurns = maxTurns;
 	if (skills !== undefined) definition.skills = skills;
 	if (isolation !== undefined) definition.isolation = isolation;
@@ -1096,8 +1356,11 @@ export function agentDefinitionFromSource(
 	if (effort !== undefined) definition.effort = effort;
 	const background = booleanField(fields.background);
 	const omitClaudeMd = booleanField(fields.omitClaudeMd);
+	const memoryValue = fields.memory;
+	const memory = memoryValue === 'user' || memoryValue === 'project' || memoryValue === 'local' ? memoryValue : undefined;
 	if (background !== undefined) definition.background = background;
 	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	if (memory !== undefined) definition.memory = memory;
 	return {ok: true, definition};
 }
 
@@ -1158,43 +1421,101 @@ export function builtinAgentDefinitions(env: Record<string, string | undefined>)
 	return [...BUILTIN_AGENT_DEFINITIONS];
 }
 
+// A CLI definition is the same shape as frontmatter, in JSON. `color` and
+// `experimental` are ignored there by contract; the object key is the name, so an
+// inline `{reviewer: {...}}` and an array of `{name: ...}` both work.
+function cliAgentDefinition(
+	rawName: string,
+	spec: Record<string, unknown>,
+	sourcePath: string,
+): {ok: true; definition: AgentDefinition} | {ok: false; reason: string} {
+	const name = rawName.length > 0 ? rawName : (stringField(spec.name) ?? '');
+	if (name.length === 0) return {ok: false, reason: 'name: required'};
+	const nameError = validateAgentName(name);
+	if (nameError !== undefined) return {ok: false, reason: nameError};
+	const description = stringField(spec.description);
+	if (description === undefined) return {ok: false, reason: 'description: required'};
+	const prompt = typeof spec.prompt === 'string' ? spec.prompt : typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+
+	const definition: AgentDefinition = {name, description, systemPrompt: prompt, source: 'cli', path: sourcePath};
+	const tools = listField(spec.tools);
+	const disallowed = listField(spec.disallowedTools);
+	const skills = listField(spec.skills);
+	if (tools !== undefined) definition.tools = tools;
+	if (disallowed !== undefined) definition.disallowedTools = disallowed;
+	if (skills !== undefined) definition.skills = skills;
+	const model = stringField(spec.model);
+	const permissionMode = stringField(spec.permissionMode);
+	const maxTurns = numberField(spec.maxTurns);
+	const isolation = stringField(spec.isolation);
+	const effort = stringField(spec.effort);
+	if (model !== undefined) definition.model = model;
+	if (permissionMode !== undefined) definition.permissionMode = permissionMode;
+	if (maxTurns !== undefined) definition.maxTurns = maxTurns;
+	if (isolation !== undefined) definition.isolation = isolation;
+	if (effort !== undefined) definition.effort = effort;
+	const background = booleanField(spec.background);
+	const omitClaudeMd = booleanField(spec.omitClaudeMd);
+	if (background !== undefined) definition.background = background;
+	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	return {ok: true, definition};
+}
+
 export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 	let entries: AgentEntry[] = [];
-	// Each (file, reason) is logged once per process, so a refresh from `/agents`
+	// Each (file, problem) is logged once per process, so a refresh from `/agents`
 	// cannot flood the debug log with the same skip.
 	const loggedSkips = new Set<string>();
+	// A plugin file that loaded under its filename still carries its problem, which
+	// `/doctor` reports. Keyed by the definition so a precedence skip does not lose it.
+	const definitionWarnings = new WeakMap<AgentDefinition, string>();
 
-	function reportInvalid(entry: AgentEntry): void {
-		const key = `${entry.path}\u0000${entry.reason ?? ''}`;
+	const managedDir = (): string => deps.managedDir ?? join(deps.home, '.commandcode', 'managed');
+
+	function pushEntry(entry: AgentEntry): void {
+		entries.push(entry);
+		const problem = entry.warning ?? entry.reason;
+		if (problem === undefined) return;
+		const key = `${entry.path}\u0000${problem}`;
 		if (loggedSkips.has(key)) return;
 		loggedSkips.add(key);
-		deps.log(`${entry.path}: ${entry.reason ?? 'invalid'}`);
+		deps.log(`${entry.path.length > 0 ? entry.path : entry.name}: ${problem}`);
 	}
 
-	function scanFile(path: string, scope: AgentScope): AgentDefinition | undefined {
+	function scanFile(path: string, scope: AgentScope, options: AgentDefinitionOptions = {}): AgentDefinition | undefined {
 		let source = '';
 		try {
 			source = deps.fs.readFile(path);
 		} catch (error) {
-			const entry: AgentEntry = {
+			pushEntry({
 				name: '',
 				source: scope,
 				path,
 				valid: false,
+				kind: 'invalid',
 				reason: `unreadable: ${String((error as Error)?.message ?? error)}`,
-			};
-			entries.push(entry);
-			reportInvalid(entry);
+			});
 			return undefined;
 		}
-		const parsed = agentDefinitionFromSource(source, path, scope);
+		const parsed = agentDefinitionFromSource(source, path, scope, options);
 		if (!parsed.ok) {
-			const entry: AgentEntry = {name: '', source: scope, path, valid: false, reason: parsed.reason};
-			entries.push(entry);
-			reportInvalid(entry);
+			pushEntry({name: '', source: scope, path, valid: false, kind: 'invalid', reason: parsed.reason});
 			return undefined;
 		}
+		if (parsed.warning !== undefined) definitionWarnings.set(parsed.definition, parsed.warning);
 		return parsed.definition;
+	}
+
+	function pushDuplicate(name: string, scope: AgentScope, path: string, kept: string): void {
+		pushEntry({
+			name,
+			source: scope,
+			path,
+			valid: false,
+			kind: 'duplicate',
+			duplicateOf: kept,
+			reason: `duplicate name "${name}": ${kept} was read first; rename or remove this file`,
+		});
 	}
 
 	// Recursive scan. Subdirectories never change a project or user identity: the
@@ -1206,7 +1527,7 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		scope: AgentScope,
 		depth: number,
 		found: AgentDefinition[],
-		localNames: Set<string>,
+		localNames: Map<string, string>,
 	): void {
 		if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
 		let names: string[] = [];
@@ -1221,19 +1542,12 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 			if (name.toLowerCase().endsWith('.md')) {
 				const definition = scanFile(full, scope);
 				if (definition === undefined) continue;
-				if (localNames.has(definition.name)) {
-					const entry: AgentEntry = {
-						name: definition.name,
-						source: scope,
-						path: full,
-						valid: false,
-						reason: `duplicate name "${definition.name}" (the first definition in this directory wins)`,
-					};
-					entries.push(entry);
-					reportInvalid(entry);
+				const kept = localNames.get(definition.name);
+				if (kept !== undefined) {
+					pushDuplicate(definition.name, scope, full, kept);
 					continue;
 				}
-				localNames.add(definition.name);
+				localNames.set(definition.name, full);
 				found.push(definition);
 				continue;
 			}
@@ -1241,28 +1555,221 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		}
 	}
 
-	// The project dirs from the working directory upward, closest first. Walk-up
+	// A plugin's subdirectory is part of its identifier, so it is scanned with the
+	// trail that builds `plugin:review:security`. Unlike a project, the plugin file
+	// contract loads a nameless or unparseable file under its filename.
+	function scanPluginDir(
+		dir: string,
+		pluginName: string,
+		trail: string[],
+		depth: number,
+		found: AgentDefinition[],
+		localNames: Map<string, string>,
+	): void {
+		if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
+		let children: string[] = [];
+		try {
+			children = deps.fs.readdir(dir).sort();
+		} catch {
+			return;
+		}
+		for (const child of children) {
+			if (entries.length >= AGENT_SCAN_MAX) return;
+			const full = join(dir, child);
+			if (child.toLowerCase().endsWith('.md')) {
+				const definition = scanFile(full, 'plugin', {
+					plugin: true,
+					pluginName,
+					scopedPrefix: `${[pluginName, ...trail].join(':')}:`,
+					fallbackName: child.replace(/\.md$/i, ''),
+				});
+				if (definition === undefined) continue;
+				const kept = localNames.get(definition.name);
+				if (kept !== undefined) {
+					pushDuplicate(definition.name, 'plugin', full, kept);
+					continue;
+				}
+				localNames.set(definition.name, full);
+				found.push(definition);
+				continue;
+			}
+			scanPluginDir(full, pluginName, [...trail, child], depth + 1, found, localNames);
+		}
+	}
+
+	function scanPlugins(root: string, found: AgentDefinition[]): void {
+		if (!deps.fs.exists(root)) return;
+		let pluginNames: string[] = [];
+		try {
+			pluginNames = deps.fs.readdir(root).sort();
+		} catch {
+			return;
+		}
+		for (const pluginName of pluginNames) {
+			// Presence under a plugin root is enablement; the host owns the plugin
+			// manager. Only plugins that ship agents are scanned.
+			const agentsDir = join(root, pluginName, 'agents');
+			if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, new Map());
+		}
+	}
+
+	// The project bases from the working directory upward, closest first. Walk-up
 	// stops at the repository root (the directory holding .git) or the filesystem
 	// root, so a nested `.commandcode/agents` closest to the cwd wins.
-	function projectDirs(): string[] {
-		const dirs: string[] = [];
+	function projectBases(): string[] {
+		const bases: string[] = [];
 		let current = deps.cwd;
 		for (let depth = 0; depth <= 64; depth += 1) {
-			const candidate = join(current, '.commandcode', 'agents');
-			if (deps.fs.exists(candidate)) dirs.push(candidate);
+			bases.push(current);
 			if (deps.fs.exists(join(current, '.git'))) break;
 			const parent = dirname(current);
 			if (parent === current) break;
 			current = parent;
 		}
-		return dirs;
+		return bases;
+	}
+
+	function pluginRoots(): string[] {
+		const roots = [...(deps.pluginRoots ?? [])];
+		roots.push(join(managedDir(), 'plugins'));
+		for (const base of projectBases()) roots.push(join(base, '.commandcode', 'plugins'));
+		roots.push(join(deps.home, '.commandcode', 'plugins'));
+		return roots;
+	}
+
+	// `--mod-option agents=<inline JSON | JSON file path>`. A file is refused in an
+	// interactive session: a definition a human cannot see at launch cannot be
+	// reviewed, so the session must pass inline JSON instead.
+	function scanCli(found: AgentDefinition[]): void {
+		const value = (deps.cli?.value ?? '').trim();
+		if (value.length === 0) return;
+		let text = value;
+		let sourcePath = 'cli';
+		if (!value.startsWith('{') && !value.startsWith('[')) {
+			const file = value.startsWith('@') ? value.slice(1) : value;
+			if (deps.cli?.interactive === true) {
+				pushEntry({
+					name: '',
+					source: 'cli',
+					path: file,
+					valid: false,
+					kind: 'invalid',
+					reason: 'an interactive session cannot load --mod-option agents from a file; pass inline JSON',
+				});
+				return;
+			}
+			try {
+				text = deps.fs.readFile(file);
+			} catch (error) {
+				pushEntry({
+					name: '',
+					source: 'cli',
+					path: file,
+					valid: false,
+					kind: 'invalid',
+					reason: `unreadable: ${String((error as Error)?.message ?? error)}`,
+				});
+				return;
+			}
+			sourcePath = file;
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(text);
+		} catch (error) {
+			pushEntry({
+				name: '',
+				source: 'cli',
+				path: sourcePath,
+				valid: false,
+				kind: 'invalid',
+				reason: `agents JSON: ${String((error as Error)?.message ?? error)}`,
+			});
+			return;
+		}
+		const specs: {name: string; spec: Record<string, unknown>}[] = [];
+		if (Array.isArray(parsed)) {
+			for (const item of parsed) {
+				if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+					pushEntry({
+						name: '',
+						source: 'cli',
+						path: sourcePath,
+						valid: false,
+						kind: 'invalid',
+						reason: 'agents JSON: every array item must be an object',
+					});
+					continue;
+				}
+				const record = item as Record<string, unknown>;
+				specs.push({name: typeof record.name === 'string' ? record.name : '', spec: record});
+			}
+		} else if (parsed !== null && typeof parsed === 'object') {
+			for (const [name, item] of Object.entries(parsed)) {
+				if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+					pushEntry({
+						name,
+						source: 'cli',
+						path: sourcePath,
+						valid: false,
+						kind: 'invalid',
+						reason: 'agents JSON: every definition must be an object',
+					});
+					continue;
+				}
+				specs.push({name, spec: item as Record<string, unknown>});
+			}
+		} else {
+			pushEntry({
+				name: '',
+				source: 'cli',
+				path: sourcePath,
+				valid: false,
+				kind: 'invalid',
+				reason: 'agents JSON: expected an object of definitions or an array',
+			});
+			return;
+		}
+
+		const localNames = new Map<string, string>();
+		for (const {name, spec} of specs) {
+			const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
+			if (!parsedDefinition.ok) {
+				pushEntry({
+					name,
+					source: 'cli',
+					path: sourcePath,
+					valid: false,
+					kind: 'invalid',
+					reason: parsedDefinition.reason,
+				});
+				continue;
+			}
+			const kept = localNames.get(parsedDefinition.definition.name);
+			if (kept !== undefined) {
+				pushDuplicate(parsedDefinition.definition.name, 'cli', sourcePath, kept);
+				continue;
+			}
+			localNames.set(parsedDefinition.definition.name, sourcePath);
+			found.push(parsedDefinition.definition);
+		}
 	}
 
 	function refresh(): void {
 		entries = [];
 		const found: AgentDefinition[] = [];
-		for (const dir of projectDirs()) scanDir(dir, 'project', 0, found, new Set());
-		scanDir(join(deps.home, '.commandcode', 'agents'), 'user', 0, found, new Set());
+		// Precedence order, highest first: a managed definition wins over CLI, CLI over
+		// project, project over user, user over plugin, and every one over a built-in.
+		scanDir(join(managedDir(), 'agents'), 'managed', 0, found, new Map());
+		scanCli(found);
+		for (const base of projectBases()) {
+			scanDir(join(base, '.commandcode', 'agents'), 'project', 0, found, new Map());
+		}
+		for (const dir of deps.addDirs ?? []) {
+			scanDir(join(dir, '.commandcode', 'agents'), 'project', 0, found, new Map());
+		}
+		scanDir(join(deps.home, '.commandcode', 'agents'), 'user', 0, found, new Map());
+		for (const root of pluginRoots()) scanPlugins(root, found);
 		found.push(...deps.builtins);
 
 		// Precedence, not an error: the first loaded definition of a name wins. A
@@ -1271,11 +1778,14 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		for (const definition of found) {
 			if (seen.has(definition.name)) continue;
 			seen.add(definition.name);
+			const warning = definitionWarnings.get(definition);
 			entries.push({
 				name: definition.name,
 				source: definition.source,
 				path: definition.path ?? '',
 				valid: true,
+				kind: 'valid',
+				...(warning !== undefined ? {warning} : {}),
 				definition,
 			});
 		}
@@ -1288,6 +1798,380 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		get: name => entries.find(entry => entry.valid && entry.definition?.name === name)?.definition,
 		refresh,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Startup context and agent memory
+//
+// What a subagent sees at startup is a bundle, not the host's full prompt: the
+// definition body, the environment, the task, the CLAUDE.md/AGENTS.md hierarchy,
+// a git status snapshot, the full content of the named skills, a sibling roster,
+// the output style, and the agent's own MEMORY.md. The bundle is built in the
+// parent from the injected filesystem, so the omit rules live in one function
+// instead of in conditionals spread through spawn. A subagent never inherits the
+// parent's auto memory; `memory` gives it a directory and a MEMORY.md of its own.
+// ---------------------------------------------------------------------------
+
+export type AgentMemoryScope = 'user' | 'project' | 'local';
+
+const MEMORY_INDEX_FILE = 'MEMORY.md';
+const MEMORY_INDEX_LINES_MAX = 200;
+const MEMORY_INDEX_BYTES_MAX = 25 * 1024;
+const GIT_STATUS_MAX_CHARS = 2000;
+const STARTUP_WALK_DEPTH_MAX = 8;
+// The window the ACP session is told it has. A family alias resolves to its
+// documented window; an explicit override wins, and an unknown model gets the
+// common default rather than an unbounded number.
+const CONTEXT_WINDOW_DEFAULT = 200000;
+const CONTEXT_WINDOW_MAX = 10 * 1000 * 1000;
+const CONTEXT_WINDOW_FAMILIES: ReadonlyArray<readonly [RegExp, number]> = [
+	[/\[1m\]|-1m\b/i, 1000000],
+	[/opus|sonnet|haiku|fable/i, 200000],
+];
+const EXPLORE_PLAN_NAMES: Readonly<Record<string, true>> = {explore: true, plan: true};
+
+export interface StartupFile {
+	readonly path: string;
+	readonly content: string;
+}
+
+export interface StartupSkill extends StartupFile {
+	readonly name: string;
+}
+
+export interface StartupMemory {
+	readonly scope: AgentMemoryScope;
+	readonly dir: string;
+	readonly path: string;
+	readonly content: string;
+	readonly lines: number;
+	readonly truncated: boolean;
+}
+
+export interface StartupBundle {
+	readonly systemPrompt: string;
+	readonly environmentText: string;
+	readonly task: string;
+	readonly claudeMd: StartupFile[];
+	readonly agentsMd: StartupFile[];
+	readonly gitStatus?: string;
+	readonly skills: StartupSkill[];
+	readonly roster?: string[];
+	readonly outputStyle?: string;
+	readonly memory?: StartupMemory;
+	readonly contextWindow: number;
+	/** A subagent never inherits the parent's auto memory. */
+	readonly parentMemory: false;
+	/** The rendered context the worker receives. */
+	readonly text: string;
+}
+
+/** The definition fields startup reads. Structural, so AgentDefinition fits. */
+export interface StartupDefinition {
+	readonly name?: string;
+	readonly systemPrompt?: string;
+	readonly skills?: readonly string[];
+	readonly memory?: AgentMemoryScope;
+	readonly omitClaudeMd?: boolean;
+	/** `managed` skips the managed policy, matching the spec's managed agents. */
+	readonly scope?: string;
+	readonly outputStyle?: string;
+}
+
+export interface StartupOptions {
+	readonly cwd: string;
+	readonly home: string;
+	readonly fs: SpoolFs;
+	readonly env?: Record<string, string | undefined>;
+	readonly definition?: StartupDefinition;
+	readonly agentType?: string;
+	readonly prompt?: string;
+	readonly model?: string;
+	readonly outputStyle?: string;
+	readonly roster?: readonly string[];
+	/** Files the agent works with; their subdirectory CLAUDE.md still loads. */
+	readonly paths?: readonly string[];
+	/** A snapshot already taken by the caller, or undefined for no snapshot. */
+	readonly gitStatus?: string;
+	readonly now?: number;
+	readonly platform?: string;
+}
+
+function readStartupFile(fs: SpoolFs, path: string): string | undefined {
+	try {
+		return fs.readFile(path);
+	} catch {
+		return undefined;
+	}
+}
+
+function startupFile(fs: SpoolFs, path: string): StartupFile | undefined {
+	const content = readStartupFile(fs, path);
+	return content === undefined ? undefined : {path, content};
+}
+
+// Project discovery walks up from the working directory and renders outermost
+// first, so broad instructions come before the nearest ones.
+function projectDirsUpward(cwd: string): string[] {
+	const dirs: string[] = [];
+	let current = cwd;
+	for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+		dirs.push(current);
+		const parent = dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return dirs.reverse();
+}
+
+// A path-scoped instruction file is loaded even when the hierarchy is omitted:
+// the agent is working with files in that directory, so the rule applies.
+function subdirectoryClaudeMd(fs: SpoolFs, cwd: string, paths: readonly string[]): StartupFile[] {
+	const seen = new Set<string>();
+	const files: StartupFile[] = [];
+	for (const path of paths) {
+		const absolute = isAbsolute(path) ? path : join(cwd, path);
+		let dir = dirname(absolute);
+		for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+			if (dir === cwd || dir === dirname(dir) || !dir.startsWith(cwd)) break;
+			const filePath = join(dir, 'CLAUDE.md');
+			if (seen.has(filePath)) break;
+			seen.add(filePath);
+			const file = startupFile(fs, filePath);
+			if (file !== undefined) files.push(file);
+			dir = dirname(dir);
+		}
+	}
+	return files;
+}
+
+export function claudeMdHierarchy(options: StartupOptions): {claudeMd: StartupFile[]; agentsMd: StartupFile[]} {
+	const env = options.env ?? {};
+	const fs = options.fs;
+	const definition = options.definition;
+	const agentType = (options.agentType ?? definition?.name ?? '').toLowerCase();
+	const claudeMd: StartupFile[] = [];
+	const agentsMd: StartupFile[] = [];
+	// Explore and Plan start without project instructions, but a path-scoped
+	// CLAUDE.md still loads because the agent works with files there.
+	const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
+	// Managed policy loads even under omitClaudeMd, except for a managed agent.
+	if (!skipHierarchy && definition?.scope !== 'managed') {
+		const managedPath =
+			env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join(options.home, '.commandcode', 'managed', 'CLAUDE.md');
+		const managed = startupFile(fs, managedPath);
+		if (managed !== undefined) claudeMd.push(managed);
+	}
+	if (!skipHierarchy && definition?.omitClaudeMd !== true) {
+		const user = startupFile(
+			fs,
+			env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join(options.home, '.commandcode', 'CLAUDE.md'),
+		);
+		if (user !== undefined) claudeMd.push(user);
+		for (const dir of projectDirsUpward(options.cwd)) {
+			const project = startupFile(fs, join(dir, 'CLAUDE.md'));
+			if (project !== undefined) claudeMd.push(project);
+			const local = startupFile(fs, join(dir, 'CLAUDE.local.md'));
+			if (local !== undefined) claudeMd.push(local);
+		}
+		// AGENTS.md is project instructions too, so it follows the same omit rule.
+		for (const dir of projectDirsUpward(options.cwd)) {
+			const agents = startupFile(fs, join(dir, 'AGENTS.md'));
+			if (agents !== undefined) agentsMd.push(agents);
+		}
+	}
+	claudeMd.push(...subdirectoryClaudeMd(fs, options.cwd, options.paths ?? []));
+	return {claudeMd, agentsMd};
+}
+
+export function skillFileFor(
+	name: string,
+	options: {cwd: string; home: string; fs: SpoolFs},
+): string | undefined {
+	if (name.length === 0) return undefined;
+	const candidates: string[] = [];
+	for (const dir of projectDirsUpward(options.cwd)) {
+		candidates.push(join(dir, '.commandcode', 'skills', name, 'SKILL.md'));
+		candidates.push(join(dir, '.claude', 'skills', name, 'SKILL.md'));
+	}
+	candidates.push(join(options.home, '.commandcode', 'skills', name, 'SKILL.md'));
+	candidates.push(join(options.home, '.claude', 'skills', name, 'SKILL.md'));
+	for (const candidate of candidates) {
+		if (readStartupFile(options.fs, candidate) !== undefined) return candidate;
+	}
+	return undefined;
+}
+
+export function memoryDirFor(scope: AgentMemoryScope, name: string, options: {cwd: string; home: string}): string {
+	const root =
+		scope === 'user'
+			? join(options.home, '.commandcode', 'agent-memory')
+			: scope === 'project'
+				? join(options.cwd, '.commandcode', 'agent-memory')
+				: join(options.cwd, '.commandcode', 'agent-memory-local');
+	return join(root, name);
+}
+
+// The first 200 lines or 25KB of MEMORY.md, whichever comes first. Bytes, not
+// UTF-16 code units: the bound is on what is injected into the context.
+export function readMemoryIndex(
+	path: string,
+	fs: SpoolFs,
+): {content: string; lines: number; truncated: boolean} {
+	let source: string;
+	try {
+		source = fs.readFile(path);
+	} catch {
+		return {content: '', lines: 0, truncated: false};
+	}
+	const allLines = source.split('\n');
+	// A trailing newline is not a line of content, so a 200-line file that ends
+	// with one is not reported as truncated.
+	if (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+	const lineBound = allLines.slice(0, MEMORY_INDEX_LINES_MAX).join('\n');
+	let content = lineBound;
+	let truncatedByBytes = false;
+	if (Buffer.byteLength(lineBound, 'utf8') > MEMORY_INDEX_BYTES_MAX) {
+		const buffer = Buffer.from(lineBound, 'utf8').subarray(0, MEMORY_INDEX_BYTES_MAX);
+		content = buffer.toString('utf8').replace(/\uFFFD$/, '');
+		truncatedByBytes = true;
+	}
+	const truncatedByLines = allLines.length > MEMORY_INDEX_LINES_MAX;
+	return {
+		content,
+		lines: content.length === 0 ? 0 : content.split('\n').length,
+		truncated: truncatedByLines || truncatedByBytes,
+	};
+}
+
+// MEMORY.md is the agent's own memory. The parent's auto memory never follows a
+// non-fork subagent, so this is the only memory that reaches the bundle.
+function startupMemory(options: StartupOptions): StartupMemory | undefined {
+	const scope = options.definition?.memory;
+	const name = options.definition?.name;
+	if (scope === undefined || name === undefined || name.length === 0) return undefined;
+	const dir = memoryDirFor(scope, name, {cwd: options.cwd, home: options.home});
+	try {
+		options.fs.mkdir(dir);
+	} catch {
+		// A read-only location must not fail the spawn: the agent still starts.
+	}
+	const path = join(dir, MEMORY_INDEX_FILE);
+	const index = readMemoryIndex(path, options.fs);
+	return {scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated};
+}
+
+export function contextWindowForModel(
+	model: string | undefined,
+	env: Record<string, string | undefined> = {},
+): number {
+	const override = Number(env.BETTER_SUBAGENTS_CONTEXT_WINDOW ?? env.CLAUDE_CODE_CONTEXT_WINDOW);
+	if (Number.isFinite(override) && override >= 1000) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
+	const value = (model ?? '').toLowerCase();
+	for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
+		if (pattern.test(value)) return window;
+	}
+	return CONTEXT_WINDOW_DEFAULT;
+}
+
+// A memory definition must be able to read and write its own MEMORY.md.
+export function withMemoryTools(
+	tools: readonly string[] | undefined,
+	memory: AgentMemoryScope | undefined,
+): string[] | undefined {
+	if (memory === undefined) return tools === undefined ? undefined : [...tools];
+	const result = tools === undefined ? [] : [...tools];
+	for (const tool of ['Read', 'Write', 'Edit']) if (!result.includes(tool)) result.push(tool);
+	return result;
+}
+
+export function gitStatusSnapshot(runtime: Pick<Runtime, 'run'>, cwd: string): string | undefined {
+	const run = runtime.run;
+	if (typeof run !== 'function') return undefined;
+	try {
+		const result = run('git', ['status', '--short', '--branch'], {cwd});
+		return result.ok ? result.stdout : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function trimGitStatus(status: string | undefined): string | undefined {
+	if (status === undefined) return undefined;
+	const text = status.replace(/\s+$/, '');
+	if (text.length === 0) return undefined;
+	return text.length > GIT_STATUS_MAX_CHARS ? `${text.slice(0, GIT_STATUS_MAX_CHARS)}\n(truncated)` : text;
+}
+
+function renderStartup(bundle: Omit<StartupBundle, 'text'>): string {
+	const sections: string[] = [bundle.environmentText];
+	if (bundle.claudeMd.length > 0) {
+		const files = bundle.claudeMd.map(file => `## ${file.path}\n${file.content}`);
+		sections.push(['# Project instructions (CLAUDE.md)', ...files].join('\n\n'));
+	}
+	if (bundle.agentsMd.length > 0) {
+		const files = bundle.agentsMd.map(file => `## ${file.path}\n${file.content}`);
+		sections.push(['# AGENTS.md', ...files].join('\n\n'));
+	}
+	if (bundle.gitStatus !== undefined) sections.push(`# Git status\n${bundle.gitStatus}`);
+	if (bundle.skills.length > 0) {
+		const skills = bundle.skills.map(skill => `## ${skill.name} (${skill.path})\n${skill.content}`);
+		sections.push(['# Skills (full content)', ...skills].join('\n\n'));
+	}
+	if (bundle.roster !== undefined && bundle.roster.length > 0) {
+		sections.push(`# Sibling agents\n${bundle.roster.map(name => `- ${name}`).join('\n')}`);
+	}
+	if (bundle.outputStyle !== undefined) sections.push(`# Output style\n${bundle.outputStyle}`);
+	if (bundle.memory !== undefined) {
+		const bound = bundle.memory.truncated ? ' (truncated to the first 200 lines or 25KB)' : '';
+		sections.push(`# Agent memory\n${bundle.memory.path}${bound}\n${bundle.memory.content}`);
+	}
+	return sections.join('\n\n');
+}
+
+export function buildStartupBundle(options: StartupOptions): StartupBundle {
+	const env = options.env ?? {};
+	const definition = options.definition;
+	const agentType = (options.agentType ?? definition?.name ?? '').toLowerCase();
+	const contextWindow = contextWindowForModel(options.model, env);
+	const {claudeMd, agentsMd} = claudeMdHierarchy(options);
+	// Explore and Plan skip the git status snapshot along with the instructions.
+	const gitStatus = EXPLORE_PLAN_NAMES[agentType] === true ? undefined : trimGitStatus(options.gitStatus);
+	// The full content of every named skill; an unlisted skill stays invocable
+	// through the Skill tool and is not preloaded here.
+	const skills: StartupSkill[] = [];
+	for (const name of definition?.skills ?? []) {
+		const path = skillFileFor(name, options);
+		const content = path === undefined ? undefined : readStartupFile(options.fs, path);
+		if (path !== undefined && content !== undefined) skills.push({name, path, content});
+	}
+	const roster = options.roster === undefined ? undefined : [...options.roster];
+	const outputStyle = options.outputStyle ?? definition?.outputStyle;
+	const memory = startupMemory(options);
+	const date = new Date(options.now ?? Date.now()).toISOString().slice(0, 10);
+	const environment = [
+		'# Environment',
+		`working directory: ${options.cwd}`,
+		`platform: ${options.platform ?? 'unknown'}`,
+		`date: ${date}`,
+	];
+	if (options.model !== undefined) environment.push(`model: ${options.model}`);
+	environment.push(`context window: ${contextWindow} tokens`);
+	const base: Omit<StartupBundle, 'text'> = {
+		systemPrompt: definition?.systemPrompt ?? '',
+		environmentText: environment.join('\n'),
+		task: options.prompt ?? '',
+		claudeMd,
+		agentsMd,
+		...(gitStatus !== undefined ? {gitStatus} : {}),
+		skills,
+		...(roster !== undefined ? {roster} : {}),
+		...(outputStyle !== undefined ? {outputStyle} : {}),
+		...(memory !== undefined ? {memory} : {}),
+		contextWindow,
+		parentMemory: false,
+	};
+	return {...base, text: renderStartup(base)};
 }
 
 // ---------------------------------------------------------------------------
@@ -1356,10 +2240,15 @@ export interface WorkerSpecInput {
 	tailMax: number;
 	bin: string;
 	sessionId?: string;
+	/** This job's nesting level: the caller's depth plus one. */
+	depth?: number;
 	agentType?: string;
 	systemPrompt?: string;
 	model?: string;
 	effort?: string;
+	/** The resolved tool capabilities; the worker logs them and never widens them. */
+	tools?: string[];
+	disallowedTools?: string[];
 	permissionMode?: string;
 	maxTurns?: number;
 	timeoutMs?: number;
@@ -1384,6 +2273,8 @@ export interface WorkerSpecInput {
 	controlPollMs?: number;
 	/** Resolved by the caller; false means foreground. */
 	background?: boolean;
+	/** The rendered startup bundle: CLAUDE.md, git status, skills, memory, roster. */
+	startup?: string;
 }
 
 export interface WorkerSpec extends WorkerSpecInput {
@@ -1402,6 +2293,383 @@ export function buildSpec(input: WorkerSpecInput, modPath: string): WorkerSpec {
 	const spec: WorkerSpec = {...input, args: []};
 	spec.args = buildArgs(spec, modPath);
 	return spec;
+}
+
+// ---------------------------------------------------------------------------
+// Tool access, model, and effort resolution
+//
+// Resolution happens once, in the parent, before a worker is spawned: the worker
+// spec carries the result, so two jobs built from the same definition cannot
+// disagree. The functions are pure and exported, because each branch below is a
+// documented Claude Code rule and is tested directly.
+//
+// `available` is the tool pool a subagent inherits. The host does not expose its
+// tool list through the mod API, so the built-in part is the documented set; MCP
+// servers are read from the same config files the host reads.
+// ---------------------------------------------------------------------------
+
+export const SUBAGENT_TOOL_UNIVERSE: string[] = [
+	'Agent',
+	'Artifact',
+	'AskUserQuestion',
+	'Bash',
+	'Edit',
+	'EndConversation',
+	'EnterPlanMode',
+	'EnterWorktree',
+	'ExitPlanMode',
+	'ExitWorktree',
+	'Glob',
+	'Grep',
+	'LSP',
+	'ListAgents',
+	'Monitor',
+	'NotebookEdit',
+	'PowerShell',
+	'Read',
+	'ScheduleWakeup',
+	'SendMessage',
+	'Skill',
+	'SubagentHandback',
+	'TaskStop',
+	'TodoWrite',
+	'ToolSearch',
+	'WaitForMcpServers',
+	'WebFetch',
+	'WebSearch',
+	'Workflow',
+	'Write',
+];
+
+// Filter one: removed from every subagent, even when the definition lists them.
+// `ExitPlanMode` is handled separately because plan mode keeps it; `Agent` stays
+// listed and reports the depth error itself.
+export const UNIVERSAL_TOOL_REMOVALS: string[] = [
+	'AskUserQuestion',
+	'EndConversation',
+	'EnterPlanMode',
+	'ScheduleWakeup',
+	'WaitForMcpServers',
+	'Workflow',
+];
+
+// Filter two: the built-in tools a background subagent keeps. Every MCP tool is
+// kept regardless; `ListAgents` is deliberately absent, so it is foreground-only.
+// Teammates on a team additionally keep the task and cron tools (phase 15).
+export const BACKGROUND_BUILTIN_TOOLS: string[] = [
+	'Read',
+	'Grep',
+	'Glob',
+	'LSP',
+	'Bash',
+	'PowerShell',
+	'Edit',
+	'Write',
+	'NotebookEdit',
+	'WebFetch',
+	'WebSearch',
+	'TodoWrite',
+	'Skill',
+	'ToolSearch',
+	'EnterWorktree',
+	'ExitWorktree',
+	'Monitor',
+	'TaskStop',
+	'SendMessage',
+	'Artifact',
+	'SubagentHandback',
+];
+
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+
+const MCP_PREFIX = 'mcp__';
+
+function unique(values: string[]): string[] {
+	const out: string[] = [];
+	for (const value of values) if (!out.includes(value)) out.push(value);
+	return out;
+}
+
+const isMcpTool = (name: string): boolean => name.startsWith(MCP_PREFIX);
+
+// `Bash(git push *)` names a tool plus a constraint; the whole tool is removed.
+// `mcp__server__*` stays whole because the wildcard is a server, not a tool name.
+export function toolNameOfSpecifier(specifier: string): string {
+	const text = String(specifier ?? '').trim();
+	const open = text.indexOf('(');
+	return (open >= 0 ? text.slice(0, open) : text).trim();
+}
+
+function mcpCapability(server: string): string {
+	return `${MCP_PREFIX}${server}__*`;
+}
+
+function mcpParts(name: string): {server: string; tool?: string} {
+	const rest = name.startsWith(MCP_PREFIX) ? name.slice(MCP_PREFIX.length) : name;
+	const separator = rest.indexOf('__');
+	if (separator < 0) return {server: rest};
+	return {server: rest.slice(0, separator), tool: rest.slice(separator + 2)};
+}
+
+// One specifier -> the concrete capabilities it selects out of the inherited pool.
+// An empty result means the specifier resolved to nothing.
+function expandSpecifier(specifier: string, available: string[], mcpServers: string[]): string[] {
+	const name = toolNameOfSpecifier(specifier);
+	if (name.length === 0) return [];
+	const capabilities = mcpServers.map(mcpCapability);
+	if (name === '*') return [...available, ...capabilities];
+	if (name === `${MCP_PREFIX}*`) return capabilities;
+	if (isMcpTool(name)) {
+		const {server, tool} = mcpParts(name);
+		if (!mcpServers.includes(server)) return [];
+		if (tool === undefined || tool === '*') return [mcpCapability(server)];
+		return [`${MCP_PREFIX}${server}__${tool}`];
+	}
+	return available.includes(name) ? [name] : [];
+}
+
+function withheldBy(specifier: string, capability: string): boolean {
+	const name = toolNameOfSpecifier(specifier);
+	if (name.length === 0) return false;
+	if (name === '*') return true;
+	if (name === `${MCP_PREFIX}*`) return isMcpTool(capability);
+	if (isMcpTool(name)) {
+		if (!isMcpTool(capability)) return false;
+		const wanted = mcpParts(name);
+		const actual = mcpParts(capability);
+		if (wanted.server !== actual.server) return false;
+		if (wanted.tool === undefined || wanted.tool === '*') return true;
+		return actual.tool === wanted.tool;
+	}
+	return capability === name;
+}
+
+export interface ToolFilterInput {
+	/** The inherited tool pool. Defaults to the documented built-in universe. */
+	available?: string[];
+	/** Configured MCP server names; each contributes `mcp__<server>__*`. */
+	mcpServers?: string[];
+	/** A `tools` list. Omitted means inherit. */
+	tools?: string[];
+	/** A `disallowedTools` list. It wins over `tools`. */
+	disallowedTools?: string[];
+	/** `plan` keeps `ExitPlanMode`; every other mode removes it. */
+	permissionMode?: string;
+	/** A background agent keeps every MCP tool and only the allowlisted built-ins. */
+	background?: boolean;
+}
+
+export type ToolFilterResult =
+	| {ok: true; tools: string[]; removed: string[]}
+	| {ok: false; error: string};
+
+export function filterTools(input: ToolFilterInput = {}): ToolFilterResult {
+	const available = unique(input.available ?? SUBAGENT_TOOL_UNIVERSE);
+	const mcpServers = unique(input.mcpServers ?? []);
+	const requested = input.tools === undefined || input.tools.length === 0 ? undefined : input.tools;
+
+	let selected: string[];
+	if (requested === undefined) {
+		// Inherit every tool available to subagents, including every MCP server.
+		selected = [...available, ...mcpServers.map(mcpCapability)];
+	} else {
+		selected = [];
+		for (const specifier of requested) selected.push(...expandSpecifier(specifier, available, mcpServers));
+		selected = unique(selected);
+	}
+
+	for (const specifier of input.disallowedTools ?? []) {
+		selected = selected.filter(capability => !withheldBy(specifier, capability));
+	}
+
+	const removed: string[] = [];
+	const kept = selected.filter(capability => {
+		if (isMcpTool(capability)) return true;
+		if (UNIVERSAL_TOOL_REMOVALS.includes(capability)) {
+			removed.push(capability);
+			return false;
+		}
+		if (capability === 'ExitPlanMode' && input.permissionMode !== 'plan') {
+			removed.push(capability);
+			return false;
+		}
+		if (input.background === true && !BACKGROUND_BUILTIN_TOOLS.includes(capability)) {
+			removed.push(capability);
+			return false;
+		}
+		return true;
+	});
+
+	if (requested !== undefined && kept.length === 0) {
+		// Name the entries, not the derived names: the author must be able to find the
+		// line in the definition.
+		return {ok: false, error: `tools list resolved to no available tool: ${requested.join(', ')}`};
+	}
+	return {ok: true, tools: kept, removed};
+}
+
+function nonEmpty(value: unknown): string | undefined {
+	return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+export type ModelSource = 'parameter' | 'definition' | 'environment' | 'main' | 'inherit' | 'forced';
+
+export interface ModelResolutionInput {
+	/** The per-invocation `model` parameter. */
+	requested?: string;
+	/** The definition's `model` frontmatter. */
+	definition?: string;
+	env?: Record<string, string | undefined>;
+	/** The main conversation's model; absent means the child inherits its default. */
+	main?: string;
+}
+
+export interface ModelResolution {
+	model: string | undefined;
+	source: ModelSource;
+}
+
+// Parameter, frontmatter, environment, main. `inherit` (either place) selects the
+// main model outright, so it outranks the environment default. FORCE makes the
+// environment value win over the parameter and the frontmatter.
+export function resolveModel(input: ModelResolutionInput = {}): ModelResolution {
+	const env = input.env ?? {};
+	const envModel =
+		nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
+	const forced =
+		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === '1' ||
+		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === 'true' ||
+		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === '1' ||
+		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === 'true';
+	const main = nonEmpty(input.main);
+	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
+
+	const requested = nonEmpty(input.requested);
+	if (requested === 'inherit') return {model: main, source: 'inherit'};
+	if (requested !== undefined) return {model: requested, source: 'parameter'};
+
+	const definition = nonEmpty(input.definition);
+	if (definition === 'inherit') return {model: main, source: 'inherit'};
+	if (definition !== undefined) return {model: definition, source: 'definition'};
+
+	if (envModel !== undefined) return {model: envModel, source: 'environment'};
+	return {model: main, source: 'main'};
+}
+
+export type EffortSource = 'parameter' | 'definition' | 'environment' | 'none';
+
+export interface EffortResolutionInput {
+	/** The per-invocation `effort` parameter. */
+	requested?: string;
+	/** The definition's `effort` frontmatter. */
+	definition?: string;
+	env?: Record<string, string | undefined>;
+}
+
+export interface EffortResolution {
+	effort: string | undefined;
+	source: EffortSource;
+}
+
+function effortLevel(value: unknown): string | undefined {
+	const level = nonEmpty(value)?.toLowerCase();
+	return level !== undefined && (EFFORT_LEVELS as readonly string[]).includes(level) ? level : undefined;
+}
+
+// Per-invocation, frontmatter, environment. There is no effort inheritance from the
+// main conversation: the runtime default applies when nothing is set.
+export function resolveEffort(input: EffortResolutionInput = {}): EffortResolution {
+	const env = input.env ?? {};
+	const requested = effortLevel(input.requested);
+	if (requested !== undefined) return {effort: requested, source: 'parameter'};
+	const definition = effortLevel(input.definition);
+	if (definition !== undefined) return {effort: definition, source: 'definition'};
+	const fromEnv =
+		effortLevel(env.BETTER_SUBAGENTS_EFFORT_LEVEL) ?? effortLevel(env.CLAUDE_CODE_EFFORT_LEVEL);
+	if (fromEnv !== undefined) return {effort: fromEnv, source: 'environment'};
+	return {effort: undefined, source: 'none'};
+}
+
+export interface LaunchResolutionInput {
+	requestedModel?: string;
+	definitionModel?: string;
+	requestedEffort?: string;
+	definitionEffort?: string;
+	env?: Record<string, string | undefined>;
+	mainModel?: string;
+	tools?: string[];
+	disallowedTools?: string[];
+	permissionMode?: string;
+	background?: boolean;
+	availableTools?: string[];
+	mcpServers?: string[];
+}
+
+export type LaunchResolution =
+	| {
+			ok: true;
+			model: string | undefined;
+			modelSource: ModelSource;
+			effort: string | undefined;
+			effortSource: EffortSource;
+			tools: string[];
+			removed: string[];
+	  }
+	| {ok: false; error: string};
+
+// The one spawn-time resolution: tools, model, and effort from the same inputs, so
+// the spec and the record cannot disagree about what was resolved.
+export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResolution {
+	const tools = filterTools({
+		...(input.availableTools !== undefined ? {available: input.availableTools} : {}),
+		...(input.mcpServers !== undefined ? {mcpServers: input.mcpServers} : {}),
+		...(input.tools !== undefined ? {tools: input.tools} : {}),
+		...(input.disallowedTools !== undefined ? {disallowedTools: input.disallowedTools} : {}),
+		...(input.permissionMode !== undefined ? {permissionMode: input.permissionMode} : {}),
+		...(input.background !== undefined ? {background: input.background} : {}),
+	});
+	if (!tools.ok) return tools;
+	const model = resolveModel({
+		...(input.requestedModel !== undefined ? {requested: input.requestedModel} : {}),
+		...(input.definitionModel !== undefined ? {definition: input.definitionModel} : {}),
+		...(input.env !== undefined ? {env: input.env} : {}),
+		...(input.mainModel !== undefined ? {main: input.mainModel} : {}),
+	});
+	const effort = resolveEffort({
+		...(input.requestedEffort !== undefined ? {requested: input.requestedEffort} : {}),
+		...(input.definitionEffort !== undefined ? {definition: input.definitionEffort} : {}),
+		...(input.env !== undefined ? {env: input.env} : {}),
+	});
+	return {
+		ok: true,
+		model: model.model,
+		modelSource: model.source,
+		effort: effort.effort,
+		effortSource: effort.source,
+		tools: tools.tools,
+		removed: tools.removed,
+	};
+}
+
+// MCP server names come from the host's config files. Discovery is best-effort: a
+// missing or malformed file means "no MCP tools known", never a session error.
+export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
+	const names: string[] = [];
+	for (const dir of dirs.slice(0, 4)) {
+		if (typeof dir !== 'string' || dir.length === 0) continue;
+		try {
+			const parsed = JSON.parse(fs.readFile(join(dir, '.commandcode', 'mcp.json'))) as {
+				mcpServers?: Record<string, {enabled?: boolean} | undefined>;
+			};
+			for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
+				if (name.length === 0 || config?.enabled === false) continue;
+				if (!names.includes(name)) names.push(name);
+			}
+		} catch {
+			/* no MCP config here */
+		}
+	}
+	return names;
 }
 
 // The identity a job record and its signal share. Declared once, so the two
@@ -1424,12 +2692,18 @@ interface Signal extends JobIdentity {
 	readonly exitCode?: number | null;
 	readonly title?: string;
 	readonly body?: string;
+	/** The report was scanned before it could reach the parent. */
+	readonly scanned?: boolean;
+	readonly scanMatches?: string[];
 }
 
 interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
 	cwd?: string;
+	/** This job's nesting level, and the job that spawned it. */
+	depth?: number;
+	parentJobId?: string;
 	agentType?: string;
 	/** The addressable name from the spawn; absent for an anonymous agent. */
 	name?: string;
@@ -1437,6 +2711,8 @@ interface JobRecord extends JobIdentity {
 	 *  own end-of-turn signal is suppressed. */
 	handbackAt?: number;
 	model?: string;
+	tools?: string[];
+	color?: string;
 	maxTurns?: number;
 	timeoutMs?: number;
 	sessionName?: string;
@@ -1454,6 +2730,8 @@ interface JobRecord extends JobIdentity {
 	failureReason?: string;
 	canceledAt?: number;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // The record write a signal implies.
@@ -1464,6 +2742,8 @@ interface JobPatch {
 	durationMs?: number;
 	failureReason?: string;
 	awaitingInput?: boolean;
+	scanned?: boolean;
+	scanMatches?: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,7 +2866,16 @@ export const jobStates = {
 
 function signalOf(
 	record: JobRecord,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	return signalEnvelope(record, {...result, state: canonicalState(result.state)});
 }
@@ -1596,7 +2885,16 @@ function signalOf(
 // a signal with different fields. Keep the body plain JS and self-contained.
 export function signalEnvelope(
 	record: JobIdentity,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		scanned?: boolean;
+		scanMatches?: string[];
+	},
 ): Signal {
 	const label = String(record.label ?? record.id);
 	const state = String(result.state);
@@ -1614,6 +2912,10 @@ export function signalEnvelope(
 		sessionId: record.sessionId,
 		title: result.title ?? `${label} ${state}`,
 		body: result.body,
+		// Omitted when the writer did not scan, so a legacy signal keeps its shape.
+		...(result.scanned === undefined
+			? {}
+			: {scanned: result.scanned === true, scanMatches: result.scanMatches ?? []}),
 	};
 }
 
@@ -1641,6 +2943,10 @@ function patchOf(signal: Signal): JobPatch {
 		patch.state = state;
 		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
 		if (state === 'waiting-input') patch.awaitingInput = true;
+	}
+	if (signal.scanned !== undefined) {
+		patch.scanned = signal.scanned;
+		patch.scanMatches = signal.scanMatches ?? [];
 	}
 	return patch;
 }
@@ -1740,6 +3046,93 @@ function createLedger(deps: LedgerDeps): Ledger {
 // Exported for the tests, which prove the guard survives retention and a restart.
 export const ledgerFactory = createLedger;
 
+// ---------------------------------------------------------------------------
+// Limits and the shared TTL sweeper
+//
+// Two limits bound a session: how many jobs may run at once and how deep
+// subagents may nest. Both are resolved from the environment in one place, with
+// the Claude Code spelling accepted as an alias. The spawn guard lives in fire(),
+// so a refused spawn writes no record and emits no signal.
+// ---------------------------------------------------------------------------
+
+export type LimitEnv = Record<string, string | undefined>;
+
+function positiveInt(raw: string | undefined, fallback: number): number {
+	const value = Number(raw);
+	return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+
+export function resolveMaxConcurrent(env: LimitEnv): number {
+	return positiveInt(env[MAX_CONCURRENT_ENV] || env[MAX_CONCURRENT_ENV_ALIAS], MAX_CONCURRENT_DEFAULT);
+}
+
+export function resolveMaxDepth(env: LimitEnv): number {
+	return positiveInt(env[MAX_DEPTH_ENV] || env[MAX_DEPTH_ENV_ALIAS], MAX_DEPTH_DEFAULT);
+}
+
+// A session's nesting depth: 0 for the main conversation, the job's own depth for
+// a worker (the spec is the worker's environment).
+function depthOf(spec: WorkerSpec | undefined): number {
+	const depth = Number(spec?.depth);
+	return Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
+}
+
+// The environment for a worker: the caller's env minus every worker marker, then
+// this job's spec and flag. A nested spawn therefore cannot inherit the parent
+// spec or a stale worker flag.
+export function workerEnv(
+	parent: Record<string, string | undefined>,
+	spec: WorkerSpec,
+): Record<string, string | undefined> {
+	const env = {...parent};
+	delete env[WORKER_SPEC_ENV];
+	delete env[WORKER_ENV];
+	delete env.PUBSUB_WORKER;
+	env[WORKER_SPEC_ENV] = JSON.stringify(spec);
+	env[WORKER_ENV] = '1';
+	return env;
+}
+
+// One TTL sweeper for every directory the spool grows: claimed/orphaned signals,
+// job records, logs and worktrees. `expired` covers entries whose age lives in
+// their contents (a job record's finishedAt); `ttlMs` covers the rest.
+export interface SweepIo {
+	readdir(dir: string): string[];
+	stat(file: string): {mtimeMs: number};
+	remove(file: string): void;
+}
+
+export interface SweepOptions {
+	ttlMs?: number;
+	expired?: (name: string) => boolean;
+	/** Keep an entry even when it is past the TTL (a live job owns its log). */
+	skip?: (name: string) => boolean;
+}
+
+export function sweepExpiredEntries(io: SweepIo, dir: string, now: number, options: SweepOptions = {}): string[] {
+	let names: string[];
+	try {
+		names = io.readdir(dir);
+	} catch {
+		return [];
+	}
+	const removed: string[] = [];
+	for (const name of names) {
+		const file = join(dir, name);
+		try {
+			if (options.skip?.(name) === true) continue;
+			const expired = options.expired?.(name) === true;
+			const old = options.ttlMs !== undefined && now - io.stat(file).mtimeMs > options.ttlMs;
+			if (!expired && !old) continue;
+			io.remove(file);
+			removed.push(name);
+		} catch {
+			/* another process won it */
+		}
+	}
+	return removed;
+}
+
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
 	// Below this line the spool is touched only through the injected filesystem.
@@ -1766,6 +3159,27 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		default: 'steer',
 		description: 'Deprecated alias for subagent_deliver.',
 	});
+	cmd.addFlag('managed_dir', {
+		type: 'string',
+		default: MANAGED_SETTINGS_DEFAULT,
+		description: 'Managed settings directory; agents/ under it wins every other scope.',
+	});
+	cmd.addFlag(CLI_AGENTS_OPTION, {
+		type: 'string',
+		default: '',
+		description:
+			'Session-only agent definitions as inline JSON, or a JSON file path in a non-interactive session (--mod-option agents=...).',
+	});
+	cmd.addFlag(ADD_DIRS_OPTION, {
+		type: 'string',
+		default: '',
+		description: 'Comma-separated extra directories; .commandcode/agents/ under each is project scope (--add-dir).',
+	});
+	cmd.addFlag(PLUGIN_DIRS_OPTION, {
+		type: 'string',
+		default: '',
+		description: 'Comma-separated plugin roots; every child directory with an agents/ dir is a plugin.',
+	});
 
 	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
 	// A flag still sitting on its default is not an override; anything else is.
@@ -1776,6 +3190,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (old.length > 0 && old !== legacyDefault) return old;
 		return value.length > 0 ? value : legacyDefault;
 	};
+	const splitFlag = (name: string): string[] =>
+		readFlag(name)
+			.split(',')
+			.map(value => value.trim())
+			.filter(value => value.length > 0);
 	const root = pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT);
 	const inboxDir = join(root, 'inbox');
 	const claimedDir = join(root, 'claimed');
@@ -1802,6 +3221,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		cwd: runtime.cwd,
 		home: runtime.home,
 		builtins: builtinAgentDefinitions(runtime.env),
+		managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+		addDirs: splitFlag(ADD_DIRS_OPTION),
+		pluginRoots: splitFlag(PLUGIN_DIRS_OPTION),
+		cli: {value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true},
 		log: message => {
 			try {
 				spool.appendFile(join(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}\n`);
@@ -1852,6 +3275,45 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			ok: false,
 			error: `unknown subagent_type "${name}"${available.length > 0 ? `; available: ${available}` : ''}`,
 		};
+	}
+
+	// The worker's system prompt: the definition body, the rendered sibling roster
+	// (supplied by the live session), then the startup bundle. The parent builds
+	// all three, so the hook is registered only in worker mode and only when there
+	// is something to append.
+	function workerSystemPrompt(): string {
+		const roster = (workerSpec as {roster?: unknown} | undefined)?.roster;
+		const parts = [
+			typeof workerSpec?.systemPrompt === 'string' ? workerSpec.systemPrompt : '',
+			typeof roster === 'string' ? roster : '',
+			typeof workerSpec?.startup === 'string' ? workerSpec.startup : '',
+		].filter(part => part.length > 0);
+		return parts.join('\n\n');
+	}
+
+	// The startup bundle for one agent job, built from the same definition the
+	// worker receives. It is rendered in the parent from the injected filesystem.
+	// The roster is supplied by the live session (T9); a subagent never inherits
+	// the parent's auto memory, only its own MEMORY.md.
+	function startupFor(
+		definition: AgentDefinition | undefined,
+		cwd: string,
+		prompt: string | undefined,
+		model: string | undefined,
+	): string | undefined {
+		if (definition === undefined || prompt === undefined) return undefined;
+		return buildStartupBundle({
+			cwd,
+			home: runtime.home,
+			env: runtime.env,
+			fs: runtime.fs,
+			definition,
+			agentType: definition.name,
+			prompt,
+			model,
+			gitStatus: gitStatusSnapshot(runtime, cwd),
+			now: runtime.now(),
+		}).text;
 	}
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
@@ -2295,45 +3757,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
 	// that died between claim and remove so a long-lived spool cannot grow forever.
 	function sweepClaimed(): void {
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(claimedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(claimedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > CLAIMED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another drain won it */
-			}
-		}
+		sweepExpiredEntries(spool, claimedDir, runtime.now(), {ttlMs: CLAIMED_TTL_MS});
 	}
 
 	function sweepOrphaned(): void {
 		if (workerMode) return;
-		const now = runtime.now();
-		let names: string[];
-		try {
-			names = spool.readdir(orphanedDir);
-		} catch {
-			return;
-		}
-		for (const name of names) {
-			const file = join(orphanedDir, name);
-			try {
-				if (now - spool.stat(file).mtimeMs > ORPHANED_TTL_MS) spool.remove(file);
-			} catch {
-				/* another process won it */
-			}
-		}
+		sweepExpiredEntries(spool, orphanedDir, runtime.now(), {ttlMs: ORPHANED_TTL_MS});
 	}
 
-	// Retention. A finished job keeps its record and its log for RETENTION_DAYS_DEFAULT
-	// (or BETTER_SUBAGENTS_RETENTION_DAYS), so `subagent_output` still works on a job
-	// from last week. A running job is never swept, however old its record is.
+	// Retention. A finished job keeps its record, its log and its worktree for
+	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS), so
+	// `subagent_output` still works on a job from last week. A running job is never
+	// swept, however old its record is.
 	function retentionMs(): number {
 		const days = Number(runtime.env[RETENTION_ENV]);
 		const value = Number.isFinite(days) && days > 0 ? days : RETENTION_DAYS_DEFAULT;
@@ -2342,23 +3777,51 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	function sweepExpired(): void {
 		if (workerMode) return;
-		const cutoff = runtime.now() - retentionMs();
-		for (const job of readRecentJobs(RECORD_SWEEP_MAX)) {
-			const state = normalizeState(job.state);
-			if (state === undefined || !isTerminal(state)) continue;
-			const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
-			if (settledAt === 0 || settledAt > cutoff) continue;
+		const now = runtime.now();
+		const ttlMs = retentionMs();
+		const cutoff = now - ttlMs;
+		const expired: string[] = [];
+		// A record's age lives in its timestamps, not its mtime: one sweeper, but the
+		// predicate decides. A running job is never expired.
+		sweepExpiredEntries(spool, jobsDir, now, {
+			expired: name => {
+				if (!name.endsWith('.json') || name.includes('.tmp-')) return false;
+				try {
+					const job = JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord;
+					const state = normalizeState(job.state);
+					if (state === undefined || !isTerminal(state)) return false;
+					const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
+					if (settledAt === 0 || settledAt > cutoff) return false;
+					if (typeof job.id === 'string' && job.id.length > 0) expired.push(job.id);
+					return true;
+				} catch {
+					return false;
+				}
+			},
+		});
+		for (const id of expired) {
 			try {
-				spool.remove(join(jobsDir, `${job.id}.json`));
-			} catch {
-				/* another process won it */
-			}
-			try {
-				spool.remove(join(logsDir, `${job.id}.log`));
+				spool.remove(join(logsDir, `${id}.log`));
 			} catch {
 				/* the log is already gone */
 			}
+			try {
+				spool.remove(join(worktreesDir, id));
+			} catch {
+				/* the worktree is already gone */
+			}
 		}
+		// An abandoned log or worktree with no live record is bounded by the same TTL.
+		sweepExpiredEntries(spool, logsDir, now, {
+			ttlMs,
+			skip: name => {
+				const job = readJob(name.replace(/\.log$/, ''));
+				if (job === undefined) return false;
+				const state = normalizeState(job.state);
+				return state === undefined || !isTerminal(state);
+			},
+		});
+		sweepExpiredEntries(spool, worktreesDir, now, {ttlMs});
 	}
 
 	function hasPendingSignal(id: string): boolean {
@@ -2489,6 +3952,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						: '';
 			const duration = elapsed.length > 0 ? ` ${elapsed}` : '';
 			const model = typeof job.model === 'string' && job.model.length > 0 ? ` · ${job.model}` : '';
+			const effort = typeof job.effort === 'string' && job.effort.length > 0 ? ` · effort=${job.effort}` : '';
+			const color = typeof job.color === 'string' && job.color.length > 0 ? ` · color=${job.color}` : '';
 			const owner = typeof job.owner === 'string' && job.owner.length > 0 ? ` · ${job.owner.slice(-6)}` : '';
 			const unread = isTerminalState(state) && job.deliveredAt === undefined ? ' · unread' : '';
 			// The type is the resolved definition name (canonical `subagent_type`); the
@@ -2499,7 +3964,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					: job.kind === 'agent'
 						? ' · subagent_type=general-purpose'
 						: '';
-			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${agentType}${model}${owner}${unread}`;
+			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${agentType}${model}${effort}${color}${owner}${unread}`;
 		});
 		const orphanNote = orphaned > 0 ? ` ${orphaned} orphaned signal(s) quarantined.` : '';
 		const filterNote = wanted === undefined ? '' : ` matching ${wanted}`;
@@ -2587,11 +4052,20 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly cwd: string;
 		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
-		/** the definition body, delivered as the worker's system prompt */
+		/** This job's nesting level, and the job that spawned it. */
+		readonly depth?: number;
+		readonly parentJobId?: string;
+		/** The definition body, delivered as the worker's system prompt */
 		readonly systemPrompt?: string;
+		/** The rendered startup bundle: instructions, git status, skills, memory */
+		readonly startup?: string;
 		readonly model?: string;
 		readonly maxTurns?: number;
 		readonly effort?: string;
+		/** The resolved tool capabilities for an agent job. */
+		readonly tools?: string[];
+		readonly disallowedTools?: string[];
+		readonly color?: string;
 		readonly permissionMode?: string;
 		readonly isolation?: string;
 		/** SIGTERM then SIGKILL after this long; 0 or absent means no timeout */
@@ -2651,6 +4125,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startedAt,
 			sessionId,
 			updatedAt: startedAt,
+			...(intent.depth !== undefined ? {depth: intent.depth} : {}),
+			...(intent.parentJobId !== undefined ? {parentJobId: intent.parentJobId} : {}),
 			...(isAgent
 				? {
 						agentType: intent.agentType ?? 'general-purpose',
@@ -2659,6 +4135,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					}
 				: {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
+			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+			...(intent.color !== undefined ? {color: intent.color} : {}),
 			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 			...(intent.effort !== undefined ? {effort: intent.effort} : {}),
 			...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
@@ -2677,7 +4155,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				cwd: spec.cwd,
 				detached: true,
 				stdio: 'ignore',
-				env: {...runtime.env, [WORKER_SPEC_ENV]: JSON.stringify(spec), [WORKER_ENV]: '1'},
+				env: workerEnv(runtime.env, spec),
 			});
 		} catch (error) {
 			const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
@@ -2708,12 +4186,53 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return {ok: true, id, pid: worker.pid};
 	}
 
+	// The pool is per session: only this session's queued and running jobs occupy
+	// slots. Records are the source of truth, so a cancel in another process frees
+	// one, and a job waiting for input has no worker process to count.
+	function activeJobCount(): number {
+		const owner = ownerId();
+		let count = 0;
+		for (const job of readRecentJobs(ACTIVE_JOB_SCAN_MAX)) {
+			if (job.owner !== owner) continue;
+			const state = normalizeState(job.state);
+			if (state !== undefined && state !== 'queued' && state !== 'running') continue;
+			count += 1;
+		}
+		return count;
+	}
+
 	function fire(intent: JobIntent): Launch {
+		// Both limits are checked before a record exists, so a refused spawn leaves no
+		// job behind and emits no signal.
+		const depth = depthOf(workerSpec) + 1;
+		if (intent.prompt !== undefined) {
+			const maxDepth = resolveMaxDepth(runtime.env);
+			if (depth > maxDepth) {
+				return {
+					ok: false,
+					error: `Subagent nesting depth limit reached (${maxDepth}). This subagent cannot spawn children; do not retry.`,
+				};
+			}
+		}
+		const maxConcurrent = resolveMaxConcurrent(runtime.env);
+		if (activeJobCount() >= maxConcurrent) {
+			return {
+				ok: false,
+				error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`,
+			};
+		}
+
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
 		const owner = intent.owner ?? ownerId();
-		const record = makeRecord(intent, id, logPath, startedAt, owner);
+		const record = makeRecord(
+			{...intent, depth, ...(workerSpec?.id !== undefined ? {parentJobId: workerSpec.id} : {})},
+			id,
+			logPath,
+			startedAt,
+			owner,
+		);
 		writeJob(record);
 		try {
 			cmd.session?.appendCustomEntry({
@@ -2750,9 +4269,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
 				...(intent.name !== undefined ? {name: intent.name} : {}),
+				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
+				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
+				...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+				...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
 				...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 				...(intent.effort !== undefined ? {effort: intent.effort} : {}),
 				...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
@@ -2792,10 +4315,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				for (const job of jobCache.slice(0, PANE_ROWS_MAX)) {
 					const state = canonicalState(job.state);
 					const duration = typeof job.durationMs === 'number' ? ` ${(job.durationMs / 1000).toFixed(1)}s` : '';
+					const color = typeof job.color === 'string' && job.color.length > 0 ? job.color : '';
 					nodes.push({
 						type: 'text',
-						text: `${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}`,
-						color: stateColor(state),
+						text: `${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}${color.length > 0 ? `  ${color}` : ''}`,
+						// The definition color is the agent's identity; the state color is the
+						// fallback, so an uncoloured job still reports its lifecycle.
+						color: color.length > 0 ? color : stateColor(state),
 					});
 				}
 				nodes.push({
@@ -2881,7 +4407,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				'foreground runs are not implemented in this release; omit run_in_background (background is the default)',
 			);
 		}
-		for (const unsupported of ['permission_mode', 'isolation', 'tools']) {
+		for (const unsupported of ['permission_mode', 'isolation']) {
 			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
@@ -2908,25 +4434,52 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (!resolved.ok) return badInput(resolved.error);
 			definition = resolved.definition;
 		}
-		const definitionModel = definition?.model === 'inherit' ? undefined : definition?.model;
+		const requestedTools =
+			prompt === undefined ? undefined : (listField(input.tools) ?? definition?.tools);
+		const requestedDisallowed =
+			prompt === undefined ? undefined : (listField(input.disallowed_tools) ?? definition?.disallowedTools);
+		const launch = resolveLaunch({
+			...(model !== undefined ? {requestedModel: model} : {}),
+			...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
+			...(typeof input.effort === 'string' ? {requestedEffort: input.effort} : {}),
+			...(definition?.effort !== undefined ? {definitionEffort: definition.effort} : {}),
+			env: runtime.env,
+			// The mod API exposes no main-model getter: an absent model means the ACP
+			// child inherits the user's configured model, which is the main one.
+			...(requestedTools !== undefined ? {tools: requestedTools} : {}),
+			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
+			...(definition?.permissionMode !== undefined ? {permissionMode: definition.permissionMode} : {}),
+			// The execution mode decides this once foreground runs land; until then every
+			// job is background.
+			background: input.run_in_background !== false,
+			mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
+		});
+		if (!launch.ok) return badInput(launch.error);
+		// Memory definitions auto-enable Read, Write, and Edit.
+		const launchTools = withMemoryTools(launch.tools, definition?.memory);
 		const maxTurns =
 			prompt === undefined
 				? undefined
 				: Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0
 					? Math.round(requestedMaxTurns)
 					: definition?.maxTurns;
+		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
 		const launched = fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
 			command,
 			prompt,
-			cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
+			cwd: runCwd,
 			...(name !== undefined ? {name} : {}),
 			agentType: definition?.name,
 			systemPrompt: definition?.systemPrompt,
-			model: prompt === undefined ? undefined : model ?? definitionModel,
+			startup: startupFor(definition, runCwd, prompt, launch.model),
+			model: prompt === undefined ? undefined : launch.model,
+			tools: prompt === undefined ? undefined : launchTools,
+			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
+			...(definition?.color !== undefined ? {color: definition.color} : {}),
 			maxTurns,
-			effort: definition?.effort,
+			effort: prompt === undefined ? undefined : launch.effort,
 			permissionMode: definition?.permissionMode,
 			isolation: definition?.isolation,
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
@@ -2997,9 +4550,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			state === 'queued' || state === 'running'
 				? `\n(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1000))}s; the result will arrive as a signal)`
 				: '';
+		// Reading the log is still worker output reaching the parent: scan it here too,
+		// and hide the worker's own tool-call progress.
+		const visible = reportText(body, String(record.kind ?? 'command'));
 		return okText(
 			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}${timing}\n\n` +
-				(body.length > 0 ? body : '(no output yet)') +
+				(visible.length > 0 ? visible : '(no output yet)') +
 				note,
 		);
 	}
@@ -3056,14 +4612,19 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// with the context the worker already has. An older record without one starts a
 		// fresh session (the definition body still applies).
 		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const resumeCwd = String(record.cwd ?? cmd.cwd);
+		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
 		const launched = fire({
 			label: `${String(record.label ?? id)} (resume)`,
 			kind: 'agent',
 			prompt: instruction,
-			cwd: String(record.cwd ?? cmd.cwd),
+			cwd: resumeCwd,
 			agentType: record.agentType,
-			systemPrompt: definition?.ok === true ? definition.definition.systemPrompt : undefined,
+			systemPrompt: resumeDefinition?.systemPrompt,
+			startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
+			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
 			effort: record.effort,
 			permissionMode: record.permissionMode,
@@ -3141,6 +4702,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const from = workerMode ? String(workerSpec?.name ?? 'worker') : ROSTER_MAIN;
 		if (to === ROSTER_MAIN) {
 			const id = `live-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const scan = scanOutput(message);
 			enqueueSignal({
 				id,
 				owner: workerMode ? workerSpec?.owner : ownerId(),
@@ -3149,8 +4711,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				state: 'note',
 				exitCode: null,
 				title: `message from ${from}`,
-				body: message,
+				body: scan.text,
 				sessionId: workerMode ? workerSpec?.sessionId : sessionId,
+				...(workerMode ? {scanned: true, scanMatches: scan.matches} : {}),
 			});
 			if (!workerMode) {
 				safeDrain();
@@ -3221,6 +4784,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						"Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins.",
 				},
 				model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
+				effort: {type: 'string', description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort."},
+				tools: {type: 'string', description: 'Comma-separated tool list (or an array). Only these tools remain; overrides the definition.'},
+				disallowed_tools: {type: 'string', description: 'Comma-separated tool list (or an array) to remove. Wins over tools.'},
 				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
 				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
 				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
@@ -3335,6 +4901,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				const record = id.length === 0 ? undefined : readJob(id);
 				if (record === undefined) return badInput(`subagent: no job ${id || '(worker)'}`);
 				const now = runtime.now();
+				const scan = scanOutput(report);
 				record.handbackAt = now;
 				record.updatedAt = now;
 				writeJob(record);
@@ -3343,7 +4910,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						state: 'done',
 						finishedAt: now,
 						durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
-						body: report,
+						body: scan.text,
+						scanned: true,
+						scanMatches: scan.matches,
 						title: `${String(record.label ?? id)} handback`,
 					}),
 				);
@@ -3397,28 +4966,92 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			wanted.length === 0
 				? entries
 				: entries.filter(entry => entry.name.toLowerCase() === wanted || entry.path.toLowerCase().includes(wanted));
-		const counts: Record<string, number> = {project: 0, user: 0, builtin: 0};
+		const counts: Partial<Record<AgentScope, number>> = {};
 		let valid = 0;
 		for (const entry of entries) {
 			if (!entry.valid) continue;
 			valid += 1;
 			counts[entry.source] = (counts[entry.source] ?? 0) + 1;
 		}
+		// Scope order, so the summary reads the way precedence does.
+		const summary = AGENT_SCOPES.filter(scope => (counts[scope] ?? 0) > 0)
+			.map(scope => `${counts[scope]} ${scope === 'builtin' ? 'built-in' : scope}`)
+			.join(', ');
 		const lines = shown.map(entry => {
 			const flags: string[] = [];
 			if (entry.definition?.readOnly === true) flags.push('read-only');
 			if (entry.definition?.oneShot === true) flags.push('one-shot');
+			if (entry.definition?.plugin !== undefined) flags.push(`plugin ${entry.definition.plugin}`);
 			if (entry.source !== 'builtin' && Object.hasOwn(HOST_RESERVED_AGENT_NAMES, entry.name)) {
 				flags.push('shadows a host-reserved name');
 			}
-			const state = entry.valid ? 'valid' : `invalid: ${entry.reason ?? 'unknown'}`;
+			if (entry.warning !== undefined) flags.push(`warning: ${entry.warning}`);
+			const state =
+				entry.kind === 'duplicate'
+					? `duplicate: ${entry.reason ?? 'unknown'}`
+					: entry.valid
+						? 'valid'
+						: `invalid: ${entry.reason ?? 'unknown'}`;
 			const location = entry.path.length > 0 ? `  ${entry.path}` : '';
-			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${location}`;
+			// What the definition resolves to. Tools are shown as authored so a missing
+			// tool is visible before a spawn fails on it.
+			const settings = [
+				entry.definition?.model !== undefined ? `model=${entry.definition.model}` : '',
+				entry.definition?.effort !== undefined ? `effort=${entry.definition.effort}` : '',
+				entry.definition?.color !== undefined ? `color=${entry.definition.color}` : '',
+				entry.definition?.tools !== undefined ? `tools=${entry.definition.tools.join('+')}` : '',
+			].filter(Boolean).join(' ');
+			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${settings.length > 0 ? ` · ${settings}` : ''}${location}`;
 		});
 		return (
-			`${valid} valid definition(s) (${counts.project} project, ${counts.user} user, ${counts.builtin} built-in), ` +
+			`${valid} valid definition(s)${summary.length > 0 ? ` (${summary})` : ''}, ` +
 			`${entries.length - valid} invalid.\n` +
 			(lines.length > 0 ? lines.join('\n') : '  (none)')
+		);
+	}
+
+	// `/doctor` is the diagnosis surface: every duplicate with the file that was
+	// kept, every invalid file, and every plugin file that loaded under its
+	// filename because its frontmatter could not be read.
+	function doctorText(filter?: string): string {
+		registry.refresh();
+		const entries = registry.entries();
+		if (String(filter ?? '').trim().toLowerCase() === 'plugins') {
+			const pluginEntries = entries.filter(entry => entry.source === 'plugin');
+			const problems = pluginEntries.filter(entry => !entry.valid || entry.warning !== undefined);
+			const lines = pluginEntries.map(entry => {
+				const state =
+					entry.kind === 'valid'
+						? entry.warning !== undefined
+							? `warning: ${entry.warning}`
+							: 'valid'
+						: `${entry.kind}: ${entry.reason ?? 'unknown'}`;
+				return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${state}  ${entry.path}`;
+			});
+			return (
+				`plugin validation: ${pluginEntries.length} file(s), ${problems.length} problem(s)\n` +
+				(lines.length > 0 ? lines.join('\n') : '  (no plugin agents)')
+			);
+		}
+		const duplicates = entries.filter(entry => entry.kind === 'duplicate');
+		const invalid = entries.filter(entry => entry.kind === 'invalid');
+		const warnings = entries.filter(entry => entry.valid && entry.warning !== undefined);
+		const pluginAgents = entries
+			.filter(entry => entry.source === 'plugin' && entry.valid && entry.definition !== undefined)
+			.map(entry => entry.name);
+		const lines: string[] = [];
+		for (const entry of duplicates) {
+			lines.push(`  duplicate ${entry.name}: kept ${entry.duplicateOf ?? '?'}, skipped ${entry.path} - rename or remove one`);
+		}
+		for (const entry of invalid) {
+			lines.push(`  invalid ${entry.path.length > 0 ? entry.path : entry.name}: ${entry.reason ?? 'unknown'}`);
+		}
+		for (const entry of warnings) lines.push(`  warning ${entry.path}: ${entry.warning}`);
+		if (pluginAgents.length > 0) lines.push(`  plugin agents: ${pluginAgents.join(', ')}`);
+		const summary = `${duplicates.length} duplicate(s), ${invalid.length} invalid, ${warnings.length} warning(s)`;
+		return (
+			`subagents doctor: ${lines.length > 0 ? summary : 'ok'}\n` +
+			(lines.length > 0 ? lines.join('\n') : '  no duplicate or invalid definitions')
 		);
 	}
 
@@ -3456,17 +5089,21 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		argumentHint: '[name|path]',
 		handler: ({args}: {args?: string}) => ({message: agentsText(args)}),
 	});
+	cmd.addCommand({
+		name: 'doctor',
+		description: 'Report duplicate, invalid, and plugin agent definitions, with the fix for each one',
+		argumentHint: '[plugins]',
+		handler: ({args}: {args?: string}) => ({message: doctorText(args)}),
+	});
 
 	// ------------------------------------------------------------------ lifecycle
 
 	cmd.hooks({
 		// The worker process loads this mod with `cmd --mod <file> acp`. Its whole
-		// purpose there is this hook: the definition body is the worker's system
-		// prompt. The parent already has the definition, so only worker mode registers
-		// it, and only when a body was passed.
-		...(workerSpec?.systemPrompt !== undefined && workerSpec.systemPrompt.length > 0
-			? {appendSystemPrompt: () => String(workerSpec?.systemPrompt ?? '')}
-			: {}),
+		// purpose there is this hook: the definition body and the startup bundle are
+		// the worker's system prompt. The parent already has both, so only worker mode
+		// registers it, and only when there is something to append.
+		...(workerSystemPrompt().length > 0 ? {appendSystemPrompt: () => workerSystemPrompt()} : {}),
 		onSessionStart: (info: {source?: string; sessionId?: string}) => {
 			if (typeof info?.sessionId === 'string' && info.sessionId.length > 0) {
 				sessionId = info.sessionId;
