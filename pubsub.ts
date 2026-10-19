@@ -38,6 +38,11 @@
 //
 // A headless worker cannot stay alive waiting for input, so `waiting-input` means
 // "the worker exited with a question"; answering it means firing a follow-up job.
+//
+// Inside, the mod is a handful of small sections rather than one flat script: the
+// runtime seam (every OS call), the state table, the envelope, the spool's
+// claim/settle, launch/failure, owner identity and the delivery ledger. See
+// "Internals" in the README.
 
 import type {ModApi} from '@commandcode/harness';
 import {spawn} from 'node:child_process';

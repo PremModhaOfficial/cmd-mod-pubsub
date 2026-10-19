@@ -170,6 +170,26 @@ write a signal tagged with a token it has read from disk. Use a private `pubsub_
 No network, no telemetry, no credentials: the mod never reads `auth.json`, opens no socket, and makes no
 outbound connection.
 
+## Internals
+
+The mod ships as one file, but it is not one flat script: each seam is a small section behind a narrow
+interface, and the smoke test drives every one of them.
+
+| Seam | Interface | Why it is a module |
+| --- | --- | --- |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `pid`, `execPath`, `env`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
+| States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
+| Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
+| Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |
+| Launch | `fire(intent)`, `failJob(job, reason)` | One failure contract: one record, one signal, one delivery. The next guard reuses it. |
+| Owner | `id()`, verdict `mine \| foreign \| orphan \| pending` | One identity rule. `pending` is a state, and there is no invented `process-<pid>` identity. |
+| Ledger | `has(id)`, `accept(id)`, `retain(n)` | The replay guard and its retention, in memory and on disk together. |
+
+Follow-up: the detached worker is still an inline string (`WORKER_SOURCE`) because the mod ships as one
+file with nothing to install. Extracting it into a real module would let the worker share the envelope and
+state code and would make the `waiting-input` heuristic a unit test, but it needs a different ship model
+(two files, or a build step), so it is not part of this pass.
+
 ## Tests
 
 ```bash
@@ -177,10 +197,12 @@ node test/smoke.mjs   # prints PASS
 ```
 
 The smoke test imports `pubsub.ts` directly with Node's native TypeScript type stripping and drives it with
-a fake `ModApi` — no dependencies, no build, no network. It asserts the registered tools/command/flags, that
-each session persists a `pubsub/owner` entry, that two sessions get **different** tokens, that a signal
-fired by session A is delivered to A and never to B, and that untagged legacy signals are quarantined to
-`orphaned/`. CI runs it on Node 24.
+a fake `ModApi` and a fake `Runtime` — no dependencies, no build, no network, no process. It covers the
+public surface (tools, command, flags, renderer, pane, hooks, timers) and each seam on its own: the runtime
+seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
+the state table's edges, the envelope's record/signal agreement, a foreign signal surviving a failed
+restore, exactly one signal from each spawn-failure mode, the owner token being retried rather than
+replaced by `process-<pid>`, and the ledger's retention and restart behaviour. CI runs it on Node 24.
 
 ## License
 
