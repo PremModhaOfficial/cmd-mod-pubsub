@@ -1411,6 +1411,344 @@ process.stdin.on('data', (data) => {
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
 
+	// 36. tool access filters and model/effort resolution --------------------
+	const access = await import('../better-sub-agents.ts');
+	for (const name of ['filterTools', 'resolveModel', 'resolveEffort', 'resolveLaunch', 'mcpServerNames']) {
+		assert.equal(typeof access[name], 'function', `${name} is exported for a focused check`);
+	}
+
+	// Inheritance: no tools list means every tool available to subagents, minus the
+	// universal removals. ExitPlanMode survives only in plan mode.
+	const inheritedTools = access.filterTools({
+		available: ['Read', 'Bash', 'ListAgents', 'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', 'Workflow'],
+		mcpServers: ['deepwiki', 'graft'],
+	});
+	assert.equal(inheritedTools.ok, true, 'an inherited tool set resolves');
+	assert.deepEqual(
+		inheritedTools.tools,
+		['Read', 'Bash', 'ListAgents', 'mcp__deepwiki__*', 'mcp__graft__*'],
+		'universal removals never reach a subagent; every MCP tool is inherited as a capability',
+	);
+	const planTools = access.filterTools({available: ['ExitPlanMode'], permissionMode: 'plan'});
+	assert.deepEqual(planTools.tools, ['ExitPlanMode'], 'plan mode keeps ExitPlanMode');
+
+	// A list keeps only what it names; a deny list removes from the inherited set;
+	// when both are set, disallowedTools wins.
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'Bash', 'Grep'], tools: ['Read', 'Bash']}).tools,
+		['Read', 'Bash'],
+		'a tools list keeps only the listed tools',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'Bash', 'Grep'], disallowedTools: ['Bash']}).tools,
+		['Read', 'Grep'],
+		'disallowedTools removes from the inherited set',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'Bash'], tools: ['Read', 'Bash'], disallowedTools: ['Bash']}).tools,
+		['Read'],
+		'disallowedTools wins over tools',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'Bash'], disallowedTools: ['Bash(git push *)']}).tools,
+		['Read'],
+		'a specifier such as Bash(git push *) removes the whole tool',
+	);
+
+	// MCP wildcards.
+	assert.deepEqual(
+		access.filterTools({available: ['Read'], mcpServers: ['deepwiki', 'graft'], tools: ['mcp__deepwiki__*']}).tools,
+		['mcp__deepwiki__*'],
+		'mcp__server__* selects one server',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read'], mcpServers: ['deepwiki', 'graft'], tools: ['mcp__*']}).tools,
+		['mcp__deepwiki__*', 'mcp__graft__*'],
+		'mcp__* selects every MCP server',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read'], mcpServers: ['deepwiki', 'graft'], disallowedTools: ['mcp__deepwiki']}).tools,
+		['Read', 'mcp__graft__*'],
+		'mcp__server withholds that server',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read'], mcpServers: ['deepwiki'], disallowedTools: ['mcp__*']}).tools,
+		['Read'],
+		'mcp__* withholds every MCP tool',
+	);
+
+	// A listed tool that no filter can keep fails the launch, naming the entries.
+	const unresolvedTools = access.filterTools({available: ['Read'], tools: ['AskUserQuestion', 'Workflow']});
+	assert.equal(unresolvedTools.ok, false, 'a tools list resolving to nothing fails');
+	assert.match(unresolvedTools.error, /AskUserQuestion/, 'the failure names the first unresolved entry');
+	assert.match(unresolvedTools.error, /Workflow/, 'the failure names the second unresolved entry');
+
+	// A background job keeps every MCP tool but only allowlisted built-ins; ListAgents
+	// is foreground-only, and AskUserQuestion is removed everywhere.
+	const backgroundTools = access.filterTools({
+		available: ['Read', 'Edit', 'TodoWrite', 'ListAgents', 'AskUserQuestion', 'EnterPlanMode'],
+		mcpServers: ['deepwiki'],
+		background: true,
+	});
+	assert.deepEqual(
+		backgroundTools.tools,
+		['Read', 'Edit', 'TodoWrite', 'mcp__deepwiki__*'],
+		'a background agent keeps allowlisted built-ins and every MCP tool',
+	);
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'ListAgents']}).tools,
+		['Read', 'ListAgents'],
+		'ListAgents is visible to a foreground agent',
+	);
+
+	// Model resolution: parameter, frontmatter, environment, main. `inherit` pins the
+	// main model; FORCE makes the environment win over parameter and frontmatter.
+	const modelMain = 'main-model';
+	assert.deepEqual(
+		access.resolveModel({
+			requested: 'sonnet',
+			definition: 'opus',
+			env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku'},
+			main: modelMain,
+		}),
+		{model: 'sonnet', source: 'parameter'},
+		'the per-invocation model wins',
+	);
+	assert.deepEqual(
+		access.resolveModel({definition: 'opus', env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku'}, main: modelMain}),
+		{model: 'opus', source: 'definition'},
+		'frontmatter wins over the environment',
+	);
+	assert.deepEqual(
+		access.resolveModel({env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku'}, main: modelMain}),
+		{model: 'haiku', source: 'environment'},
+		'the environment wins over the main model',
+	);
+	assert.deepEqual(
+		access.resolveModel({
+			env: {BETTER_SUBAGENTS_SUBAGENT_MODEL: 'canonical', CLAUDE_CODE_SUBAGENT_MODEL: 'alias'},
+			main: modelMain,
+		}),
+		{model: 'canonical', source: 'environment'},
+		'the canonical environment name wins over the Claude Code alias',
+	);
+	assert.deepEqual(access.resolveModel({main: modelMain}), {model: modelMain, source: 'main'}, 'main is the last resort');
+	assert.deepEqual(
+		access.resolveModel({definition: 'inherit', env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku'}, main: modelMain}),
+		{model: modelMain, source: 'inherit'},
+		'frontmatter inherit selects the main model',
+	);
+	assert.deepEqual(
+		access.resolveModel({requested: 'inherit', env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku'}, main: modelMain}),
+		{model: modelMain, source: 'inherit'},
+		'a per-invocation inherit selects the main model',
+	);
+	assert.deepEqual(
+		access.resolveModel({
+			requested: 'sonnet',
+			definition: 'opus',
+			env: {BETTER_SUBAGENTS_SUBAGENT_MODEL: 'haiku', BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE: '1'},
+			main: modelMain,
+		}),
+		{model: 'haiku', source: 'forced'},
+		'FORCE makes the environment model win over parameter and frontmatter',
+	);
+	assert.deepEqual(access.resolveModel({}), {model: undefined, source: 'main'}, 'no model means inherit, not a guess');
+
+	// Effort resolution: per-invocation, frontmatter, environment. An invalid level is
+	// ignored rather than passed to the runtime.
+	assert.deepEqual(
+		access.resolveEffort({requested: 'max', definition: 'high', env: {CLAUDE_CODE_EFFORT_LEVEL: 'low'}}),
+		{effort: 'max', source: 'parameter'},
+		'the per-invocation effort wins',
+	);
+	assert.deepEqual(
+		access.resolveEffort({definition: 'high', env: {CLAUDE_CODE_EFFORT_LEVEL: 'low'}}),
+		{effort: 'high', source: 'definition'},
+		'frontmatter effort wins over the environment',
+	);
+	assert.deepEqual(
+		access.resolveEffort({env: {BETTER_SUBAGENTS_EFFORT_LEVEL: 'xhigh', CLAUDE_CODE_EFFORT_LEVEL: 'low'}}),
+		{effort: 'xhigh', source: 'environment'},
+		'the canonical effort environment name wins',
+	);
+	assert.deepEqual(
+		access.resolveEffort({env: {CLAUDE_CODE_EFFORT_LEVEL: 'low'}}),
+		{effort: 'low', source: 'environment'},
+		'the Claude Code effort alias is accepted',
+	);
+	assert.deepEqual(
+		access.resolveEffort({definition: 'bogus', env: {CLAUDE_CODE_EFFORT_LEVEL: 'low'}}),
+		{effort: 'low', source: 'environment'},
+		'an invalid frontmatter effort falls through',
+	);
+	assert.deepEqual(access.resolveEffort({}), {effort: undefined, source: 'none'}, 'no effort means the runtime default');
+	ok('tools/model/effort: inherit, list, deny, MCP wildcards, empty failure, background filter, and every resolution branch');
+
+	// The same rules at spawn: the worker spec carries the resolved set, the job
+	// record carries model/effort/color, and an unresolved tools list fails the launch.
+	const accessRoot = mkdtempSync(join(tmpdir(), 'subagent-access-'));
+	const accessHome = mkdtempSync(join(tmpdir(), 'subagent-access-home-'));
+	mkdirSync(join(accessHome, '.commandcode'), {recursive: true});
+	writeFileSync(
+		join(accessHome, '.commandcode', 'mcp.json'),
+		JSON.stringify({mcpServers: {deepwiki: {enabled: true}, disabled: {enabled: false}}}),
+	);
+	const accessAgents = join(accessRoot, '.commandcode', 'agents');
+	writeAgent(accessAgents, 'reader.md', 'reader', 'reader', 'READER BODY', {tools: 'Read, Grep'});
+	writeAgent(accessAgents, 'denied.md', 'denied', 'denied', 'DENIED BODY', {
+		tools: 'Read, Grep',
+		disallowedTools: 'Grep',
+	});
+	writeAgent(accessAgents, 'nothing.md', 'nothing', 'nothing', 'NOTHING BODY', {tools: 'AskUserQuestion'});
+	writeAgent(accessAgents, 'deep.md', 'deep', 'deep', 'DEEP BODY', {tools: 'mcp__deepwiki__*'});
+	writeAgent(accessAgents, 'bgtools.md', 'bgtools', 'bgtools', 'BGT BODY', {
+		tools: 'Read, ListAgents, mcp__deepwiki__*',
+	});
+	writeAgent(accessAgents, 'styled.md', 'styled', 'styled', 'STYLED BODY', {
+		model: 'opus',
+		effort: 'high',
+		color: 'blue',
+	});
+	const accessRuntime = makeRuntime({cwd: accessRoot, home: accessHome});
+	const accessSpool = mkdtempSync(join(tmpdir(), 'subagent-access-spool-'));
+	const accessApi = makeApi({spoolDir: accessSpool, session: makeSession(), runtime: accessRuntime.runtime});
+	mod(accessApi.api, accessApi.runtime);
+	const accessSpawn = toolOf(accessApi, 'subagent_spawn');
+	const spawnAccess = async (input) => {
+		const before = accessRuntime.spawnCalls.length;
+		const result = await accessSpawn.run({input});
+		const call = accessRuntime.spawnCalls[before];
+		return {result, spec: call === undefined ? undefined : JSON.parse(call.options.env.SUBAGENT_SPEC)};
+	};
+
+	const reader = await spawnAccess({description: 'reader', prompt: 'x', subagent_type: 'reader'});
+	assert.equal(reader.result.ok, true, 'a defined tools list spawns');
+	assert.deepEqual(reader.spec.tools, ['Read', 'Grep'], 'the definition tools list reaches the worker');
+	const denied = await spawnAccess({description: 'denied', prompt: 'x', subagent_type: 'denied'});
+	assert.deepEqual(denied.spec.tools, ['Read'], 'disallowedTools is applied at spawn');
+	const deep = await spawnAccess({description: 'deep', prompt: 'x', subagent_type: 'deep'});
+	assert.deepEqual(deep.spec.tools, ['mcp__deepwiki__*'], 'an MCP wildcard resolves against configured servers');
+	const bgtools = await spawnAccess({description: 'bgtools', prompt: 'x', subagent_type: 'bgtools'});
+	assert.deepEqual(
+		bgtools.spec.tools,
+		['Read', 'mcp__deepwiki__*'],
+		'a background job drops non-allowlisted built-ins and keeps every MCP tool',
+	);
+	const callTuned = await spawnAccess({
+		description: 'styled',
+		prompt: 'x',
+		subagent_type: 'styled',
+		model: 'haiku',
+		effort: 'max',
+	});
+	assert.equal(callTuned.spec.model, 'haiku', 'the per-invocation model reaches the worker');
+	assert.equal(callTuned.spec.effort, 'max', 'the per-invocation effort wins over the definition');
+	const nothing = await spawnAccess({description: 'nothing', prompt: 'x', subagent_type: 'nothing'});
+	assert.equal(nothing.result.ok, false, 'a definition whose tools list resolves to nothing fails the launch');
+	assert.match(nothing.result.error, /AskUserQuestion/, 'the launch error names the unresolved entry');
+
+	const callTooled = await spawnAccess({description: 'tooled', prompt: 'x', subagent_type: 'reader', tools: 'Read'});
+	assert.deepEqual(callTooled.spec.tools, ['Read'], 'a per-invocation tools list wins over the definition');
+	const callDenied = await spawnAccess({
+		description: 'tooled',
+		prompt: 'x',
+		subagent_type: 'reader',
+		tools: 'Read, Grep',
+		disallowed_tools: 'Read',
+	});
+	assert.deepEqual(callDenied.spec.tools, ['Grep'], 'a per-invocation disallowed_tools list is applied');
+
+	const styled = await spawnAccess({description: 'styled', prompt: 'x', subagent_type: 'styled'});
+	assert.equal(styled.spec.model, 'opus', 'the frontmatter model reaches the worker');
+	assert.equal(styled.spec.effort, 'high', 'the frontmatter effort reaches the worker');
+	const styledRecord = JSON.parse(readFileSync(join(accessSpool, 'jobs', `${styled.spec.id}.json`), 'utf8'));
+	assert.equal(styledRecord.model, 'opus', 'the resolved model is recorded');
+	assert.equal(styledRecord.effort, 'high', 'the resolved effort is recorded');
+	assert.equal(styledRecord.color, 'blue', 'the definition color is recorded');
+	const styledList = toolOf(accessApi, 'subagent_list').run({input: {}});
+	const styledListText = (await styledList).content[0].text;
+	assert.match(styledListText, /opus/, 'subagent_list shows the model');
+	assert.match(styledListText, /effort=high/, 'subagent_list shows the effort');
+	assert.match(styledListText, /color=blue/, 'subagent_list shows the color');
+	const jobsPane = accessApi.paneDefs.find((def) => def.id === 'jobs');
+	const paneText = JSON.stringify(jobsPane.render());
+	assert.match(paneText, /blue/, 'the jobs pane renders the definition color');
+
+	const plain = await spawnAccess({description: 'plain', prompt: 'x', subagent_type: 'general-purpose'});
+	assert.equal(plain.spec.model, undefined, 'no model anywhere means the worker inherits the main model');
+	assert.equal(plain.spec.effort, undefined, 'no effort anywhere means the runtime default');
+
+	// Environment resolution at spawn, including FORCE over the definition.
+	const envHome = mkdtempSync(join(tmpdir(), 'subagent-env-home-'));
+	const envRuntime = makeRuntime({
+		cwd: accessRoot,
+		home: envHome,
+		env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku', CLAUDE_CODE_EFFORT_LEVEL: 'low'},
+	});
+	const envApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-env-spool-')),
+		session: makeSession(),
+		runtime: envRuntime.runtime,
+	});
+	mod(envApi.api, envRuntime.runtime);
+	const envSpawn = toolOf(envApi, 'subagent_spawn');
+	const envSpawnSpec = async (input) => {
+		const before = envRuntime.spawnCalls.length;
+		const result = await envSpawn.run({input});
+		return {result, spec: JSON.parse(envRuntime.spawnCalls[before].options.env.SUBAGENT_SPEC)};
+	};
+	const envPlain = await envSpawnSpec({description: 'plain', prompt: 'x', subagent_type: 'general-purpose'});
+	assert.equal(envPlain.spec.model, 'haiku', 'CLAUDE_CODE_SUBAGENT_MODEL reaches a definition with no model');
+	assert.equal(envPlain.spec.effort, 'low', 'CLAUDE_CODE_EFFORT_LEVEL applies when the definition sets none');
+	const envStyled = await envSpawnSpec({description: 'styled', prompt: 'x', subagent_type: 'styled'});
+	assert.equal(envStyled.spec.model, 'opus', 'the definition model wins over the environment');
+	assert.equal(envStyled.spec.effort, 'high', 'the definition effort wins over the environment');
+	const forcedRuntime = makeRuntime({
+		cwd: accessRoot,
+		home: mkdtempSync(join(tmpdir(), 'subagent-force-home-')),
+		env: {CLAUDE_CODE_SUBAGENT_MODEL: 'haiku', CLAUDE_CODE_SUBAGENT_MODEL_FORCE: '1'},
+	});
+	const forcedApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-force-spool-')),
+		session: makeSession(),
+		runtime: forcedRuntime.runtime,
+	});
+	mod(forcedApi.api, forcedRuntime.runtime);
+	const forcedBefore = forcedRuntime.spawnCalls.length;
+	const forcedResult = await toolOf(forcedApi, 'subagent_spawn').run({
+		input: {description: 'forced', prompt: 'x', subagent_type: 'styled', model: 'sonnet'},
+	});
+	assert.equal(forcedResult.ok, true, 'a forced environment model still spawns');
+	assert.equal(
+		JSON.parse(forcedRuntime.spawnCalls[forcedBefore].options.env.SUBAGENT_SPEC).model,
+		'haiku',
+		'FORCE makes the environment model win over the parameter and the definition',
+	);
+
+	// Resume keeps the per-invocation model, effort, and the resolved tool access.
+	const resumeRecordPath = join(accessSpool, 'jobs', `${styled.spec.id}.json`);
+	writeFileSync(
+		resumeRecordPath,
+		JSON.stringify({...styledRecord, state: 'done', acpSessionId: 'acp-styled', finishedAt: fixedNow}),
+	);
+	const resumeBefore = accessRuntime.spawnCalls.length;
+	const resumedJob = await toolOf(accessApi, 'subagent_resume').run({input: {id: styled.spec.id, prompt: 'keep going'}});
+	assert.equal(resumedJob.ok, true, 'a finished agent resumes');
+	const resumeSpec = JSON.parse(accessRuntime.spawnCalls[resumeBefore].options.env.SUBAGENT_SPEC);
+	assert.equal(resumeSpec.model, styled.spec.model, 'the resolved model survives resume');
+	assert.equal(resumeSpec.effort, styled.spec.effort, 'the resolved effort survives resume');
+	assert.deepEqual(resumeSpec.tools, styled.spec.tools, 'the resolved tool access survives resume');
+	assert.equal(resumeSpec.permissionMode, styled.spec.permissionMode, 'the resolved permission mode survives resume');
+	ok('tools/model/effort at spawn: spec, record, list, pane, environment, FORCE, and resume');
+
+	// The worker applies the resolved tool set and model; thinking is inherited, so no
+	// per-subagent thinking setting is ever sent.
+	const accessWorker = workerSource();
+	assert.match(accessWorker, /\[acp\] tools /, 'the worker logs the resolved tool set');
+	assert.match(accessWorker, /not in the allowed catalog/, 'an alias outside the catalog falls back with a warning');
+	assert.ok(!accessWorker.includes("configId: 'thinking'"), 'thinking is inherited, never set per subagent');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);

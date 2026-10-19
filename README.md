@@ -45,8 +45,8 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `subagent_type` (or the deprecated `agent_type`), `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. |
-| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, elapsed time and owner, plus how many signals are still waiting for this session. |
+| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `subagent_type` (or the deprecated `agent_type`), `model`, `effort`, `tools`, `disallowed_tools`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. |
+| `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, effort, color, elapsed time and owner, plus how many signals are still waiting for this session. |
 | `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
 | `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. The resumed run is a new job with its own signal. |
@@ -104,9 +104,36 @@ With the mod installed, the body is injected through the host's `appendSystemPro
 worker. When the mod is loaded only with `--mod` (development), this host's `cmd acp` ignores `--mod`, so
 the worker carries the body at the front of the task prompt instead; the job log says which path ran.
 
-`permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
+`permission_mode` and `isolation` are **refused explicitly** rather than silently ignored: they
 arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
 background path is the only one that exists yet.
+
+### Tool access, model, and effort
+
+`tools` and `disallowedTools` are comma strings or YAML lists, and the spawn arguments `tools` /
+`disallowed_tools` override the definition for one invocation.
+
+- `tools` only: only the listed tools remain. `disallowedTools` only: the listed tools are removed from
+  the inherited set. Both: `disallowedTools` wins, so a tool in both lists is removed.
+- `mcp__server__*` selects one server's tools, `mcp__*` selects every MCP tool, and `mcp__server` or
+  `mcp__server__*` in `disallowedTools` withholds them. A specifier such as `Bash(git push *)` removes
+  the whole tool.
+- Every subagent loses `AskUserQuestion`, `EndConversation`, `EnterPlanMode`, `ScheduleWakeup`,
+  `WaitForMcpServers`, `Workflow`, and `ExitPlanMode` unless its permission mode is `plan`.
+- A background subagent keeps every MCP tool but only the allowlisted built-ins, so `ListAgents` is
+  foreground-only.
+- A `tools` list that resolves to nothing fails the launch and names the entries.
+
+Model: the per-invocation `model`, then the definition's `model`, then `BETTER_SUBAGENTS_SUBAGENT_MODEL`
+(or `CLAUDE_CODE_SUBAGENT_MODEL`), then the main model. `inherit` selects the main model.
+`BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE=1` (or the Claude Code alias) makes the environment value win over
+the parameter and the definition. Family aliases resolve against the session's model catalog; a value the
+allowlist blocks falls back to the inherited model and is logged.
+
+Effort: the per-invocation `effort`, then the definition's `effort`, then `BETTER_SUBAGENTS_EFFORT_LEVEL`
+(or `CLAUDE_CODE_EFFORT_LEVEL`). Effort is `low`, `medium`, `high`, `xhigh`, or `max`. Extended thinking
+is inherited from the main conversation; there is no per-subagent thinking setting. The definition's
+`color` appears in the job list and the jobs pane.
 
 ### Deprecated aliases (one release)
 
