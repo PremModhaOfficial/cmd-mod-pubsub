@@ -1,0 +1,33 @@
+{
+	"name": "cmd-mod-pubsub",
+	"version": "0.1.0",
+	"description": "Command Code mod: fire-and-forget async jobs that signal back to the session that fired them",
+	"type": "module",
+	"license": "MIT",
+	"author": "Prem Modha",
+	"keywords": [
+		"cmd-mod",
+		"command-code",
+		"pubsub",
+		"async-agents"
+	],
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/PremModhaOfficial/cmd-mod-pubsub.git"
+	},
+	"homepage": "https://github.com/PremModhaOfficial/cmd-mod-pubsub#readme",
+	"bugs": {
+		"url": "https://github.com/PremModhaOfficial/cmd-mod-pubsub/issues"
+	},
+	"files": [
+		"pubsub.ts",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"test": "node test/smoke.mjs"
+	},
+	"engines": {
+		"node": ">=22.18"
+	}
+}

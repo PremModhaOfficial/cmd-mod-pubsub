@@ -1,0 +1,14 @@
+# dependencies
+node_modules/
+
+# logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# editor / OS noise
+.idea/
+.vscode/
+Thumbs.db
