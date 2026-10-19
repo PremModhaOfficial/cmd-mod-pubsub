@@ -1613,6 +1613,222 @@ process.stdin.on('data', (data) => {
 	assert.match(agentListing, /added {2}project {2}valid/, '/agents lists an --add-dir definition');
 	assert.match(agentListing, /fromFile {2}cli {2}valid/, '/agents lists a CLI definition');
 	ok('scopes: managed, CLI, project, user, plugin, precedence, --add-dir, plugin names, /doctor');
+	// limits: the concurrency pool, nesting depth, and the shared TTL sweeper ---
+	const limits = await import('../better-sub-agents.ts');
+	assert.equal(typeof limits.resolveMaxConcurrent, 'function', 'resolveMaxConcurrent is exported');
+	assert.equal(typeof limits.resolveMaxDepth, 'function', 'resolveMaxDepth is exported');
+	assert.equal(typeof limits.workerEnv, 'function', 'workerEnv is exported');
+	assert.equal(typeof limits.sweepExpiredEntries, 'function', 'sweepExpiredEntries is exported');
+
+	// Both spellings of each limit, canonical first, and a default when unset.
+	assert.equal(limits.resolveMaxConcurrent({}), 20, 'default concurrency is 20');
+	assert.equal(limits.resolveMaxConcurrent({BETTER_SUBAGENTS_MAX_CONCURRENT: '3'}), 3, 'the canonical limit applies');
+	assert.equal(
+		limits.resolveMaxConcurrent({CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '4'}),
+		4,
+		'the Claude Code concurrency alias is accepted',
+	);
+	assert.equal(
+		limits.resolveMaxConcurrent({BETTER_SUBAGENTS_MAX_CONCURRENT: '5', CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '4'}),
+		5,
+		'the canonical name wins over the alias',
+	);
+	assert.equal(limits.resolveMaxConcurrent({BETTER_SUBAGENTS_MAX_CONCURRENT: 'nope'}), 20, 'an invalid limit falls back');
+	assert.equal(limits.resolveMaxDepth({}), 3, 'default nesting depth is 3');
+	assert.equal(limits.resolveMaxDepth({BETTER_SUBAGENTS_MAX_DEPTH: '2'}), 2, 'the canonical depth applies');
+	assert.equal(
+		limits.resolveMaxDepth({CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '5'}),
+		5,
+		'the Claude Code depth alias is accepted',
+	);
+
+	// Twenty model-spawned jobs start; the 21st fails with the documented error and
+	// writes no record. Canceling one frees the slot.
+	const poolDir = mkdtempSync(join(tmpdir(), 'subagent-pool-'));
+	const poolRuntime = makeRuntime({now: () => fixedNow, env: {...process.env}});
+	const pool = makeApi({spoolDir: poolDir, session: makeSession(), runtime: poolRuntime.runtime});
+	mod(pool.api, pool.runtime);
+	const poolSpawn = toolOf(pool, 'subagent_spawn');
+	const poolIds = [];
+	for (let index = 0; index < 20; index += 1) {
+		const spawned = await poolSpawn.run({input: {description: `pool ${index}`, prompt: 'work'}});
+		assert.equal(spawned.ok, true, `job ${index + 1} of 20 starts`);
+		poolIds.push(JSON.parse(poolRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).id);
+	}
+	assert.equal(poolRuntime.spawnCalls.length, 20, 'twenty workers spawned');
+	const overflow = await poolSpawn.run({input: {description: 'overflow', prompt: 'work'}});
+	assert.equal(overflow.ok, false, 'the 21st spawn fails');
+	assert.match(overflow.error, /Concurrent subagent limit reached/, 'the error is the documented one');
+	assert.match(overflow.error, /do not retry/i, 'the error tells the model not to retry');
+	assert.equal(poolRuntime.spawnCalls.length, 20, 'no worker spawns past the limit');
+	assert.ok(!existsSync(join(poolDir, 'jobs', 'overflow.json')), 'a refused spawn writes no record');
+	const poolCanceled = await toolOf(pool, 'subagent_cancel').run({input: {id: poolIds[0]}});
+	assert.equal(poolCanceled.ok, true, 'a job can be poolCanceled');
+	const afterCancel = await poolSpawn.run({input: {description: 'after cancel', prompt: 'work'}});
+	assert.equal(afterCancel.ok, true, 'spawning works again below the limit');
+	assert.equal(poolRuntime.spawnCalls.length, 21, 'and the replacement worker spawns');
+
+	// The limit is per session, not per spool: session B shares session A's spool.
+	const otherPoolRuntime = makeRuntime({now: () => fixedNow, env: {...process.env}});
+	const otherPool = makeApi({spoolDir: poolDir, session: makeSession(), runtime: otherPoolRuntime.runtime});
+	mod(otherPool.api, otherPool.runtime);
+	const otherSpawn = await toolOf(otherPool, 'subagent_spawn').run({input: {description: 'other', prompt: 'work'}});
+	assert.equal(otherSpawn.ok, true, 'another session in the same spool has its own slots');
+
+	// A configured limit and its alias apply to the real spawn path.
+	const tinyRuntime = makeRuntime({now: () => fixedNow, env: {...process.env, BETTER_SUBAGENTS_MAX_CONCURRENT: '2'}});
+	const tiny = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-pool-tiny-')), session: makeSession(), runtime: tinyRuntime.runtime});
+	mod(tiny.api, tiny.runtime);
+	const tinySpawn = toolOf(tiny, 'subagent_spawn');
+	assert.equal((await tinySpawn.run({input: {description: 'a', command: 'true'}})).ok, true);
+	assert.equal((await tinySpawn.run({input: {description: 'b', command: 'true'}})).ok, true);
+	const tinyOverflow = await tinySpawn.run({input: {description: 'c', command: 'true'}});
+	assert.equal(tinyOverflow.ok, false, 'BETTER_SUBAGENTS_MAX_CONCURRENT=2 refuses the third');
+	assert.match(tinyOverflow.error, /Concurrent subagent limit reached/, 'the configured limit uses the same error');
+	const limitAliasRuntime = makeRuntime({now: () => fixedNow, env: {...process.env, CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS: '1'}});
+	const limitAlias = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-pool-alias-')), session: makeSession(), runtime: limitAliasRuntime.runtime});
+	mod(limitAlias.api, limitAlias.runtime);
+	const limitAliasSpawn = toolOf(limitAlias, 'subagent_spawn');
+	assert.equal((await limitAliasSpawn.run({input: {description: 'one', command: 'true'}})).ok, true);
+	assert.equal(
+		(await limitAliasSpawn.run({input: {description: 'two', command: 'true'}})).ok,
+		false,
+		'the Claude Code concurrency alias applies to the spawn path',
+	);
+
+	// Depth is on the job record and in the worker spec. A top-level spawn is 1.
+	const depthDir = mkdtempSync(join(tmpdir(), 'subagent-depth-'));
+	const depthRuntime = makeRuntime({now: () => fixedNow, env: {...process.env}});
+	const depth = makeApi({spoolDir: depthDir, session: makeSession(), runtime: depthRuntime.runtime});
+	mod(depth.api, depth.runtime);
+	const top = await toolOf(depth, 'subagent_spawn').run({input: {description: 'top', prompt: 'work'}});
+	assert.equal(top.ok, true, 'a top-level agent spawns');
+	const topSpec = JSON.parse(depthRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(topSpec.depth, 1, 'a top-level spawn is depth 1');
+	const topRecord = JSON.parse(readFileSync(join(depthDir, 'jobs', `${topSpec.id}.json`), 'utf8'));
+	assert.equal(topRecord.depth, 1, 'depth is on the job record');
+
+	// A depth-2 worker may spawn; its child is depth 3 and carries only its own spec.
+	const twoRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {
+			...process.env,
+			BETTER_SUBAGENTS_WORKER: '1',
+			PUBSUB_WORKER: '1',
+			SUBAGENT_SPEC: JSON.stringify({id: 'parent-two', depth: 2}),
+		},
+	});
+	const two = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-depth-two-')), session: makeSession(), runtime: twoRuntime.runtime});
+	mod(two.api, two.runtime);
+	const depthChild = await toolOf(two, 'subagent_spawn').run({input: {description: 'child', prompt: 'work'}});
+	assert.equal(depthChild.ok, true, 'a depth-2 worker can spawn a child');
+	const childCall = twoRuntime.spawnCalls.at(-1);
+	const childEnv = childCall.options.env;
+	const childSpec = JSON.parse(childEnv.SUBAGENT_SPEC);
+	assert.equal(childSpec.depth, 3, 'its child is depth 3');
+	assert.notEqual(childSpec.id, 'parent-two', 'the parent spec does not leak into the child');
+	assert.equal(childEnv.BETTER_SUBAGENTS_WORKER, '1', 'the worker flag is set for the child');
+	assert.equal(childEnv.PUBSUB_WORKER, undefined, 'the legacy worker flag is not forwarded');
+	const childRecord = JSON.parse(readFileSync(join(two.api.getFlag('subagent_dir'), 'jobs', `${childSpec.id}.json`), 'utf8'));
+	assert.equal(childRecord.depth, 3, 'the child depth is recorded');
+
+	// At depth 3 the Agent surface stays registered and returns an error instead.
+	const threeRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify({id: 'parent-three', depth: 3})},
+	});
+	const three = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-depth-three-')), session: makeSession(), runtime: threeRuntime.runtime});
+	mod(three.api, three.runtime);
+	assert.ok(toolNames(three).includes('subagent_spawn'), 'the spawn surface stays listed at the depth limit');
+	const refused = await toolOf(three, 'subagent_spawn').run({input: {description: 'nope', prompt: 'work'}});
+	assert.equal(refused.ok, false, 'a depth-3 worker cannot spawn a child');
+	assert.match(refused.error, /nesting depth limit reached/i, 'the depth error names the limit');
+	assert.match(refused.error, /do not retry/i, 'the depth error tells the model not to retry');
+	assert.equal(threeRuntime.spawnCalls.length, 0, 'no worker spawns at the depth limit');
+
+	// A configured depth limit lowers it, under either name.
+	const shallowRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {
+			...process.env,
+			BETTER_SUBAGENTS_WORKER: '1',
+			SUBAGENT_SPEC: JSON.stringify({id: 'parent-shallow', depth: 2}),
+			BETTER_SUBAGENTS_MAX_DEPTH: '2',
+		},
+	});
+	const shallow = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-depth-shallow-')), session: makeSession(), runtime: shallowRuntime.runtime});
+	mod(shallow.api, shallow.runtime);
+	assert.equal(
+		(await toolOf(shallow, 'subagent_spawn').run({input: {description: 'no', prompt: 'x'}})).ok,
+		false,
+		'BETTER_SUBAGENTS_MAX_DEPTH=2 stops a depth-2 worker',
+	);
+	const aliasDepthRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {
+			...process.env,
+			BETTER_SUBAGENTS_WORKER: '1',
+			SUBAGENT_SPEC: JSON.stringify({id: 'parent-alias', depth: 2}),
+			CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
+		},
+	});
+	const aliasDepth = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-depth-alias-')), session: makeSession(), runtime: aliasDepthRuntime.runtime});
+	mod(aliasDepth.api, aliasDepth.runtime);
+	assert.equal(
+		(await toolOf(aliasDepth, 'subagent_spawn').run({input: {description: 'no', prompt: 'x'}})).ok,
+		false,
+		'the Claude Code depth alias applies to the spawn path',
+	);
+
+	// One generic TTL sweeper serves records, logs and worktrees.
+	const swept = [];
+	const fakeIo = {
+		readdir: () => ['old', 'fresh'],
+		stat: (file) => ({mtimeMs: file.endsWith('/old') ? 0 : fixedNow}),
+		remove: (file) => swept.push(file),
+	};
+	assert.deepEqual(
+		limits.sweepExpiredEntries(fakeIo, '/spool/logs', fixedNow, {ttlMs: 1000}),
+		['old'],
+		'the sweeper removes an entry past its TTL and keeps a fresh one',
+	);
+	assert.deepEqual(swept, ['/spool/logs/old'], 'it removes through the injected filesystem');
+	assert.deepEqual(
+		limits.sweepExpiredEntries(
+			{readdir: () => ['expired', 'kept'], stat: () => ({mtimeMs: fixedNow}), remove: () => {}},
+			'/spool/jobs',
+			fixedNow,
+			{expired: (name) => name === 'expired'},
+		),
+		['expired'],
+		'the same sweeper accepts a predicate for records, whose age is in the file',
+	);
+
+	const sweepDir = mkdtempSync(join(tmpdir(), 'subagent-sweep-'));
+	const sweep = makeApi({spoolDir: sweepDir, session: makeSession(), runtime: makeRuntime({now: () => fixedNow, env: {...process.env}}).runtime});
+	mod(sweep.api, sweep.runtime);
+	mkdirSync(join(sweepDir, 'worktrees', 'settled'), {recursive: true});
+	mkdirSync(join(sweepDir, 'worktrees', 'busy'), {recursive: true});
+	writeFileSync(join(sweepDir, 'worktrees', 'settled', 'marker'), 'x');
+	const oldAt = fixedNow - 31 * 24 * 60 * 60 * 1000;
+	writeFileSync(
+		join(sweepDir, 'jobs', 'settled.json'),
+		JSON.stringify({id: 'settled', state: 'done', startedAt: oldAt, finishedAt: oldAt}),
+	);
+	writeFileSync(join(sweepDir, 'logs', 'settled.log'), 'done\n');
+	writeFileSync(
+		join(sweepDir, 'jobs', 'busy.json'),
+		JSON.stringify({id: 'busy', state: 'running', startedAt: fixedNow - 1000}),
+	);
+	writeFileSync(join(sweepDir, 'logs', 'busy.log'), 'still going\n');
+	sweep.registeredHooks.onSessionStart({source: 'resume', sessionId: 'sweep'});
+	assert.ok(!existsSync(join(sweepDir, 'jobs', 'settled.json')), 'a settled record past retention is swept');
+	assert.ok(!existsSync(join(sweepDir, 'logs', 'settled.log')), 'its log is swept with it');
+	assert.ok(!existsSync(join(sweepDir, 'worktrees', 'settled')), 'its worktree is swept with it');
+	assert.ok(existsSync(join(sweepDir, 'jobs', 'busy.json')), 'a running record is kept');
+	assert.ok(existsSync(join(sweepDir, 'logs', 'busy.log')), 'a running log is kept');
+	assert.ok(existsSync(join(sweepDir, 'worktrees', 'busy')), 'a running worktree is kept');
+	ok('limits: concurrency pool, nesting depth, env aliases, and the shared TTL sweeper');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
