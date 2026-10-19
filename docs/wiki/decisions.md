@@ -14,3 +14,4 @@ On 2026-10-20 the run stops when all 14 tickets #4-#17 are merged into `better-s
 | 2026-10-20 | Run T12 and T10 in parallel; T13 waits for both. | Ticket graph: #16 blocked by #15 and #13. |
 | 2026-10-20 | T12 and T10 landed. | T12 `b1662aa` (checks 70-73); T10 `fcf787e` (checks 74-80); smoke 80 PASS. |
 | 2026-10-20 | T14 closes the release ledger without the human gates: all parity rows get a check, deviations stay as rows, and the repository rename/tag wait for the human. | `SPEC.md` ledger (33 rows), ADR 0001 deviations, smoke 88/88, e2e 10/10. |
+| 2026-10-20 | The two-axis review found 13 spec-axis gaps and 11 standards-axis findings; one fix implementer is running on `fix-review`. | StandardsReview and SpecReview reports; fix branch based on `72a3c95`. |
