@@ -1787,7 +1787,211 @@ process.stdin.on('data', (data) => {
 	assert.ok(!readOut.content[0].text.includes('[tool]'), 'subagent_output hides intermediate tool calls');
 	ok('subagent_output scans before the parent reads, and never shows tool calls');
 
-// 42. foreground and background execution -------------------------------
+
+	// 42. scopes, discovery precedence, and /doctor ---------------------------
+	const scopeExports = await import('../better-sub-agents.ts');
+	const scopeRoot = mkdtempSync(join(tmpdir(), 'subagent-scopes-'));
+	const scopeRepo = join(scopeRoot, 'repo');
+	const scopeNested = join(scopeRepo, 'packages', 'app');
+	const scopeOutside = join(scopeRoot, 'outside');
+	const scopeManaged = join(scopeRoot, 'managed');
+	const scopePlugins = join(scopeRoot, 'plugins');
+	const scopeHome = join(scopeRoot, 'home');
+	const scopeAdded = join(scopeRoot, 'added');
+	mkdirSync(join(scopeRepo, '.git'), {recursive: true});
+	mkdirSync(join(scopeOutside, '.git'), {recursive: true});
+	const missingManaged = join(scopeRoot, 'no-managed');
+
+	const writeScoped = (dir, file, name, body, extra) =>
+		writeAgent(dir, file, name, `${name} description`, body, extra);
+	// Above the repository root: the walk must stop at .git and never see this.
+	writeScoped(join(scopeRoot, '.commandcode', 'agents'), 'above.md', 'above', 'ABOVE REPO ROOT');
+	writeScoped(join(scopeRepo, '.commandcode', 'agents'), 'shared.md', 'scope-winner', 'PROJECT');
+	writeScoped(join(scopeNested, '.commandcode', 'agents'), 'shared.md', 'scope-winner', 'NESTED');
+	writeScoped(join(scopeManaged, 'agents'), 'shared.md', 'scope-winner', 'MANAGED');
+	writeScoped(join(scopeHome, '.commandcode', 'agents'), 'shared.md', 'scope-winner', 'USER');
+	writeScoped(join(scopeRepo, '.commandcode', 'agents', 'sub'), 'deep.md', 'deep', 'DEEP');
+	writeScoped(join(scopeRepo, '.commandcode', 'agents'), 'dup-a.md', 'dup', 'DUP A');
+	writeScoped(join(scopeRepo, '.commandcode', 'agents'), 'dup-b.md', 'dup', 'DUP B');
+	writeFileSync(join(scopeRepo, '.commandcode', 'agents', 'no-name.md'), '---\ndescription: x\n---\nbody');
+	writeScoped(join(scopeAdded, '.commandcode', 'agents'), 'added.md', 'added', 'ADDED');
+	writeScoped(join(scopeAdded, '.commandcode', 'agents', 'nested'), 'deep-added.md', 'deep-added', 'DEEP ADDED');
+	writeScoped(join(scopePlugins, 'my-plugin', 'agents', 'review'), 'security.md', 'security', 'PLUGIN SECURITY', {
+		permissionMode: 'bypassPermissions',
+		hooks: '{}',
+		mcpServers: '[]',
+	});
+	writeFileSync(
+		join(scopePlugins, 'my-plugin', 'agents', 'broken.md'),
+		'---\nname: [oops\ndescription: x\n---\nbroken body',
+	);
+	writeFileSync(
+		join(scopePlugins, 'my-plugin', 'agents', 'noname.md'),
+		'Plugin fallback description\n\nNONAME BODY',
+	);
+
+	const definitionLog = [];
+	const registryOf = (over = {}) =>
+		scopeExports.createAgentRegistry({
+			fs: realFs,
+			cwd: scopeNested,
+			home: scopeHome,
+			builtins: [],
+			log: (message) => definitionLog.push(message),
+			managedDir: scopeManaged,
+			pluginRoots: [scopePlugins],
+			addDirs: [scopeAdded],
+			...over,
+		});
+
+	const allScopes = registryOf();
+	assert.equal(allScopes.get('scope-winner').source, 'managed', 'managed scope wins every other scope');
+	assert.equal(allScopes.get('scope-winner').systemPrompt, 'MANAGED', 'the managed definition is the loaded one');
+	assert.equal(allScopes.get('above'), undefined, 'project walk-up stops at the repository root');
+	assert.equal(allScopes.get('deep').systemPrompt, 'DEEP', 'a project subdirectory is scanned recursively');
+	assert.equal(allScopes.get('added').source, 'project', '--add-dir loads its .commandcode/agents');
+	assert.equal(allScopes.get('deep-added').systemPrompt, 'DEEP ADDED', '--add-dir is scanned recursively');
+
+	const noManaged = registryOf({managedDir: missingManaged});
+	assert.equal(noManaged.get('scope-winner').systemPrompt, 'NESTED', 'the closest project directory wins');
+	const fromRepo = registryOf({cwd: scopeRepo, managedDir: missingManaged});
+	assert.equal(fromRepo.get('scope-winner').systemPrompt, 'PROJECT', 'the outer project directory wins from there');
+	const userScopeOnly = registryOf({cwd: scopeOutside, managedDir: missingManaged});
+	assert.equal(userScopeOnly.get('scope-winner').source, 'user', 'user scope loads when no project definition exists');
+
+	const duplicates = allScopes.entries().filter((entry) => entry.kind === 'duplicate');
+	assert.equal(duplicates.length, 1, 'one same-directory duplicate is recorded');
+	assert.equal(duplicates[0].name, 'dup', 'the duplicate names the colliding definition');
+	assert.match(duplicates[0].duplicateOf ?? '', /dup-a\.md$/, 'the first file read is the one kept');
+	assert.match(duplicates[0].reason ?? '', /rename or remove/, 'the duplicate carries a proposed fix');
+	assert.equal(allScopes.get('dup').systemPrompt, 'DUP A', 'same-directory duplicates resolve by read order');
+
+	const pluginDefinition = allScopes.get('my-plugin:review:security');
+	assert.ok(pluginDefinition !== undefined, 'a plugin subfolder becomes part of the scoped name');
+	assert.equal(pluginDefinition.name, 'my-plugin:review:security', 'the scoped identifier is exact');
+	assert.equal(pluginDefinition.source, 'plugin', 'the definition is plugin scope');
+	assert.equal(allScopes.get('security'), undefined, 'a plugin definition is not addressable unscoped');
+	assert.equal(pluginDefinition.permissionMode, undefined, 'plugin definitions ignore permissionMode');
+	assert.ok(!('hooks' in pluginDefinition), 'plugin definitions ignore hooks');
+	assert.ok(!('mcpServers' in pluginDefinition), 'plugin definitions ignore mcpServers');
+
+	const fallbackDefinition = allScopes.get('my-plugin:noname');
+	assert.ok(fallbackDefinition !== undefined, 'a plugin file with no frontmatter loads under its filename');
+	assert.match(fallbackDefinition.systemPrompt, /NONAME BODY/, 'the fallback keeps the body');
+	const brokenDefinition = allScopes.get('my-plugin:broken');
+	assert.ok(brokenDefinition !== undefined, 'a plugin file with unparseable frontmatter still loads');
+	const brokenEntry = allScopes.entries().find((entry) => entry.path.endsWith('broken.md'));
+	assert.equal(brokenEntry.valid, true, 'the unparseable plugin file is loaded, not skipped');
+	assert.match(brokenEntry.warning ?? '', /frontmatter/, 'the plugin parse failure is a warning');
+
+	const cliInline = registryOf({
+		managedDir: missingManaged,
+		cli: {
+			value: JSON.stringify({
+				'scope-winner': {description: 'cli', prompt: 'CLI'},
+				'cli-only': {description: 'cli only', prompt: 'CLI ONLY', color: 'blue', experimental: {cacheTtl: '1h'}},
+			}),
+			interactive: true,
+		},
+	});
+	assert.equal(cliInline.get('scope-winner').source, 'cli', 'CLI scope beats project and user');
+	assert.equal(cliInline.get('scope-winner').systemPrompt, 'CLI', 'the CLI definition is the loaded one');
+	assert.equal(cliInline.get('cli-only').systemPrompt, 'CLI ONLY', 'an inline CLI definition loads');
+	assert.equal(cliInline.get('cli-only').color, undefined, 'CLI definitions ignore color');
+	assert.ok(!('experimental' in cliInline.get('cli-only')), 'CLI definitions ignore experimental');
+	assert.equal(registryOf({managedDir: missingManaged}).get('cli-only'), undefined, 'CLI definitions are session-only');
+	const managedOverCli = registryOf({
+		cli: {value: '{"scope-winner":{"description":"cli","prompt":"CLI"}}', interactive: true},
+	});
+	assert.equal(managedOverCli.get('scope-winner').source, 'managed', 'managed wins over CLI');
+
+	const cliFile = join(scopeRoot, 'agents.json');
+	writeFileSync(cliFile, JSON.stringify({fromFile: {description: 'file', prompt: 'FROM FILE'}}));
+	assert.equal(
+		registryOf({managedDir: missingManaged, cli: {value: cliFile, interactive: false}}).get('fromFile').systemPrompt,
+		'FROM FILE',
+		'a CLI JSON file loads in non-interactive mode',
+	);
+	const refusedFile = registryOf({managedDir: missingManaged, cli: {value: cliFile, interactive: true}});
+	assert.equal(refusedFile.get('fromFile'), undefined, 'interactive mode refuses a CLI file path');
+	const refusal = refusedFile.entries().find((entry) => entry.source === 'cli' && !entry.valid);
+	assert.ok(refusal !== undefined, 'the refusal is recorded');
+	assert.match(refusal.reason ?? '', /interactive session cannot load .*file/i, 'the refusal explains itself');
+
+	const cliBad = registryOf({
+		managedDir: missingManaged,
+		cli: {
+			value: JSON.stringify({
+				'-dash': {description: 'x', prompt: 'x'},
+				'colon:name': {description: 'x', prompt: 'x'},
+				['a'.repeat(257)]: {description: 'x', prompt: 'x'},
+				'no-desc': {prompt: 'x'},
+			}),
+			interactive: true,
+		},
+	});
+	assert.equal(
+		cliBad.entries().filter((entry) => entry.source === 'cli' && !entry.valid).length,
+		4,
+		'CLI name and description rules reject four definitions',
+	);
+
+	const doctorRuntime = makeRuntime({now: () => fixedNow, cwd: scopeNested, home: scopeHome, interactive: false});
+	const doctorSpool = mkdtempSync(join(tmpdir(), 'subagent-doctor-'));
+	const doctor = makeApi({spoolDir: doctorSpool, session: makeSession(), runtime: doctorRuntime.runtime});
+	doctor.api.setFlag('managed_dir', scopeManaged);
+	doctor.api.setFlag('add_dir', scopeAdded);
+	doctor.api.setFlag('plugin_dir', scopePlugins);
+	doctor.api.setFlag('agents', cliFile);
+	mod(doctor.api, doctor.runtime);
+
+	const doctorCommand = doctor.commandDefs.find((def) => def.name === 'doctor');
+	assert.ok(doctorCommand !== undefined, '/doctor is registered');
+	const report = doctorCommand.handler({args: ''}).message;
+	assert.match(report, /duplicate/i, '/doctor reports duplicates');
+	assert.match(report, /dup-a\.md/, '/doctor names the definition that was kept');
+	assert.match(report, /dup-b\.md/, '/doctor names the duplicate file');
+	assert.match(report, /rename or remove/i, '/doctor proposes a fix');
+	assert.match(report, /no-name\.md/, '/doctor names each invalid file');
+	assert.match(report, /broken\.md/, '/doctor names each unparseable plugin file');
+	assert.match(report, /my-plugin:review:security/, '/doctor lists plugin-scoped names');
+
+	const pluginReport = doctorCommand.handler({args: 'plugins'}).message;
+	assert.match(pluginReport, /my-plugin:review:security/, '/doctor plugins validates plugin definitions');
+	assert.match(pluginReport, /broken\.md/, '/doctor plugins reports the unparseable plugin file');
+	assert.ok(!pluginReport.includes('no-name.md'), '/doctor plugins filters other scopes');
+
+	const pluginSpawn = toolOf(doctor, 'subagent_spawn');
+	const beforePluginSpawn = doctorRuntime.spawnCalls.length;
+	const spawnedPlugin = await pluginSpawn.run({
+		input: {description: 'plugin', prompt: 'x', subagent_type: 'my-plugin:review:security'},
+	});
+	assert.equal(spawnedPlugin.ok, true, 'a plugin-scoped name is spawnable');
+	const pluginSpec = JSON.parse(doctorRuntime.spawnCalls[beforePluginSpawn].options.env.SUBAGENT_SPEC);
+	assert.match(pluginSpec.systemPrompt, /PLUGIN SECURITY/, 'the plugin body reaches the worker');
+	const managedSpawn = await pluginSpawn.run({
+		input: {description: 'managed', prompt: 'x', subagent_type: 'scope-winner'},
+	});
+	assert.equal(managedSpawn.ok, true, 'the managed definition is spawnable');
+	assert.equal(
+		JSON.parse(doctorRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).systemPrompt,
+		'MANAGED',
+		'the managed scope wins through the flag-driven registry too',
+	);
+	const addedSpawn = await pluginSpawn.run({input: {description: 'added', prompt: 'x', subagent_type: 'added'}});
+	assert.equal(addedSpawn.ok, true, '--add-dir definitions are spawnable');
+	assert.equal(
+		JSON.parse(doctorRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).systemPrompt,
+		'ADDED',
+		'the added directory reaches the worker',
+	);
+	const agentListing = doctor.commandDefs.find((def) => def.name === 'agents').handler({args: ''}).message;
+	assert.match(agentListing, /my-plugin:review:security {2}plugin {2}valid/, '/agents lists a plugin-scoped name');
+	assert.match(agentListing, /added {2}project {2}valid/, '/agents lists an --add-dir definition');
+	assert.match(agentListing, /fromFile {2}cli {2}valid/, '/agents lists a CLI definition');
+	ok('scopes: managed, CLI, project, user, plugin, precedence, --add-dir, plugin names, /doctor');
+
+	// 43. foreground and background execution -------------------------------
 	// Policy: the disable env wins over the definition, a definition's
 	// `background: true` wins over the caller, and the default is background. The
 	// fake runtime's spawn is the seam: a fake worker that settles the record during
@@ -2009,7 +2213,7 @@ process.stdin.on('data', (data) => {
 	);
 	ok('API errors: partial output survives a cut-off, empty fails with the exact error, background delivers the last output');
 
-	// 45. the policy table and the result shaping are pure, so every forced-mode
+		// 46. the policy table and the result shaping are pure, so every forced-mode
 	// combination is asserted directly instead of being inferred from a spawn.
 	const policy = (requested, definitionBackground, env) =>
 		resolveExecutionPolicy({requested, definitionBackground, env});
@@ -2065,7 +2269,6 @@ process.stdin.on('data', (data) => {
 		'the inline foreground result is scanned like every other report',
 	);
 	ok('policy precedence and foreground result shaping, asserted as a table');
-
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
