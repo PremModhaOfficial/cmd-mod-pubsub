@@ -57,6 +57,9 @@ const isTerminal = (record) =>
 	record !== undefined && ['done', 'failed', 'waiting-input', 'canceled'].includes(record.state);
 
 try {
+	// Keep the idle live session short so a later explicit resume is exercised on a
+	// worker that has already exited, not one still waiting for messages.
+	process.env.BETTER_SUBAGENTS_LIVE_IDLE_MS ??= '750';
 	const dir = mkdtempSync(join(tmpdir(), 'subagent-e2e-'));
 	const api = makeApi({spoolDir: dir, session: makeSession()});
 	mod(api.api, api.runtime);
@@ -147,6 +150,7 @@ try {
 			description: 'acp job',
 			prompt: 'Reply with exactly the word pong and nothing else.',
 			subagent_type: 'general-purpose',
+			name: 'ponger',
 		},
 	});
 	assert.equal(agentSpawned.ok, true, `agent spawn must succeed: ${JSON.stringify(agentSpawned)}`);
@@ -166,6 +170,37 @@ try {
 	assert.equal(agentSignal.state, 'done');
 	assert.equal(agentSignal.owner, agentRecord.owner);
 	ok(`ACP job completed: jobs/${agentId}.json, logs/${agentId}.log, inbox/ signal`);
+
+	// 2b. a real live message ------------------------------------------------
+	// The agent is running, idle, or already finished by now; each path is a legal
+	// live send. The answer must land in the same session (the original log or the
+	// log of the resumed job), which proves the control queue or the resume path.
+	const liveSend = await toolOf(api, 'subagent_send').run({
+		input: {to: 'ponger', message: 'Reply with exactly the word banana and nothing else.'},
+	});
+	assert.equal(liveSend.ok, true, `live send must start: ${JSON.stringify(liveSend)}`);
+	const liveText = await waitFor(() => {
+		const own = readFileSync(join(dir, 'logs', `${agentId}.log`), 'utf8');
+		if (/banana/i.test(own)) return own;
+		for (const name of readdirSync(join(dir, 'jobs')).filter((file) => file.endsWith('.json'))) {
+			let job;
+			try {
+				job = JSON.parse(readFileSync(join(dir, 'jobs', name), 'utf8'));
+			} catch {
+				continue;
+			}
+			if (job.name !== 'ponger' || job.id === agentId) continue;
+			try {
+				const text = readFileSync(join(dir, 'logs', `${job.id}.log`), 'utf8');
+				if (/banana/i.test(text)) return text;
+			} catch {
+				/* the resumed job has not opened its log yet */
+			}
+		}
+		return undefined;
+	}, 'the live message to be answered', 180_000);
+	assert.match(liveText, /banana/i, 'the live message was answered in the agent session');
+	ok('live message: the named agent answered the message in its own session');
 
 	// 3. a real timeout -----------------------------------------------------
 	const slow = await toolOf(api, 'subagent_spawn').run({
@@ -197,11 +232,14 @@ try {
 	assert.match(
 		readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'),
 		/model not set|unknown model|not in the allowed catalog/i,
-		'the model rejection is in the log',
+		'the model rejection or documented fallback is in the log',
 	);
 	ok(`bad model reported and the job finished: jobs/${failId}.json (${failRecord.state})`);
 
 	// 4. a real resume ------------------------------------------------------
+	// The live worker (original or resumed by the message) owns the session until its
+	// idle window passes; wait it out, then resume explicitly.
+	await sleep(1500);
 	const resumed = await toolOf(api, 'subagent_resume').run({
 		input: {id: agentId, prompt: 'Reply with exactly the word ping and nothing else.'},
 	});

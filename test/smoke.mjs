@@ -16,13 +16,14 @@
 
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
 import mod, {
 	AGENT_API_ERROR,
+	buildRoster,
 	commandEscapesWorktree,
 	createJobWorktree,
 	defaultBranch,
@@ -128,9 +129,9 @@ try {
 
 	// 4. cross-session isolation -------------------------------------------
 	// Session A fires a signal. A's drain delivers it; B's drain must not.
-	const send = toolOf(a, 'subagent_send');
+	const send = toolOf(a, 'pubsub_send');
 	const sendResult = await send.run({input: {title: 'smoke signal', body: 'hello from A'}});
-	assert.equal(sendResult.ok, true, 'subagent_send must succeed');
+	assert.equal(sendResult.ok, true, 'pubsub_send must succeed');
 	assert.equal(a.userMessages.length, 1, 'A must receive its own signal');
 	assert.match(a.userMessages[0].text, /\[subagent\] smoke signal/, 'signal text must be addressed');
 	assert.equal(a.userMessages[0].options?.deliverAs, 'steer', 'default delivery is steer');
@@ -594,7 +595,7 @@ try {
 	const replaySession = makeSession();
 	const replayOne = makeApi({spoolDir: replayDir, session: replaySession, runtime: makeRuntime().runtime});
 	mod(replayOne.api, replayOne.runtime);
-	await toolOf(replayOne, 'subagent_send').run({input: {title: 'once only', body: 'first'}});
+	await toolOf(replayOne, 'pubsub_send').run({input: {title: 'once only', body: 'first'}});
 	assert.equal(replayOne.userMessages.length, 1, 'the first factory delivers once');
 	const deliveredId = replayOne.userMessages[0].text.match(/job (\S+)/)[1];
 	const replayOwner = ownerEntries(replaySession)[0];
@@ -881,7 +882,6 @@ try {
 		['subagent_spawn', 'pubsub_fire'],
 		['subagent_list', 'pubsub_list'],
 		['subagent_cancel', 'pubsub_cancel'],
-		['subagent_send', 'pubsub_send'],
 	];
 	for (const [canonical, deprecated] of aliasPairs) {
 		const target = toolOf(alias, canonical);
@@ -891,6 +891,10 @@ try {
 		assert.equal(old.run, target.run, `${deprecated} must delegate to ${canonical}`);
 		assert.match(old.schema.description, new RegExp(`deprecated: use ${canonical}`), `${deprecated} must say it is deprecated`);
 	}
+	// pubsub_send is the legacy NOTE channel, deliberately not a live-message alias.
+	const legacyNote = toolOf(alias, 'pubsub_send');
+	assert.deepEqual(Object.keys(legacyNote.schema.input_schema.properties).sort(), ['body', 'title'], 'pubsub_send keeps title/body');
+	assert.notEqual(legacyNote.run, toolOf(alias, 'subagent_send').run, 'pubsub_send is not subagent_send');
 	assert.deepEqual(toolNames(alias).filter((name) => name.startsWith('pubsub_')).sort(), [
 		'pubsub_fire',
 		'pubsub_list',
@@ -1363,7 +1367,7 @@ process.stdin.on('data', (data) => {
 	);
 	chmodSync(fakeCmd, 0o755);
 
-	const runAcpJob = async (id, markerPath, resumeSession) => {
+	const runAcpJob = async (id, markerPath, resumeSession, extraRecord = {}) => {
 		const spec = seam.buildSpec(
 			{
 				id,
@@ -1388,7 +1392,7 @@ process.stdin.on('data', (data) => {
 			},
 			'/mod.ts',
 		);
-		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued'}));
+		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued', ...extraRecord}));
 		const child = spawn(process.execPath, ['-e', workerText], {
 			cwd: acpDir,
 			env: {...process.env, SUBAGENT_SPEC: JSON.stringify(spec), BETTER_SUBAGENTS_WORKER: '1'},
@@ -1441,6 +1445,12 @@ process.stdin.on('data', (data) => {
 	assert.ok(!acpResumed.log.includes('SESSION_NEW'), 'resume does not fall back to a new session');
 	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
+
+	// SubagentHandback already delivered the report. The wrapper must record the
+	// terminal state without emitting a second signal for the same run.
+	const acpHandback = await runAcpJob('acp-handback', markerPath, undefined, {handbackAt: 1});
+	assert.equal(acpHandback.record.state, 'done', 'a handback run still settles its record');
+	assert.equal(acpHandback.signals.length, 0, 'the handback signal is not duplicated');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
 
 	// limits: the concurrency pool, nesting depth, and the shared TTL sweeper ---
@@ -3644,6 +3654,414 @@ process.stdin.on('data', (data) => {
 	assert.match(noRepo.error, /git repository/, 'the error says why');
 	assert.equal(noRepoRuntime.spawnCalls.length, 0, 'no worker starts without its worktree');
 	ok('worktree isolation: fire creates it, the result removes or keeps and reports it');
+
+	// 65. the sibling roster -------------------------------------------------
+	// The roster is a snapshot built once at spawn: main plus every OTHER named
+	// agent. Unnamed jobs are not addressable, duplicates collapse to the newest
+	// record, and an agent is never listed as its own sibling.
+	const roster = buildRoster(
+		[
+			{name: 'Tester', state: 'running', jobId: 'j1'},
+			{name: 'Tester', state: 'done', jobId: 'j0'},
+			{name: '', state: 'running', jobId: 'j2'},
+			{state: 'done', jobId: 'j3'},
+			{name: 'Helper', state: 'done', jobId: 'j4'},
+			{name: 'Runner', state: 'running', jobId: 'j5'},
+		],
+		'Tester',
+	);
+	assert.match(roster, /^SIBLING ROSTER/m, 'the roster has a header');
+	assert.match(roster, /\bmain\b/, 'the roster always includes main');
+	assert.match(roster, /Helper/, 'a named sibling is listed');
+	assert.match(roster, /running/, 'a sibling state is listed');
+	assert.ok(!/Tester/.test(roster), 'the agent is not its own sibling');
+	assert.ok(!/j3/.test(roster), 'an unnamed job is not an addressable agent');
+	assert.equal(buildRoster([{name: 'Tester', jobId: 'j1'}], 'Tester'), '', 'no named sibling means no roster');
+	assert.equal(buildRoster([], undefined), '', 'no agents means no roster');
+	ok('buildRoster: main plus named siblings only, self excluded, newest wins');
+
+	// 66. live messaging: the worker control channel -------------------------
+	// A real worker process, a real fake ACP child, and the real control file. A
+	// message appended while a prompt runs is queued and becomes the next prompt
+	// (the turn is not restarted); a message appended while the agent is idle
+	// starts a turn. Each message turn emits its own `message` signal, so main
+	// gets the reply without waiting for the agent to exit.
+	const appendLine = (file, value) => appendFileSync(file, JSON.stringify(value) + '\n');
+	const waitUntil = async (check, label, timeout = 6000) => {
+		const deadline = Date.now() + timeout;
+		while (Date.now() < deadline) {
+			const value = check();
+			if (value) return value;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		throw new Error(`timed out waiting for ${label}`);
+	};
+	const liveCmd = join(acpDir, 'live-cmd.mjs');
+	writeFileSync(
+		liveCmd,
+		`#!/usr/bin/env node
+let buffer = '';
+let turn = 0;
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+const chunk = (text) => send({method: 'session/update', params: {sessionId: 'acp-live', update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text}}}});
+const delay = Number(process.env.FAKE_PROMPT_DELAY || 0);
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') send({id: message.id, result: {protocolVersion: 1}});
+    else if (message.method === 'session/new') send({id: message.id, result: {sessionId: 'acp-live', modes: {currentModeId: 'default', availableModes: []}, configOptions: []}});
+    else if (message.method === 'session/set_mode' || message.method === 'session/set_config_option') send({id: message.id, result: {}});
+    else if (message.method === 'session/prompt') {
+      turn += 1;
+      const text = message.params.prompt?.[0]?.text ?? '';
+      chunk('PROMPT' + turn + ' ' + JSON.stringify(text) + '\\n');
+      setTimeout(() => {
+        chunk('REPLY' + turn + ' ' + JSON.stringify(text) + '\\n');
+        send({id: message.id, result: {stopReason: 'end_turn'}});
+      }, delay);
+    }
+  }
+});
+`,
+	);
+	chmodSync(liveCmd, 0o755);
+	const liveDir = mkdtempSync(join(tmpdir(), 'subagent-live-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(liveDir, dir), {recursive: true});
+	const startLive = (id, delay, idleMs) => {
+		const controlDir = join(liveDir, 'control', id);
+		mkdirSync(controlDir, {recursive: true});
+		const spec = seam.buildSpec(
+			{
+				id,
+				label: id,
+				kind: 'agent',
+				owner: 'owner-live',
+				cwd: liveDir,
+				logPath: join(liveDir, 'logs', `${id}.log`),
+				inboxDir: join(liveDir, 'inbox'),
+				jobsDir: join(liveDir, 'jobs'),
+				startedAt: Date.now(),
+				tailMax: 8000,
+				bin: liveCmd,
+				prompt: 'first task',
+				agentType: 'general-purpose',
+				systemPrompt: 'You are live.',
+				name: id,
+				live: true,
+				idleMs,
+				controlPollMs: 20,
+				controlDir,
+			},
+			'/mod.ts',
+		);
+		writeFileSync(join(liveDir, 'jobs', `${id}.json`), JSON.stringify({id, name: id, state: 'queued'}));
+		const child = spawn(process.execPath, ['-e', workerText], {
+			cwd: liveDir,
+			env: {
+				...process.env,
+				SUBAGENT_SPEC: JSON.stringify(spec),
+				BETTER_SUBAGENTS_WORKER: '1',
+				FAKE_PROMPT_DELAY: String(delay),
+			},
+		});
+		const exited = new Promise((resolve) => child.on('exit', resolve));
+		return {
+			id,
+			controlDir,
+			exited,
+			log: () => {
+				try {
+					return readFileSync(join(liveDir, 'logs', `${id}.log`), 'utf8');
+				} catch {
+					return '';
+				}
+			},
+			signals: () =>
+				readdirSync(join(liveDir, 'inbox'))
+					.filter((name) => name.includes(id))
+					.map((name) => JSON.parse(readFileSync(join(liveDir, 'inbox', name), 'utf8'))),
+		};
+	};
+
+	// running: the message lands while turn 1 is still going.
+	const liveRunning = startLive('live-running', 600, 400);
+	appendLine(join(liveRunning.controlDir, 'send.jsonl'), {from: 'main', message: 'queued while busy', at: Date.now()});
+	const runningLog = await waitUntil(() => {
+		const text = liveRunning.log();
+		return /REPLY2/.test(text) ? text : undefined;
+	}, 'the queued message to run after turn 1');
+	assert.match(runningLog, /PROMPT2 "queued while busy"/, 'the queued message becomes the next prompt');
+	assert.ok(runningLog.indexOf('REPLY1') < runningLog.indexOf('PROMPT2'), 'turn 1 was not restarted');
+	await liveRunning.exited;
+	const runningSignals = liveRunning.signals();
+	assert.equal(
+		runningSignals.filter((signal) => signal.kind === 'message').length,
+		1,
+		'one message signal per message turn',
+	);
+	assert.match(runningSignals.find((signal) => signal.kind === 'message').body, /REPLY2/, 'the reply is in the signal');
+	ok('live worker: a message during a turn is queued to the next safe point');
+
+	// 67. live messaging: a message to an idle agent starts a turn -------------
+	// Turn 1 is done and the agent is waiting; the message starts a turn.
+	const liveIdle = startLive('live-idle', 0, 3000);
+	await waitUntil(
+		() =>
+			liveIdle.signals().some((signal) => signal.state === 'done' && signal.kind === 'agent') &&
+			(() => {
+				try {
+					return JSON.parse(readFileSync(join(liveIdle.controlDir, 'state.json'), 'utf8')).busy === false;
+				} catch {
+					return false;
+				}
+			})(),
+		'the idle state after turn 1',
+	);
+	appendLine(join(liveIdle.controlDir, 'send.jsonl'), {from: 'main', message: 'wake up', at: Date.now()});
+	const idleLog = await waitUntil(() => (/REPLY2/.test(liveIdle.log()) ? liveIdle.log() : undefined), 'the idle message to start a turn');
+	assert.match(idleLog, /PROMPT2 "wake up"/, 'the idle message starts a turn');
+	await waitUntil(
+		() => liveIdle.signals().some((signal) => signal.kind === 'message' && /REPLY2/.test(String(signal.body))),
+		'the idle reply signal',
+	);
+	await liveIdle.exited;
+	ok('live worker: a message to an idle agent starts a turn');
+
+	// 68. live messaging: send routing ---------------------------------------
+	// The parent resolves a name to a job record. A live worker gets the message
+	// appended to its control file; a finished agent is resumed as a new job with
+	// the recorded ACP session. The fake runtime proves both without a process.
+	const liveSpool = mkdtempSync(join(tmpdir(), 'subagent-send-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(liveSpool, dir), {recursive: true});
+	const sendSession = makeSession();
+	const livePid = 555555;
+	const sendRuntime = makeRuntime({alive: (pid) => pid === livePid});
+	const sendBundle = makeApi({spoolDir: liveSpool, session: sendSession, runtime: sendRuntime.runtime});
+	mod(sendBundle.api, sendBundle.runtime);
+	const sendOwner = ownerEntries(sendSession)[0];
+	const sendTool = toolOf(sendBundle, 'subagent_send');
+	const noteTool = toolOf(sendBundle, 'pubsub_send');
+	assert.deepEqual(Object.keys(sendTool.schema.input_schema.properties).sort(), ['message', 'to'], 'subagent_send takes to and message');
+	assert.deepEqual(Object.keys(noteTool.schema.input_schema.properties).sort(), ['body', 'title'], 'pubsub_send stays the legacy note tool');
+	assert.ok(!/deprecated: use subagent_send/.test(noteTool.schema.description), 'pubsub_send is not an alias of subagent_send');
+
+	const liveRecord = {
+		id: 'live-1',
+		owner: sendOwner,
+		name: 'Tester',
+		label: 'tester',
+		kind: 'agent',
+		agentType: 'general-purpose',
+		state: 'running',
+		startedAt: 1,
+		workerPid: livePid,
+		cwd: liveSpool,
+		logPath: join(liveSpool, 'logs', 'live-1.log'),
+	};
+	writeFileSync(join(liveSpool, 'jobs', 'live-1.json'), JSON.stringify(liveRecord));
+	const queued = await sendTool.run({input: {to: 'Tester', message: 'first'}});
+	assert.equal(queued.ok, true, JSON.stringify(queued));
+	assert.match(queued.content[0].text, /next safe point/, 'a busy worker queues');
+	const sendFile = join(liveSpool, 'control', 'live-1', 'send.jsonl');
+	const firstLine = JSON.parse(readFileSync(sendFile, 'utf8').trim().split('\n')[0]);
+	assert.equal(firstLine.message, 'first', 'the message reaches the control file');
+	assert.equal(firstLine.from, 'main', 'the sender is recorded');
+	assert.equal(typeof firstLine.at, 'number', 'the queue entry is stamped');
+
+	mkdirSync(join(liveSpool, 'control', 'live-1'), {recursive: true});
+	writeFileSync(join(liveSpool, 'control', 'live-1', 'state.json'), JSON.stringify({busy: false}));
+	const startedLive = await sendTool.run({input: {to: 'Tester', message: 'second'}});
+	assert.match(startedLive.content[0].text, /starts a turn/, 'an idle worker starts a turn');
+	assert.equal(readFileSync(sendFile, 'utf8').trim().split('\n').length, 2, 'the idle message is queued too');
+
+	const unknownTarget = await sendTool.run({input: {to: 'Nobody', message: 'hi'}});
+	assert.equal(unknownTarget.ok, false, 'an unknown target is an error');
+	assert.match(unknownTarget.error, /no agent named "Nobody"/, 'the error names the target');
+	assert.match(unknownTarget.error, /Tester/, 'the error lists the addressable names');
+
+	writeFileSync(
+		join(liveSpool, 'jobs', 'live-1.json'),
+		JSON.stringify({...liveRecord, state: 'done', workerPid: undefined, acpSessionId: 'acp-old', finishedAt: 2, durationMs: 1}),
+	);
+	const spawnsBefore = sendRuntime.spawnCalls.length;
+	const resumedLive = await sendTool.run({input: {to: 'Tester', message: 'after finish'}});
+	assert.equal(resumedLive.ok, true, JSON.stringify(resumedLive));
+	assert.equal(sendRuntime.spawnCalls.length, spawnsBefore + 1, 'a finished target is resumed in a new worker');
+	const liveResumeSpec = JSON.parse(sendRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(liveResumeSpec.resumeSession, 'acp-old', 'the recorded ACP session is resumed');
+	assert.equal(liveResumeSpec.name, 'Tester', 'the resumed job keeps the addressable name');
+	assert.equal(liveResumeSpec.prompt, 'after finish', 'the live message is the resumed turn');
+	assert.equal(typeof liveResumeSpec.startup, 'string', 'the resumed turn gets its startup context');
+	assert.match(resumedLive.content[0].text, /resumed/i, 'the tool reports a resume');
+
+	const toMain = await sendTool.run({input: {to: 'main', message: 'note to self'}});
+	assert.equal(toMain.ok, true, JSON.stringify(toMain));
+	assert.match(sendBundle.userMessages.at(-1).text, /note to self/, 'main receives a message addressed to main');
+
+	writeFileSync(
+		join(liveSpool, 'jobs', 'helper.json'),
+		JSON.stringify({id: 'helper', owner: sendOwner, name: 'Helper', label: 'helper', kind: 'agent', state: 'done', startedAt: 0}),
+	);
+	const spawnTool = toolOf(sendBundle, 'subagent_spawn');
+	const named = await spawnTool.run({input: {description: 'named spawn', prompt: 'hello', name: 'Scout'}});
+	assert.equal(named.ok, true, JSON.stringify(named));
+	const namedSpec = JSON.parse(sendRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(namedSpec.name, 'Scout', 'the spawn carries the name');
+	assert.equal(namedSpec.live, true, 'an agent job accepts live messages');
+	assert.match(namedSpec.controlDir, /control/, 'the worker gets its control directory');
+	assert.match(namedSpec.roster, /\bmain\b/, 'the roster lists main');
+	assert.match(namedSpec.roster, /Helper/, 'the roster lists a named sibling');
+	assert.ok(!/Scout/.test(namedSpec.roster), 'the new agent is not in its own roster');
+	assert.ok(namedSpec.rosterNames.includes('Helper'), 'the roster names travel as data');
+	ok('subagent_send: running queues, idle starts a turn, finished resumes, main is addressable');
+
+	// 69. ListAgents, subagent_agents, and SubagentHandback ------------------
+	// ListAgents is a foreground surface. The same factory, run as a background
+	// worker, must not register it. subagent_agents lists definitions; handback is
+	// the worker's explicit final-report path.
+	const visibility = (background, crossSessionEnabled = true) => {
+		const dir = mkdtempSync(join(tmpdir(), 'subagent-vis-'));
+		const spec = {
+			id: 'w-vis',
+			owner: 'owner-vis',
+			name: 'Worker',
+			kind: 'agent',
+			jobsDir: join(dir, 'jobs'),
+			inboxDir: join(dir, 'inbox'),
+			logPath: join(dir, 'logs', 'w-vis.log'),
+			controlDir: join(dir, 'control', 'w-vis'),
+			startedAt: 1,
+			tailMax: 100,
+			background,
+		};
+		const rt = makeRuntime({
+			env: {
+				...process.env,
+				BETTER_SUBAGENTS_WORKER: '1',
+				SUBAGENT_SPEC: JSON.stringify(spec),
+				...(crossSessionEnabled ? {} : {BETTER_SUBAGENTS_CROSS_SESSION: '0'}),
+			},
+		});
+		const bundle = makeApi({spoolDir: dir, session: makeSession(), runtime: rt.runtime});
+		mod(bundle.api, bundle.runtime);
+		return bundle;
+	};
+	assert.ok(!toolNames(visibility(true)).includes('ListAgents'), 'a background worker does not keep ListAgents');
+	assert.ok(toolNames(visibility(false)).includes('ListAgents'), 'a foreground worker keeps ListAgents');
+	assert.ok(!toolNames(visibility(false, false)).includes('ListAgents'), 'cross-session messaging off removes ListAgents');
+	assert.ok(toolNames(sendBundle).includes('ListAgents'), 'the main session has ListAgents');
+	assert.ok(toolNames(visibility(false)).includes('SubagentHandback'), 'a worker can hand a report back');
+	assert.ok(!toolNames(sendBundle).includes('SubagentHandback'), 'the main session has no handback tool');
+
+	const defs = await toolOf(sendBundle, 'subagent_agents').run({input: {scope: 'builtin'}});
+	assert.equal(defs.ok, true, JSON.stringify(defs));
+	assert.match(defs.content[0].text, /general-purpose/, 'definitions include the built-in fallback');
+	assert.match(defs.content[0].text, /builtin/, 'each row names its scope');
+
+	const listAgentsOut = await toolOf(sendBundle, 'ListAgents').run({input: {}});
+	assert.equal(listAgentsOut.ok, true, JSON.stringify(listAgentsOut));
+	assert.match(listAgentsOut.content[0].text, /\bmain\b/, 'ListAgents always offers main');
+	assert.match(listAgentsOut.content[0].text, /Helper/, 'ListAgents lists a named peer');
+	assert.match(listAgentsOut.content[0].text, /Scout/, 'ListAgents lists the named spawn');
+
+	const hbDir = mkdtempSync(join(tmpdir(), 'subagent-hb-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(hbDir, dir), {recursive: true});
+	const hbSpec = {
+		id: 'hb-1',
+		owner: 'owner-hb',
+		name: 'Reporter',
+		label: 'reporter',
+		kind: 'agent',
+		jobsDir: join(hbDir, 'jobs'),
+		inboxDir: join(hbDir, 'inbox'),
+		logPath: join(hbDir, 'logs', 'hb-1.log'),
+		controlDir: join(hbDir, 'control', 'hb-1'),
+		startedAt: 10,
+		tailMax: 100,
+		background: false,
+	};
+	const hbRt = makeRuntime({env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(hbSpec)}});
+	const hb = makeApi({spoolDir: hbDir, session: makeSession(), runtime: hbRt.runtime});
+	mod(hb.api, hb.runtime);
+	writeFileSync(
+		join(hbDir, 'jobs', 'hb-1.json'),
+		JSON.stringify({id: 'hb-1', label: 'reporter', kind: 'agent', owner: 'owner-hb', state: 'running', startedAt: 10}),
+	);
+	const handback = await toolOf(hb, 'SubagentHandback').run({input: {report: 'the final answer is 42'}});
+	assert.equal(handback.ok, true, JSON.stringify(handback));
+	const hbSignals = readdirSync(join(hbDir, 'inbox')).map((name) =>
+		JSON.parse(readFileSync(join(hbDir, 'inbox', name), 'utf8')),
+	);
+	assert.equal(hbSignals.length, 1, 'handback emits exactly one signal');
+	assert.equal(hbSignals[0].owner, 'owner-hb', 'the report is addressed to the parent session');
+	assert.match(hbSignals[0].body, /42/, 'the report is the signal body');
+	const hbRecord = JSON.parse(readFileSync(join(hbDir, 'jobs', 'hb-1.json'), 'utf8'));
+	assert.equal(typeof hbRecord.handbackAt, 'number', 'the record marks the handback');
+
+	// A terminal record with a live worker is still stoppable: the cancel is a process
+	// stop plus the control marker, not a state transition.
+	writeFileSync(
+		join(liveSpool, 'jobs', 'live-idle.json'),
+		JSON.stringify({...liveRecord, id: 'live-idle', label: 'idle live', state: 'done', workerPid: livePid}),
+	);
+	const liveStopped = await toolOf(sendBundle, 'subagent_cancel').run({input: {id: 'live-idle'}});
+	assert.equal(liveStopped.ok, true, JSON.stringify(liveStopped));
+	assert.match(liveStopped.content[0].text, /stopped live agent/, 'a live idle agent can be stopped');
+	assert.ok(existsSync(join(liveSpool, 'control', 'live-idle', 'cancel')), 'the worker receives the cancel marker');
+
+	// A worker's own sends: main is a signal owned by the parent, and a peer must be
+	// in the roster the parent handed the worker.
+	const workerMain = visibility(false);
+	const fromWorker = await toolOf(workerMain, 'subagent_send').run({input: {to: 'main', message: 'from the worker'}});
+	assert.equal(fromWorker.ok, true, JSON.stringify(fromWorker));
+	const workerRoot = String(workerMain.api.getFlag('subagent_dir'));
+	const workerSignals = readdirSync(join(workerRoot, 'inbox')).map((name) =>
+		JSON.parse(readFileSync(join(workerRoot, 'inbox', name), 'utf8')),
+	);
+	assert.equal(workerSignals.length, 1, 'a worker message to main is one signal');
+	assert.equal(workerSignals[0].owner, 'owner-vis', 'it is addressed to the parent session');
+	assert.match(workerSignals[0].body, /from the worker/, 'the message is the body');
+
+	const peerDir = mkdtempSync(join(tmpdir(), 'subagent-peer-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(peerDir, dir), {recursive: true});
+	const peerSpec = {
+		id: 'peer-host',
+		owner: 'owner-vis',
+		name: 'Worker',
+		kind: 'agent',
+		rosterNames: ['Peer'],
+		jobsDir: join(peerDir, 'jobs'),
+		inboxDir: join(peerDir, 'inbox'),
+		logPath: join(peerDir, 'logs', 'peer-host.log'),
+		controlDir: join(peerDir, 'control', 'peer-host'),
+		startedAt: 1,
+		tailMax: 100,
+		background: false,
+	};
+	const peerRt = makeRuntime({
+		env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(peerSpec)},
+		alive: (pid) => pid === 777,
+	});
+	const peer = makeApi({spoolDir: peerDir, session: makeSession(), runtime: peerRt.runtime});
+	mod(peer.api, peer.runtime);
+	writeFileSync(
+		join(peerDir, 'jobs', 'peer.json'),
+		JSON.stringify({id: 'peer', owner: 'owner-other', name: 'Peer', state: 'running', kind: 'agent', startedAt: 1, workerPid: 777}),
+	);
+	const toPeer = await toolOf(peer, 'subagent_send').run({input: {to: 'Peer', message: 'hello peer'}});
+	assert.equal(toPeer.ok, true, JSON.stringify(toPeer));
+	assert.match(readFileSync(join(peerDir, 'control', 'peer', 'send.jsonl'), 'utf8'), /hello peer/, 'a roster peer receives the message');
+	assert.equal(
+		(await toolOf(peer, 'subagent_send').run({input: {to: 'Worker', message: 'x'}})).ok,
+		false,
+		'a worker cannot address a name outside its roster',
+	);
+	ok('ListAgents visibility, subagent_agents, and SubagentHandback');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
