@@ -47,9 +47,9 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 | --- | --- | --- |
 | `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `name`, `subagent_type` (or the deprecated `agent_type`), `model`, `effort`, `tools`, `disallowed_tools`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. A `name` makes the agent addressable with `subagent_send`. |
 | `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, effort, color, elapsed time and owner, plus how many signals are still waiting for this session. |
-| `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
+| `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration, owner and agent id, plus a bounded slice of its log (or its transcript when the log is gone) and the transcript path. `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
-| `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. The resumed run is a new job with its own signal. |
+| `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. `id` may be the agent id or the job id. The resumed run is a new job with its own signal; model, effort, cache TTL and the compact window carry over. |
 | `subagent_send` | `to`, `message` | Live message to a **named** agent or `main`. A running target queues the message and answers at its next safe point; an idle target starts a turn; a finished target resumes its ACP session with full context. The reply arrives as its own message signal. |
 | `subagent_agents` | `scope?` | Agent definitions with scope, model, tools, validity, and source file. |
 | `ListAgents` | none | Where cross-session messaging is on: `main` plus every named agent this conversation can message with `subagent_send`. Foreground agents only; a background agent does not keep it. |
@@ -138,8 +138,10 @@ plugin ignores the field.
 (`agent` flag or `BETTER_SUBAGENTS_AGENT`/`CLAUDE_CODE_AGENT`), never for a subagent, and a plugin
 ignores it. `autoCompactWindow` is clamped to 100,000–1,000,000 and can only lower the model's inherited
 window; it has no effect on the main session. `experimental.cacheTtl` accepts `5m` or `1h`. ACP exposes
-neither setting, so the adapter logs the resolved value as a recorded deviation
-(`docs/adr/0001-worker-and-control.md`) and the host default still governs.
+neither the window nor the TTL as a per-session option, so the adapter logs each resolved value as a
+recorded deviation (`docs/adr/0001-worker-and-control.md`) and the host default still governs. The
+prompt-cache split is recorded at spawn: a fork carries `promptCache: "shared"`, every other agent
+`"own"`.
 
 `--append-subagent-system-prompt` (text, `@path`, or the `append_subagent_system_prompt_file` flag) is
 appended to every subagent's system prompt. It is delivered through the mod flag or
@@ -379,14 +381,37 @@ gone instead of waiting forever. A detached worker survives the harness, so a li
 waiting.
 
 A job that overruns `timeout_ms` is `SIGTERM`ed and then `SIGKILL`ed, and signals `failed` with
-`timed out after …`. An ACP turn reports its `stopReason`: `end_turn` is `done`; `cancelled`,
-`max_tokens` and `max_turn_requests` are `failed` with the reason. A rejected `model` or `effort`
+`timed out after …`. An ACP turn reports its `stopReason`: `end_turn` is `done`; `cancelled` is `failed`
+with the reason. `max_tokens` and `max_turn_requests` (the `maxTurns` cap) keep the output already
+produced: the record and signal carry `partial: true`, the foreground returns it with a `[partial: …]`
+note, and the agent id lets a later `subagent_resume` continue it. A rejected `model` or `effort`
 config option is logged and the turn continues on the session default. A process that exits before the
 prompt completes is `failed` with `ACP exited before the prompt completed`, so an API or auth failure
 is visible rather than silent.
 
-Finished jobs keep their record and their log for **30 days** (`BETTER_SUBAGENTS_RETENTION_DAYS` overrides
-it), then both are swept. A running job is never swept, however old its record is.
+A completed agent job returns an **agent id**; `subagent_resume` accepts either that id or the job id.
+`explore` and `plan` are one-shot: they return no agent id and refuse a resume.
+
+Finished jobs keep their record, their log, and their transcript for **30 days**, then all three are
+swept together. `BETTER_SUBAGENTS_RETENTION_DAYS` (alias `CLAUDE_CODE_CLEANUP_PERIOD_DAYS`) or
+`cleanupPeriodDays` in `.commandcode/settings.json` sets the window. A running job is never swept,
+however old its record is.
+
+### Resume, transcripts, and compaction
+
+- Every agent job persists its conversation to `transcripts/<id>.jsonl` as the ACP `session/update`
+  stream arrives. It lives outside the main session file, so compacting the main transcript cannot
+  touch it, and a restart reads the same file.
+- `subagent_resume` continues the recorded ACP session (`session/resume`) and keeps the per-invocation
+  model, effort, `maxTurns`, `autoCompactWindow`, and `cacheTtl`. A partial `maxTurns` result is
+  resumable for the same reason.
+- Each subagent has its own context window. The adapter watches the host's `usage_update`; when the used
+  count crosses the resolved window it records and logs `compact_boundary` with `trigger: "auto"` and
+  the pre-compaction token count, and carries it on the signal. ACP emits no compaction event of its
+  own, so the crossing is the observable boundary (recorded deviation).
+- Prompt cache: a fork records `promptCache: "shared"` (the host fork copies the main session's cache);
+  every other agent records `"own"`. `cacheTtl` is carried and logged on the spec, but ACP has no option
+  for it, so the host default governs.
 
 ## Ownership — why another session's result never lands in yours
 
@@ -424,6 +449,7 @@ inbox/            workers drop <timestamp>-<id>.json here
 claimed/          rename target during delivery, so two drains cannot deliver one signal twice
 orphaned/         untagged legacy signals, quarantined instead of leaked
 logs/             one log per fired job
+transcripts/      one append-only JSONL conversation per agent job, addressed by agent id
 jobs/             one JSON record per job (for subagent_list and the jobs pane)
 control/          one directory per live agent: send.jsonl, cancel, state.json (and permission files)
 delivered.jsonl   durable delivery ledger, so a restart cannot replay a signal
@@ -498,7 +524,7 @@ node test/e2e.mjs     # the real thing: a real printf job, a real ACP job, a rea
 
 `test/e2e.mjs` needs `cmd` on PATH (or `COMMANDCODE_BIN`), a signed-in Command Code and network, so CI runs
 only the smoke suite. It prints the spool path it used, and leaves the artifacts there as evidence:
-`jobs/<id>.json`, `logs/<id>.log` and the `inbox/` signal for each job.
+`jobs/<id>.json`, `logs/<id>.log`, `transcripts/<id>.jsonl` and the `inbox/` signal for each job.
 
 The smoke test imports `better-sub-agents.ts` directly with Node's native TypeScript type stripping and drives it with
 a fake `ModApi` and a fake `Runtime` (both in `test/harness.mjs`) — no dependencies, no build, no network,
@@ -507,7 +533,11 @@ public surface (tools, command, flags, renderer, pane, hooks, timers) and each s
 seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
 the state table's edges, the envelope's record/signal agreement, a foreign signal surviving a failed
 restore, exactly one signal from each spawn-failure mode, the owner token being retried rather than
-replaced by `process-<pid>`, and the ledger's retention and restart behaviour. CI runs it on Node 24.
+replaced by `process-<pid>`, and the ledger's retention and restart behaviour. The T13 checks cover the
+agent id and the one-shot refusal, resume by agent id with model/effort/cache/window preserved, the
+fork/own prompt-cache split, transcript persistence across a restart, retention sweeping record + log +
+transcript together, and a `maxTurns` stop that is partial and emits `compact_boundary`. CI runs it on
+Node 24.
 
 ## License
 

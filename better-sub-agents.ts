@@ -151,6 +151,11 @@ const JOB_ENTRY_TYPE = 'subagent/job';
 const WORKER_ENV = 'BETTER_SUBAGENTS_WORKER';
 const WORKER_SPEC_ENV = 'SUBAGENT_SPEC';
 const RETENTION_ENV = 'BETTER_SUBAGENTS_RETENTION_DAYS';
+// `cleanupPeriodDays` is the Claude Code name for the same window. The host has no
+// such setting, so the alias arrives through the environment, and a project or user
+// `.commandcode/settings.json` is read as the documented settings surface.
+const RETENTION_ENV_ALIAS = 'CLAUDE_CODE_CLEANUP_PERIOD_DAYS';
+const CLEANUP_PERIOD_SETTING = 'cleanupPeriodDays';
 // Limits. The concurrency limit is per session; the depth limit caps nesting.
 const MAX_CONCURRENT_DEFAULT = 20;
 const MAX_CONCURRENT_ENV = 'BETTER_SUBAGENTS_MAX_CONCURRENT';
@@ -265,6 +270,22 @@ const readRecord = () => {
   try { return JSON.parse(fs.readFileSync(recordPath, 'utf8')); } catch (e) { return {}; }
 };
 
+// The persisted conversation for this agent. Append-only JSONL: the ACP update
+// stream in order, plus a result line and any compact boundary. It lives outside
+// the main session, so the main transcript compacting can never touch it.
+const transcriptPath = typeof spec.transcriptPath === 'string' ? spec.transcriptPath : '';
+let transcriptFd;
+const transcriptWrite = entry => {
+  if (transcriptPath.length === 0) return;
+  try {
+    if (transcriptFd === undefined) {
+      fs.mkdirSync(path.dirname(transcriptPath), {recursive: true});
+      transcriptFd = fs.openSync(transcriptPath, 'a');
+    }
+    fs.writeSync(transcriptFd, JSON.stringify(entry) + '\\n');
+  } catch (e) {}
+};
+
 // Canceled is terminal. Re-read inside this call (Node is single-threaded, so the
 // read+write pair cannot interleave with the cancel tool) and force the state back
 // if a cancellation landed while the child was exiting.
@@ -347,12 +368,23 @@ const settle = (state, detail, code, tail, extra) => {
     awaitingInput: state === 'waiting-input' ? true : undefined,
     question: typeof payload.question === 'string' ? payload.question : undefined,
     permissionRequest: payload.permissionRequest,
+    partial: payload.partial === true ? true : undefined,
+    compactBoundary: payload.compactBoundary,
     scanned: true,
     scanMatches: scan.matches
   });
+  transcriptWrite({
+    at: finishedAt,
+    type: 'result',
+    state: state,
+    exitCode: typeof code === 'number' ? code : null,
+    partial: payload.partial === true,
+    compactBoundary: payload.compactBoundary
+  });
   emit(signalEnvelope({
     id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
-    startedAt: spec.startedAt, logPath: spec.logPath, sessionId: spec.sessionId
+    startedAt: spec.startedAt, logPath: spec.logPath, sessionId: spec.sessionId,
+    ...(typeof spec.agentId === 'string' ? {agentId: spec.agentId} : {})
   }, Object.assign({
     state: state,
     exitCode: typeof code === 'number' ? code : null,
@@ -601,7 +633,10 @@ const forkLiveLoop = async () => {
     }
     for (const line of parsed.toolLines) logWrite(line + '\\n');
     const reply = parsed.result && typeof parsed.result.finalText === 'string' ? parsed.result.finalText.trim() : '';
-    if (reply.length > 0) logWrite(reply + '\\n');
+    if (reply.length > 0) {
+      logWrite(reply + '\\n');
+      transcriptWrite({at: Date.now(), update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text: reply + '\\n'}}});
+    }
     const failure = turnError !== undefined
       ? 'live turn failed: ' + String(turnError && turnError.message || turnError)
       : !parsed.result
@@ -618,7 +653,8 @@ const forkLiveLoop = async () => {
       owner: spec.owner,
       startedAt: startedAt,
       logPath: spec.logPath,
-      sessionId: spec.sessionId
+      sessionId: spec.sessionId,
+      ...(typeof spec.agentId === 'string' ? {agentId: spec.agentId} : {})
     }, {
       state: failure === undefined ? 'done' : 'failed',
       exitCode: failure === undefined ? 0 : null,
@@ -654,7 +690,10 @@ const finishFork = (code, spawnError, signal) => {
   }
   for (const line of parsed.toolLines) logWrite(line + '\\n');
   const text = result && typeof result.finalText === 'string' ? result.finalText.trim() : '';
-  if (text.length > 0) logWrite((text.charAt(text.length - 1) === '\\n' ? text : text + '\\n'));
+  if (text.length > 0) {
+    logWrite(text.charAt(text.length - 1) === '\\n' ? text : text + '\\n');
+    transcriptWrite({at: Date.now(), update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text: text + '\\n'}}});
+  }
   const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
   const errorText = result && typeof result.error === 'string' ? result.error : '';
   const stopReason = result && typeof result.stopReason === 'string' ? result.stopReason : '';
@@ -677,8 +716,8 @@ const finishFork = (code, spawnError, signal) => {
     shutdown();
     return;
   }
-  if (stopReason === 'max_turn_requests' || stopReason === 'max_tokens') {
-    settle('failed', 'max turns reached; result is partial', code, text);
+  if (stopReason === 'max_turn_requests' || stopReason === 'max_tokens' || stopReason === 'max_turns') {
+    settle('failed', 'max turns reached; result is partial', code, text, {partial: true});
   } else {
     settle('done', 'exit 0', code === null ? 0 : code, text);
   }
@@ -829,6 +868,24 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     shutdown();
   };
 
+  // The host publishes usage after each turn. Auto-compaction itself is host-side;
+  // the observable event is the crossing of this agent's window with the token
+  // count from before it. A new high-water mark per turn keeps one crossing from
+  // emitting duplicates. Each subagent has its own session, so windows never mix.
+  let compaction;
+  const maybeCompact = update => {
+    if (!update || update.sessionUpdate !== 'usage_update') return;
+    const used = Number(update.used);
+    if (!Number.isFinite(used) || used <= 0) return;
+    const window = typeof spec.autoCompactWindow === 'number' ? spec.autoCompactWindow : undefined;
+    if (window === undefined || used < window) return;
+    if (compaction !== undefined && used <= compaction.preTokens) return;
+    compaction = {trigger: 'auto', preTokens: Math.round(used), at: Date.now()};
+    writeRecord({compactBoundary: compaction});
+    transcriptWrite({at: compaction.at, type: 'compact_boundary', trigger: 'auto', preTokens: compaction.preTokens});
+    logWrite('\\n[harness: compact_boundary ' + JSON.stringify(compaction) + ']\\n');
+  };
+
   const handleLine = line => {
     let message;
     try { message = JSON.parse(line); } catch (e) { return; }
@@ -836,6 +893,10 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       if (message.method === 'session/update') {
         const update = message.params && message.params.update;
         if (!update) return;
+        // The transcript is append-only and independent of the log, so a restart can
+        // read the conversation even if the log was rotated or the session compacted.
+        transcriptWrite({at: Date.now(), update: update});
+        maybeCompact(update);
         if (update.sessionUpdate === 'agent_message_chunk' && update.content && typeof update.content.text === 'string') {
           logWrite(update.content.text);
         } else if (update.sessionUpdate === 'tool_call') {
@@ -1018,6 +1079,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       ? 'reply to ' + String(from || 'main') + ':'
       : failure + '\\nreply to ' + String(from || 'main') + ':';
     const scan = scanOutput(prefix + '\\n' + tail);
+    const partial = typeof failure === 'string' && /result is partial/.test(failure);
     emit(signalEnvelope({
       id: spec.id + '-msg-' + turnCount,
       label: spec.label + ' (message)',
@@ -1025,8 +1087,9 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       owner: spec.owner,
       startedAt: Date.now(),
       logPath: spec.logPath,
-      sessionId: spec.sessionId
-    }, {
+      sessionId: spec.sessionId,
+      ...(typeof spec.agentId === 'string' ? {agentId: spec.agentId} : {})
+    }, Object.assign({
       state: failure === undefined ? 'done' : 'failed',
       exitCode: failure === undefined ? 0 : null,
       finishedAt: Date.now(),
@@ -1035,7 +1098,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       body: scan.text,
       scanned: true,
       scanMatches: scan.matches
-    }));
+    }, partial ? {partial: true} : {})));
   };
 
   // After the first turn: wait for a message, run it as its own prompt, and only
@@ -1101,8 +1164,12 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // session/new is where ACP attaches them to this job's session.
     const mcpServers = Array.isArray(spec.mcpServers) ? spec.mcpServers : [];
     if (mcpServers.length > 0) logWrite('[acp] mcp servers ' + mcpServers.map(server => server.name).join(', ') + '\\n');
-    // ACP exposes neither setting. Record the resolved value so the deviation is
-    // visible in the job log instead of silent; the host default still governs.
+    // ACP exposes none of these as a per-session option. Record the resolved values
+    // so the deviation is visible in the job log instead of silent; the host default
+    // still governs.
+    if (typeof spec.promptCache === 'string') {
+      logWrite('[acp] prompt cache ' + spec.promptCache + (spec.promptCache === 'shared' ? ' (the main conversation)' : ' (this agent)') + '\\n');
+    }
     if (typeof spec.autoCompactWindow === 'number') {
       logWrite('[acp] auto-compact window ' + spec.autoCompactWindow + ' requested; ACP has no option (host default applies)\\n');
     }
@@ -1203,16 +1270,23 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       logWrite('[acp] startup context ' + startupText.length + ' chars (hook ' + (hookReady ? 'live' : 'absent') + ')\\n');
     }
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
+    const stopReason = result && typeof result.stopReason === 'string' ? result.stopReason : '';
+    // maxTurns and max_tokens stop with what the agent already produced. The result
+    // is partial, not lost: the record and signal say so and the job stays resumable.
+    const partial = stopReason === 'max_turns' || stopReason === 'max_turn_requests' || stopReason === 'max_tokens';
     const outcome = turnOutcome(result);
     if (outcome !== undefined) {
-      fail(outcome, null);
+      settle('failed', outcome, null, readReportTail(), Object.assign(
+        partial ? {partial: true} : {},
+        compaction === undefined ? {} : {compactBoundary: compaction}
+      ));
       shutdown();
       return;
     }
     // The first turn is the job's result, as before. With live messaging the
     // session then stays open: the record is done, but the process (and its ACP
     // session) keeps accepting messages until the idle window passes.
-    settle('done', 'exit 0', 0, readReportTail());
+    settle('done', 'exit 0', 0, readReportTail(), compaction === undefined ? undefined : {compactBoundary: compaction});
     await liveLoop();
     shutdown();
   };
@@ -3134,6 +3208,10 @@ export interface WorkerSpecInput {
 	/** This job's nesting level: the caller's depth plus one. */
 	depth?: number;
 	agentType?: string;
+	/** The durable resume handle; absent for a one-shot agent. */
+	agentId?: string;
+	/** Where the worker appends the persisted conversation. */
+	transcriptPath?: string;
 	/** A fork: inherit the main conversation's prompt, tools, model, and cache. */
 	fork?: boolean;
 	/** The main conversation the fork copies; absent for a non-fork. */
@@ -3221,7 +3299,11 @@ export function buildArgs(spec: WorkerSpec, modPath: string): string[] {
 			'json',
 		];
 	}
-	return ['--mod', modPath, 'acp'];
+	// maxTurns is a host cap. The flag is shared with -p mode; ACP may ignore it,
+	// but the stop reason is what the lifecycle contract reads, and a host that
+	// honors it stops with max_turn_requests, which the worker marks partial.
+	const maxTurns = typeof spec.maxTurns === 'number' && spec.maxTurns > 0 ? String(spec.maxTurns) : '';
+	return [...(maxTurns.length > 0 ? ['--max-turns', maxTurns] : []), '--mod', modPath, 'acp'];
 }
 
 export function buildSpec(input: WorkerSpecInput, modPath: string): WorkerSpec {
@@ -4173,6 +4255,8 @@ export interface PermissionRequest {
 // message that reaches the session.
 interface JobIdentity {
 	id: string;
+	/** The durable resume handle. Absent for a one-shot agent (Explore, Plan). */
+	agentId?: string;
 	owner?: string;
 	label?: string;
 	kind?: string;
@@ -4184,6 +4268,14 @@ interface JobIdentity {
 	sessionId?: string;
 }
 
+/** One compaction observed in a subagent's own context window. */
+export interface CompactBoundary {
+	readonly trigger: 'auto' | 'manual';
+	/** The token count before compaction ran. */
+	readonly preTokens: number;
+	readonly at: number;
+}
+
 interface Signal extends JobIdentity {
 	readonly exitCode?: number | null;
 	readonly title?: string;
@@ -4193,12 +4285,21 @@ interface Signal extends JobIdentity {
 	readonly scanMatches?: string[];
 	readonly question?: string;
 	readonly permissionRequest?: PermissionRequest;
+	/** A maxTurns or max_tokens stop: the output is partial and the job is resumable. */
+	readonly partial?: boolean;
+	readonly compactBoundary?: CompactBoundary;
 }
 
 interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
 	cwd?: string;
+	/** The persisted conversation for this agent; retention sweeps it with the record. */
+	transcriptPath?: string;
+	/** The maxTurns or max_tokens stop that produced a partial result. */
+	partial?: boolean;
+	/** The last compaction observed for this agent's own context window. */
+	compactBoundary?: CompactBoundary;
 	/** This job's nesting level, and the job that spawned it. */
 	depth?: number;
 	parentJobId?: string;
@@ -4275,6 +4376,8 @@ interface JobPatch {
 	permissionRequest?: PermissionRequest;
 	scanned?: boolean;
 	scanMatches?: string[];
+	partial?: boolean;
+	compactBoundary?: CompactBoundary;
 }
 
 // ---------------------------------------------------------------------------
@@ -4500,6 +4603,8 @@ export interface ForegroundJob {
 	readonly label?: unknown;
 	readonly id?: unknown;
 	readonly kind?: unknown;
+	/** A maxTurns or max_tokens stop: the result is partial and resumable. */
+	readonly partial?: unknown;
 }
 
 export type ForegroundResult =
@@ -4541,6 +4646,11 @@ export function foregroundOutcome(job: ForegroundJob, log: string): ForegroundRe
 	}
 	const reason =
 		typeof job.failureReason === 'string' && job.failureReason.length > 0 ? job.failureReason : `${label} ${state}`;
+	if (state === 'failed' && job.partial === true && hasAgentOutput(log)) {
+		// A maxTurns stop is a partial success: the text is the result, and the job
+		// keeps its agent id so a resume can continue it.
+		return {ok: true, partial: true, text: `${text}\n\n[partial: ${reason}]`};
+	}
 	if (state === 'failed' && reason.startsWith(AGENT_API_ERROR) && hasAgentOutput(log)) {
 		return {ok: true, partial: true, text: `${text}\n\n[cut off: ${reason}]`};
 	}
@@ -4668,12 +4778,15 @@ export function signalEnvelope(
 		permissionRequest?: PermissionRequest;
 		scanned?: boolean;
 		scanMatches?: string[];
+		partial?: boolean;
+		compactBoundary?: CompactBoundary;
 	},
 ): Signal {
 	const label = String(record.label ?? record.id);
 	const state = String(result.state);
 	return {
 		id: record.id,
+		...(record.agentId !== undefined ? {agentId: record.agentId} : {}),
 		owner: record.owner,
 		label,
 		kind: String(record.kind ?? 'command'),
@@ -4692,6 +4805,8 @@ export function signalEnvelope(
 		...(result.scanned === undefined
 			? {}
 			: {scanned: result.scanned === true, scanMatches: result.scanMatches ?? []}),
+		...(result.partial === true ? {partial: true} : {}),
+		...(result.compactBoundary !== undefined ? {compactBoundary: result.compactBoundary} : {}),
 	};
 }
 
@@ -4726,6 +4841,8 @@ function patchOf(signal: Signal): JobPatch {
 		patch.scanned = signal.scanned;
 		patch.scanMatches = signal.scanMatches ?? [];
 	}
+	if (signal.partial === true) patch.partial = true;
+	if (signal.compactBoundary !== undefined) patch.compactBoundary = signal.compactBoundary;
 	return patch;
 }
 
@@ -5010,10 +5127,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const orphanedDir = join(root, 'orphaned');
 	const logsDir = join(root, 'logs');
 	const jobsDir = join(root, 'jobs');
+	const transcriptsDir = join(root, 'transcripts');
 	const worktreesDir = join(root, 'worktrees');
 	const controlRoot = join(root, 'control');
 	const ledgerPath = join(root, 'delivered.jsonl');
-	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir, controlRoot]) {
+	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
 		spool.mkdir(dir);
 	}
 
@@ -5339,12 +5457,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: '';
 		const facts = [
 			`job ${String(message.id ?? 'unknown')}`,
+			typeof message.agentId === 'string' ? `agent ${message.agentId}` : '',
 			String(message.kind ?? 'signal'),
 			state,
+			message.partial === true ? 'partial' : '',
 			message.exitCode === null || message.exitCode === undefined ? '' : `exit ${message.exitCode}`,
 			typeof message.durationMs === 'number' ? `${(message.durationMs / 1000).toFixed(1)}s` : '',
 		].filter(Boolean).join(' · ');
 		const log = typeof message.logPath === 'string' ? `\nlog ${message.logPath}` : '';
+		const boundary =
+			message.compactBoundary === undefined
+				? ''
+				: `\ncompact_boundary: ${message.compactBoundary.trigger} at ${message.compactBoundary.preTokens} tokens`;
 		const body = typeof message.body === 'string' ? message.body.trim() : '';
 		const title = String(message.title ?? message.label ?? message.id ?? '(signal)');
 		// The worker names the agent (the title) and carries the request: the parent
@@ -5364,9 +5488,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				? 'The job is resumable: answer here, or fire a follow-up job. Nothing else arrives until then.'
 				: state === 'canceled'
 					? 'The job was canceled; nothing else will arrive for it.'
-					: 'This result arrived automatically. Read it now and use it in your current work; ' +
-						'do not poll for it and do not wait for it.';
-		return `[subagent] ${title}\n${facts}${log}${kept}` + (body.length > 0 ? `\n\n${body}` : '') + ask + `\n\n${next}`;
+					: message.partial === true && typeof message.agentId === 'string'
+						? `The result is partial: resume it with subagent_resume ${message.agentId}.`
+						: 'This result arrived automatically. Read it now and use it in your current work; ' +
+							'do not poll for it and do not wait for it.';
+		return `[subagent] ${title}\n${facts}${log}${boundary}${kept}` + (body.length > 0 ? `\n\n${body}` : '') + ask + `\n\n${next}`;
 	}
 
 	function readJob(id: string): JobRecord | undefined {
@@ -5704,13 +5830,35 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		sweepExpiredEntries(spool, orphanedDir, runtime.now(), {ttlMs: ORPHANED_TTL_MS});
 	}
 
-	// Retention. A finished job keeps its record, its log and its worktree for
-	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS), so
+	// Retention. A finished job keeps its record, its log and its transcript for
+	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS, its
+	// CLAUDE_CODE_CLEANUP_PERIOD_DAYS alias, or `cleanupPeriodDays` in settings), so
 	// `subagent_output` still works on a job from last week. A running job is never
-	// swept, however old its record is.
+	// swept, however old its record is. The three artifacts are swept together.
+	function cleanupPeriodDays(): number | undefined {
+		// Project settings win over user settings, the same precedence the definition
+		// registry uses. A missing or malformed file contributes nothing.
+		for (const base of [runtime.cwd, runtime.home]) {
+			if (typeof base !== 'string' || base.length === 0) continue;
+			try {
+				const parsed = JSON.parse(spool.readFile(join(base, '.commandcode', 'settings.json'))) as Record<string, unknown>;
+				const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
+				if (Number.isFinite(value) && value > 0) return value;
+			} catch {
+				/* no settings here */
+			}
+		}
+		return undefined;
+	}
+
 	function retentionMs(): number {
-		const days = Number(runtime.env[RETENTION_ENV]);
-		const value = Number.isFinite(days) && days > 0 ? days : RETENTION_DAYS_DEFAULT;
+		const raw = runtime.env[RETENTION_ENV] ?? runtime.env[RETENTION_ENV_ALIAS];
+		const days = Number(raw);
+		const configured = Number.isFinite(days) && days > 0 ? days : cleanupPeriodDays();
+		const value =
+			configured !== undefined && Number.isFinite(configured) && configured > 0
+				? configured
+				: RETENTION_DAYS_DEFAULT;
 		return value * 24 * 60 * 60 * 1000;
 	}
 
@@ -5745,16 +5893,33 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				/* the log is already gone */
 			}
 			try {
+				spool.remove(join(transcriptsDir, `${id}.jsonl`));
+			} catch {
+				/* the transcript is already gone */
+			}
+			try {
 				spool.remove(join(worktreesDir, id));
 			} catch {
 				/* the worktree is already gone */
 			}
 		}
-		// An abandoned log or worktree with no live record is bounded by the same TTL.
+		// An abandoned log, transcript or worktree with no live record is bounded by
+		// the same TTL.
 		sweepExpiredEntries(spool, logsDir, now, {
 			ttlMs,
 			skip: name => {
 				const job = readJob(name.replace(/\.log$/, ''));
+				if (job === undefined) return false;
+				const state = normalizeState(job.state);
+				return state === undefined || !isTerminal(state);
+			},
+		});
+		sweepExpiredEntries(spool, transcriptsDir, now, {
+			ttlMs,
+			// A transcript belongs to a job, so a running job's transcript is never
+			// swept even when the file itself is old.
+			skip: name => {
+				const job = readJob(name.replace(/\.jsonl$/, ''));
 				if (job === undefined) return false;
 				const state = normalizeState(job.state);
 				return state === undefined || !isTerminal(state);
@@ -6035,6 +6200,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly cwd: string;
 		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
+		/** Explore and Plan are one-shot: no agent id, no resume. */
+		readonly oneShot?: boolean;
 		/** A fork: inherit the main conversation instead of building a fresh one. */
 		readonly fork?: boolean;
 		/** The main conversation the fork copies. */
@@ -6130,14 +6297,20 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(intent.parentJobId !== undefined ? {parentJobId: intent.parentJobId} : {}),
 			...(isAgent
 				? {
+						// The durable resume handle. A one-shot agent has none, so nothing can
+						// invite a resume that the lifecycle forbids.
+						...(intent.oneShot === true ? {} : {agentId: id}),
 						agentType: intent.agentType ?? 'general-purpose',
 						sessionName: sessionNameOf(id),
+						transcriptPath: join(transcriptsDir, `${id}.jsonl`),
 						...(intent.resumeSession !== undefined ? {resumedFrom: intent.resumedFrom} : {}),
 					}
 				: {}),
 			...(intent.fork === true
 				? {fork: true, promptCache: 'shared', ...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {})}
-				: {}),
+				: isAgent
+					? {promptCache: 'own'}
+					: {}),
 			...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
 			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
@@ -6312,6 +6485,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					: {}),
 				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
+				...(record.agentId !== undefined ? {agentId: record.agentId} : {}),
+				...(record.transcriptPath !== undefined ? {transcriptPath: record.transcriptPath} : {}),
 				...(intent.fork === true
 					? {
 							fork: true,
@@ -6319,7 +6494,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 							sessionName: sessionNameOf(id),
 							...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {}),
 						}
-					: {}),
+					: isAgent
+						? {promptCache: 'own'}
+						: {}),
 				...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
@@ -6752,6 +6929,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(name !== undefined ? {name} : {}),
 			...(teamName !== undefined ? {teamName} : {}),
 			agentType: definition?.name,
+			oneShot: definition?.oneShot,
 			...(forkRequested
 				? {fork: true, ...(sessionId !== undefined ? {mainSessionId: sessionId} : {})}
 				: {}),
@@ -6772,10 +6950,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
 		if (!launched.ok) return badInput(launched.error);
+		// A one-shot (Explore/Plan) has no agent id: the record is the only handle.
+		const spawnedAgentId = readJob(launched.id)?.agentId;
 		// A foreground run returns its result here; a background run returns the moment
 		// the worker is detached.
 		if (launched.result !== undefined) {
-			return launched.result.ok ? okText(launched.result.text) : badInput(launched.result.error);
+			if (!launched.result.ok) return badInput(launched.result.error);
+			return okText(
+				spawnedAgentId !== undefined ? `agent id ${spawnedAgentId}\n${launched.result.text}` : launched.result.text,
+			);
 		}
 		const kind =
 			definition !== undefined
@@ -6783,6 +6966,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: 'shell (/bin/sh -c)';
 		return okText(
 			`spawned ${launched.id} "${label}" as ${kind}, pid ${launched.pid}.\n` +
+				(spawnedAgentId !== undefined ? `agent id ${spawnedAgentId}\n` : '') +
 				`log ${join(logsDir, `${launched.id}.log`)}\n` +
 				`The result arrives here as a signal when it exits - do not wait for it. ` +
 				`subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`,
@@ -6808,14 +6992,52 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
-	// The transcript of one job: the record's facts, the log path, and a bounded slice
-	// of the log. `offset` is a character offset from the start; the default is the tail.
+	// The persisted conversation, rendered from the worker's JSONL stream. A
+	// malformed line is skipped; it never hides the rest of the transcript.
+	function transcriptText(id: string, record: JobRecord): string {
+		const file = String(record.transcriptPath ?? join(transcriptsDir, `${id}.jsonl`));
+		let raw = '';
+		try {
+			raw = spool.readFile(file);
+		} catch {
+			return '';
+		}
+		const parts: string[] = [];
+		for (const line of raw.split('\n')) {
+			if (!line.trim()) continue;
+			try {
+				const entry = JSON.parse(line) as {
+					type?: unknown;
+					line?: unknown;
+					update?: {sessionUpdate?: unknown; content?: {text?: unknown}; title?: unknown; kind?: unknown};
+				};
+				const update = entry.update;
+				if (update?.sessionUpdate === 'agent_message_chunk' && typeof update.content?.text === 'string') {
+					parts.push(update.content.text);
+				} else if (update?.sessionUpdate === 'tool_call') {
+					parts.push(`[tool] ${String(update.title ?? update.kind ?? 'call')}\n`);
+				} else if (typeof entry.line === 'string') {
+					parts.push(`${entry.line}\n`);
+				}
+			} catch {
+				/* one malformed line does not hide the transcript */
+			}
+		}
+		return parts.join('');
+	}
+
+	// The transcript of one job: the record's facts, the log and transcript paths,
+	// and a bounded slice of the conversation. A finished job falls back to its
+	// transcript when the log is gone; `offset` is a character offset from the start.
 	function outputText(id: string, input: Record<string, unknown>): ToolResult {
 		const record = readJob(id);
 		if (record === undefined) return badInput(`subagent: no job ${id}`);
 		const state = canonicalState(record.state);
 		const file = String(record.logPath ?? join(logsDir, `${id}.log`));
-		const log = readLog(file);
+		const transcriptPath = String(record.transcriptPath ?? join(transcriptsDir, `${id}.jsonl`));
+		const transcript = record.kind === 'agent' || record.kind === 'fork' ? transcriptText(id, record) : '';
+		const logText = readLog(file);
+		const log = logText.length > 0 ? logText : transcript;
 		const requested = Number(input.max_chars);
 		const maxChars = Math.min(
 			OUTPUT_MAX_CHARS_CAP,
@@ -6835,6 +7057,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 		const facts = [
 			state,
+			record.partial === true ? 'partial' : '',
+			typeof record.agentId === 'string' ? `agent ${record.agentId}` : '',
 			typeof record.exitCode === 'number' ? `exit ${record.exitCode}` : '',
 			typeof record.durationMs === 'number' ? `${(record.durationMs / 1000).toFixed(1)}s` : '',
 			typeof record.model === 'string' && record.model.length > 0 ? record.model : '',
@@ -6849,7 +7073,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// and hide the worker's own tool-call progress.
 		const visible = reportText(body, String(record.kind ?? 'command'));
 		return okText(
-			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}${timing}\n\n` +
+			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}` +
+				(record.transcriptPath !== undefined ? `\ntranscript ${transcriptPath}` : '') +
+				`${timing}\n\n` +
 				(visible.length > 0 ? visible : '(no output yet)') +
 				note,
 		);
@@ -6888,18 +7114,31 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (id.length === 0) return badInput('id is required');
 		const instruction = String(input.prompt ?? '').trim();
 		if (instruction.length === 0) return badInput('prompt is required: it is the instruction for the resumed run');
-		const record = readJob(id);
-		if (record === undefined) return badInput(`subagent: no job ${id}`);
+		// The agent id is the durable handle; the job id also resolves, so a caller
+		// holding either from the result can resume.
+		const record =
+			readJob(id) ??
+			readRecentJobs(ACTIVE_JOB_SCAN_MAX).find(job => typeof job.agentId === 'string' && job.agentId === id);
+		if (record === undefined) return badInput(`subagent: no job or agent ${id}`);
+		const jobId = record.id;
 		const state = normalizeState(record.state);
-		if (state !== undefined && !isTerminal(state)) return badInput(`subagent: job ${id} is still ${state}`);
+		if (state !== undefined && !isTerminal(state)) return badInput(`subagent: job ${jobId} is still ${state}`);
 		if (record.prompt === undefined) {
-			return badInput(`subagent: job ${id} is a shell job; there is no agent session to resume`);
+			return badInput(`subagent: job ${jobId} is a shell job; there is no agent session to resume`);
+		}
+		// Explore and Plan are one-shot: the lifecycle gives them no agent id, so a
+		// resume would pretend to continue a context that was never addressable. An
+		// older record written before agent ids is refused for the same reason.
+		if (record.fork !== true && record.agentId === undefined) {
+			return badInput(
+				`subagent: job ${jobId} has no agent id (${String(record.agentType ?? 'explore or plan')} is one-shot, or the record predates agent ids); it cannot be resumed`,
+			);
 		}
 		// A live worker already owns this session. Starting a second worker would race
 		// the first over it, so the live path is the message path.
 		if (liveState(record).alive) {
 			return badInput(
-				`subagent: job ${id} is still running; send it a live message with subagent_send` +
+				`subagent: job ${jobId} is still running; send it a live message with subagent_send` +
 					(record.name === undefined ? ' once it finishes, or wait for its result' : `({to: "${record.name}", message}) instead`),
 			);
 		}
@@ -6909,10 +7148,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// session instead; forking again would lose the context it already has.
 		if (record.fork === true) {
 			if (record.forkSessionId === undefined) {
-				return badInput(`subagent: job ${id} is a fork with no recorded session; spawn it again`);
+				return badInput(`subagent: job ${jobId} is a fork with no recorded session; spawn it again`);
 			}
 			const forkLaunched = await fire({
-				label: `${String(record.label ?? id)} (resume)`,
+				label: `${String(record.label ?? jobId)} (resume)`,
 				kind: 'fork',
 				prompt: instruction,
 				background: record.teamName !== undefined ? false : true,
@@ -6921,18 +7160,23 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				fork: true,
 				...(record.mainSessionId !== undefined ? {mainSessionId: record.mainSessionId} : {}),
 				resumeSession: record.forkSessionId,
-				resumedFrom: id,
+				resumedFrom: jobId,
 				...(record.permissionMode !== undefined ? {permissionMode: record.permissionMode} : {}),
 				...(record.name !== undefined ? {name: record.name} : {}),
 				...(record.teamName !== undefined ? {teamName: record.teamName} : {}),
 				...(record.owner !== undefined ? {owner: record.owner} : {}),
 			});
 			if (!forkLaunched.ok) return badInput(forkLaunched.error);
+			const forkAgentId = readJob(forkLaunched.id)?.agentId;
 			if (forkLaunched.result !== undefined) {
-				return forkLaunched.result.ok ? okText(forkLaunched.result.text) : badInput(forkLaunched.result.error);
+				if (!forkLaunched.result.ok) return badInput(forkLaunched.result.error);
+				return okText(
+					forkAgentId !== undefined ? `agent id ${forkAgentId}\n${forkLaunched.result.text}` : forkLaunched.result.text,
+				);
 			}
 			return okText(
-				`resumed ${id} as ${forkLaunched.id} "${String(record.label ?? id)} (resume)", pid ${forkLaunched.pid}.\n` +
+				`resumed ${jobId} as ${forkLaunched.id} "${String(record.label ?? jobId)} (resume)", pid ${forkLaunched.pid}.\n` +
+					(forkAgentId !== undefined ? `agent id ${forkAgentId}\n` : '') +
 					`log ${join(logsDir, `${forkLaunched.id}.log`)}\n` +
 					`The resumed fork reports back here as its own signal.`,
 			);
@@ -6962,13 +7206,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 							addDirs: splitFlag(ADD_DIRS_OPTION),
 						}),
 					}).servers;
-		const resumeCompact = resolveAutoCompactWindow(
+		const resumeCompact = record.autoCompactWindow ?? resolveAutoCompactWindow(
 			contextWindowForModel(record.model, runtime.env),
 			resumeDefinition?.autoCompactWindow,
 			false,
 		);
+		const resumeCacheTtl = record.cacheTtl ?? resumeDefinition?.cacheTtl;
 		const launched = await fire({
-			label: `${String(record.label ?? id)} (resume)`,
+			label: `${String(record.label ?? jobId)} (resume)`,
 			kind: 'agent',
 			prompt: instruction,
 			background,
@@ -6980,23 +7225,30 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
 			...(resumedMcp.length > 0 ? {mcpServers: resumedMcp} : {}),
 			...(resumeCompact !== undefined ? {autoCompactWindow: resumeCompact} : {}),
-			...(resumeDefinition?.cacheTtl !== undefined ? {cacheTtl: resumeDefinition.cacheTtl} : {}),
+			...(resumeCacheTtl !== undefined ? {cacheTtl: resumeCacheTtl} : {}),
 			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
+			// The per-invocation model and effort are what make a resume the same run
+			// continued, not a fresh one with the definition's defaults.
 			effort: record.effort,
 			permissionMode: record.permissionMode,
 			timeoutMs: record.timeoutMs,
 			resumeSession: record.acpSessionId,
-			resumedFrom: id,
+			resumedFrom: jobId,
 			...(record.name !== undefined ? {name: record.name} : {}),
 			...(record.owner !== undefined ? {owner: record.owner} : {}),
 		});
 		if (!launched.ok) return badInput(launched.error);
+		const resumedAgentId = readJob(launched.id)?.agentId;
 		if (launched.result !== undefined) {
-			return launched.result.ok ? okText(launched.result.text) : badInput(launched.result.error);
+			if (!launched.result.ok) return badInput(launched.result.error);
+			return okText(
+				resumedAgentId !== undefined ? `agent id ${resumedAgentId}\n${launched.result.text}` : launched.result.text,
+			);
 		}
 		return okText(
-			`resumed ${id} as ${launched.id} "${String(record.label ?? id)} (resume)", pid ${launched.pid}.\n` +
+			`resumed ${jobId} as ${launched.id} "${String(record.label ?? jobId)} (resume)", pid ${launched.pid}.\n` +
+				(resumedAgentId !== undefined ? `agent id ${resumedAgentId}\n` : '') +
 				`log ${join(logsDir, `${launched.id}.log`)}\n` +
 				`The resumed run reports back here as its own signal.`,
 		);
@@ -7111,6 +7363,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
 			model: record.model,
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.autoCompactWindow !== undefined ? {autoCompactWindow: record.autoCompactWindow} : {}),
+			...(record.cacheTtl !== undefined ? {cacheTtl: record.cacheTtl} : {}),
 			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
 			effort: record.effort,

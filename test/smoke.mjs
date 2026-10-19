@@ -835,13 +835,13 @@ try {
 		'a shell job has no agent session to resume',
 	);
 
-	await toolOf(res, 'subagent_spawn').run({input: {description: 'agent', prompt: 'first', subagent_type: 'explore'}});
+	await toolOf(res, 'subagent_spawn').run({input: {description: 'agent', prompt: 'first', subagent_type: 'general-purpose'}});
 	const agentSpec = JSON.parse(resRuntime.spawnCalls[1].options.env.SUBAGENT_SPEC);
-	assert.equal(agentSpec.agentType, 'explore', 'the resolved definition name is recorded');
+	assert.equal(agentSpec.agentType, 'general-purpose', 'the resolved definition name is recorded');
 	assert.deepEqual(agentSpec.args.slice(0, 1), ['--mod'], 'an agent worker loads the mod');
 	assert.ok(agentSpec.args[1]?.endsWith('better-sub-agents.ts'), 'the mod file that defines the worker');
 	assert.equal(agentSpec.args[2], 'acp', 'the worker transport is ACP');
-	assert.match(agentSpec.systemPrompt, /read-only codebase explorer/, 'the definition body travels in the spec');
+	assert.match(agentSpec.systemPrompt, /general-purpose autonomous agent/, 'the definition body travels in the spec');
 	const running = await resume.run({input: {id: agentSpec.id, prompt: 'continue'}});
 	assert.equal(running.ok, false, 'a running job cannot be resumed');
 	assert.match(running.error, /still queued|still running/);
@@ -864,10 +864,10 @@ try {
 	const resumedSpec = JSON.parse(resRuntime.spawnCalls[2].options.env.SUBAGENT_SPEC);
 	assert.equal(resumedSpec.resumeSession, 'acp-session-1', 'the resume targets the ACP session id');
 	assert.equal(resumedSpec.prompt, 'continue', 'the new instruction is the resumed prompt');
-	assert.match(resumedSpec.systemPrompt, /read-only codebase explorer/, 'the resumed worker keeps the definition body');
+	assert.match(resumedSpec.systemPrompt, /general-purpose autonomous agent/, 'the resumed worker keeps the definition body');
 	const resumedRecord = JSON.parse(readFileSync(join(resDir, 'jobs', `${resumedSpec.id}.json`), 'utf8'));
 	assert.equal(resumedRecord.resumedFrom, agentSpec.id, 'the new record says what it resumed');
-	assert.equal(resumedRecord.agentType, 'explore', 'the agent type carries over');
+	assert.equal(resumedRecord.agentType, 'general-purpose', 'the agent type carries over');
 	assert.notEqual(resumedSpec.id, agentSpec.id, 'a resume is a new job with its own signal');
 	ok('subagent_resume: rejects unknown, shell and running jobs; resumes a finished one');
 
@@ -1383,6 +1383,8 @@ process.stdin.on('data', (data) => {
 				bin: fakeCmd,
 				prompt: 'do the thing',
 				agentType: 'general-purpose',
+				agentId: id,
+				transcriptPath: join(acpDir, 'transcripts', `${id}.jsonl`),
 				systemPrompt: 'You are the test worker.',
 				model: 'test-model',
 				effort: 'low',
@@ -1395,7 +1397,7 @@ process.stdin.on('data', (data) => {
 			},
 			'/mod.ts',
 		);
-		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued', ...extraRecord}));
+		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued', agentId: id, transcriptPath: join(acpDir, 'transcripts', `${id}.jsonl`), ...extraRecord}));
 		const child = spawn(process.execPath, ['-e', workerText], {
 			cwd: acpDir,
 			env: {...process.env, SUBAGENT_SPEC: JSON.stringify(spec), BETTER_SUBAGENTS_WORKER: '1'},
@@ -1438,7 +1440,24 @@ process.stdin.on('data', (data) => {
 	assert.equal(acp.record.state, 'done', 'the prompt result settles the job');
 	assert.equal(acp.signals.length, 1, 'one signal for the finished ACP job');
 	assert.equal(acp.signals[0].state, 'done', 'the signal is a success');
+	assert.equal(acp.signals[0].agentId, 'acp-job', 'the completion carries the agent id');
 	assert.match(acp.signals[0].body, /exit 0/, 'the signal carries the result');
+	const acpTranscript = join(acpDir, 'transcripts', 'acp-job.jsonl');
+	assert.ok(existsSync(acpTranscript), 'the worker persists a transcript');
+	assert.match(readFileSync(acpTranscript, 'utf8'), /worker says hello/, 'the transcript holds the streamed answer');
+
+	// A restart reads the persisted transcript. Main-session compaction (its entries
+	// disappearing) cannot reach the spool, because the transcript never lives there.
+	const restartSession = makeSession();
+	const restart = makeApi({spoolDir: acpDir, session: restartSession});
+	mod(restart.api, restart.runtime);
+	restartSession.entries.length = 0;
+	restart.registeredHooks.onSessionStart({source: 'resume', sessionId: 'restart'});
+	const reread = await toolOf(restart, 'subagent_output').run({input: {id: 'acp-job'}});
+	assert.equal(reread.ok, true, JSON.stringify(reread));
+	assert.match(reread.content[0].text, /worker says hello/, 'a new session still reads the persisted transcript');
+	assert.match(reread.content[0].text, /transcript .*acp-job\.jsonl/, 'the output names the transcript');
+	assert.ok(existsSync(acpTranscript), 'a session start leaves a fresh transcript untouched');
 
 	// Marker present: the ACP child loaded the mod, so appendSystemPrompt is live and
 	// the body must not be duplicated into the prompt.
@@ -4977,6 +4996,311 @@ process.stdout.write(JSON.stringify({
 	assert.equal(forkRuntime.spawnCalls.length, beforeOpenView, 'no fork starts while the agent view is open');
 	ok('/subtask forks the main conversation when the agent view is off');
 	}
+	// 81. agent id, one-shot agents, and the prompt-cache split -------------
+	const t13Root = mkdtempSync(join(tmpdir(), 'subagent-t13-'));
+	mkdirSync(join(t13Root, '.git'), {recursive: true});
+	mkdirSync(join(t13Root, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(t13Root, '.commandcode', 'agents', 'lead.md'),
+		[
+			'---',
+			'name: lead',
+			'description: lead agent',
+			'maxTurns: 7',
+			'autoCompactWindow: 150000',
+			'experimental:',
+			'  cacheTtl: 5m',
+			'---',
+			'LEAD BODY',
+		].join('\n'),
+	);
+	const t13Runtime = makeRuntime({now: () => fixedNow, cwd: t13Root});
+	const t13 = makeApi({spoolDir: t13Root, session: makeSession(), runtime: t13Runtime.runtime});
+	mod(t13.api, t13.runtime);
+	t13.registeredHooks.onSessionStart({source: 'startup', sessionId: 'main-t13'});
+	const t13Spawn = async (input) => {
+		const before = t13Runtime.spawnCalls.length;
+		const result = await toolOf(t13, 'subagent_spawn').run({input});
+		const call = t13Runtime.spawnCalls[before];
+		return {result, spec: call === undefined ? undefined : JSON.parse(call.options.env.SUBAGENT_SPEC)};
+	};
+	const t13Record = (id) => JSON.parse(readFileSync(join(t13Root, 'jobs', `${id}.json`), 'utf8'));
+
+	const t13LeadSpawn = await t13Spawn({
+		description: 'lead',
+		prompt: 'work',
+		subagent_type: 'lead',
+		model: 'm1',
+		effort: 'high',
+	});
+	assert.equal(t13LeadSpawn.result.ok, true, JSON.stringify(t13LeadSpawn.result));
+	assert.equal(t13LeadSpawn.spec.agentId, t13LeadSpawn.spec.id, 'an agent run carries an agent id');
+	assert.equal(t13LeadSpawn.spec.promptCache, 'own', 'a non-fork agent has its own prompt cache');
+	assert.equal(t13LeadSpawn.spec.cacheTtl, '5m', 'cacheTtl reaches the spawn');
+	assert.equal(t13LeadSpawn.spec.autoCompactWindow, 150000, 'the compact window reaches the spawn');
+	assert.match(
+		String(t13LeadSpawn.result.content[0].text),
+		new RegExp(`agent id ${t13LeadSpawn.spec.id}`),
+		'the spawn result names the agent id',
+	);
+	const leadRecord = t13Record(t13LeadSpawn.spec.id);
+	assert.equal(leadRecord.promptCache, 'own', 'the cache split is recorded at spawn');
+	assert.equal(
+		leadRecord.transcriptPath,
+		join(t13Root, 'transcripts', `${t13LeadSpawn.spec.id}.jsonl`),
+		'the record names its transcript',
+	);
+
+	const exploreSpawn = await t13Spawn({description: 'explore', prompt: 'find', subagent_type: 'explore'});
+	assert.equal(exploreSpawn.result.ok, true, JSON.stringify(exploreSpawn.result));
+	assert.equal(exploreSpawn.spec.agentId, undefined, 'a one-shot agent gets no agent id');
+	assert.ok(
+		!String(exploreSpawn.result.content[0].text).includes('agent id'),
+		'a one-shot spawn result offers no agent id',
+	);
+	const exploreRecordPath = join(t13Root, 'jobs', `${exploreSpawn.spec.id}.json`);
+	writeFileSync(
+		exploreRecordPath,
+		JSON.stringify({...t13Record(exploreSpawn.spec.id), state: 'done', finishedAt: fixedNow}),
+	);
+	const oneShot = await toolOf(t13, 'subagent_resume').run({input: {id: exploreSpawn.spec.id, prompt: 'more'}});
+	assert.equal(oneShot.ok, false, 'a one-shot agent cannot be resumed');
+	assert.match(String(oneShot.error), /one-shot/, 'the refusal names the one-shot rule');
+
+	const t13ForkSpawn = await t13Spawn({description: 'fork', prompt: 'work', subagent_type: 'fork'});
+	assert.equal(t13ForkSpawn.result.ok, true, JSON.stringify(t13ForkSpawn.result));
+	assert.equal(t13ForkSpawn.spec.promptCache, 'shared', 'a fork shares the main conversation cache');
+	assert.equal(t13Record(t13ForkSpawn.spec.id).promptCache, 'shared', 'the shared cache is recorded at spawn');
+	ok('T13: agent id, one-shot refusal, and the fork/own prompt-cache split');
+
+	// 82. resume by agent id keeps the per-invocation model and effort ------
+	writeFileSync(
+		join(t13Root, 'jobs', `${t13LeadSpawn.spec.id}.json`),
+		JSON.stringify({...leadRecord, state: 'done', exitCode: 0, finishedAt: fixedNow, acpSessionId: 'acp-lead'}),
+	);
+	const resumedLead = await toolOf(t13, 'subagent_resume').run({input: {id: leadRecord.agentId, prompt: 'continue'}});
+	assert.equal(resumedLead.ok, true, JSON.stringify(resumedLead));
+	const resumedLeadSpec = JSON.parse(t13Runtime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(resumedLeadSpec.resumeSession, 'acp-lead', 'the resume targets the recorded session');
+	assert.equal(resumedLeadSpec.model, 'm1', 'the per-invocation model survives resume');
+	assert.equal(resumedLeadSpec.effort, 'high', 'the per-invocation effort survives resume');
+	assert.equal(resumedLeadSpec.cacheTtl, '5m', 'the cache TTL survives resume');
+	assert.equal(resumedLeadSpec.autoCompactWindow, 150000, 'the compact window survives resume');
+	assert.equal(resumedLeadSpec.maxTurns, 7, 'the turn cap survives resume');
+
+	// The agent id is the resume handle even when it differs from the job id.
+	writeFileSync(
+		join(t13Root, 'jobs', 'handle-job.json'),
+		JSON.stringify({
+			...leadRecord,
+			id: 'handle-job',
+			agentId: 'agent-handle',
+			label: 'handle',
+			state: 'done',
+			finishedAt: fixedNow,
+			acpSessionId: 'acp-handle',
+		}),
+	);
+	const byHandle = await toolOf(t13, 'subagent_resume').run({input: {id: 'agent-handle', prompt: 'again'}});
+	assert.equal(byHandle.ok, true, JSON.stringify(byHandle));
+	const byHandleSpec = JSON.parse(t13Runtime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(byHandleSpec.resumeSession, 'acp-handle', 'resume resolves the agent id, not only the job id');
+	assert.equal(
+		JSON.parse(readFileSync(join(t13Root, 'jobs', `${byHandleSpec.id}.json`), 'utf8')).resumedFrom,
+		'handle-job',
+		'and records the job it continued',
+	);
+	ok('T13: resume by agent id keeps model, effort, cache, and the compact window');
+
+	// 83. retention sweeps record, log and transcript together --------------
+	const ret3Root = mkdtempSync(join(tmpdir(), 'subagent-retention3-'));
+	const ret3 = makeApi({
+		spoolDir: ret3Root,
+		session: makeSession(),
+		runtime: makeRuntime({now: () => fixedNow, env: {CLAUDE_CODE_CLEANUP_PERIOD_DAYS: '1'}}).runtime,
+	});
+	mod(ret3.api, ret3.runtime);
+	const t13OldAt = fixedNow - 2 * day;
+	for (const id of ['swept', 'kept']) {
+		const finishedAt = id === 'swept' ? t13OldAt : fixedNow;
+		writeFileSync(
+			join(ret3Root, 'jobs', `${id}.json`),
+			JSON.stringify({
+				id,
+				state: 'done',
+				startedAt: finishedAt - 1000,
+				finishedAt,
+				transcriptPath: join(ret3Root, 'transcripts', `${id}.jsonl`),
+			}),
+		);
+		writeFileSync(join(ret3Root, 'logs', `${id}.log`), 'output\n');
+		writeFileSync(
+			join(ret3Root, 'transcripts', `${id}.jsonl`),
+			'{"at":1,"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}\n',
+		);
+	}
+	ret3.registeredHooks.onSessionStart({source: 'resume', sessionId: 'r3'});
+	assert.ok(!existsSync(join(ret3Root, 'jobs', 'swept.json')), 'the old record is swept');
+	assert.ok(!existsSync(join(ret3Root, 'logs', 'swept.log')), 'its log is swept with it');
+	assert.ok(!existsSync(join(ret3Root, 'transcripts', 'swept.jsonl')), 'and its transcript is swept with it');
+	assert.ok(existsSync(join(ret3Root, 'transcripts', 'kept.jsonl')), 'a fresh transcript is kept');
+	ret3.registeredHooks.onSessionStart({source: 'resume', sessionId: 'r3'});
+	assert.ok(existsSync(join(ret3Root, 'transcripts', 'kept.jsonl')), 'a session start cannot sweep a fresh transcript');
+	ok('T13: retention sweeps the record, log, and transcript together');
+
+	// `cleanupPeriodDays` in project settings is the same window.
+	const settingsRoot = mkdtempSync(join(tmpdir(), 'subagent-cleanup-setting-'));
+	mkdirSync(join(settingsRoot, '.commandcode'), {recursive: true});
+	writeFileSync(join(settingsRoot, '.commandcode', 'settings.json'), JSON.stringify({cleanupPeriodDays: 1}));
+	const settings = makeApi({
+		spoolDir: settingsRoot,
+		session: makeSession(),
+		runtime: makeRuntime({cwd: settingsRoot, now: () => fixedNow, env: {}}).runtime,
+	});
+	mod(settings.api, settings.runtime);
+	writeFileSync(
+		join(settingsRoot, 'jobs', 'two-days.json'),
+		JSON.stringify({id: 'two-days', state: 'done', startedAt: t13OldAt, finishedAt: t13OldAt}),
+	);
+	settings.registeredHooks.onSessionStart({source: 'resume', sessionId: 'settings'});
+	assert.ok(!existsSync(join(settingsRoot, 'jobs', 'two-days.json')), 'cleanupPeriodDays: 1 sweeps a two-day-old job');
+	ok('T13: cleanupPeriodDays in project settings sets the retention window');
+
+	// 84. a maxTurns stop is partial and emits compact_boundary -------------
+	const t13WorkerDir = mkdtempSync(join(tmpdir(), 'subagent-t13-worker-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'transcripts']) mkdirSync(join(t13WorkerDir, dir), {recursive: true});
+	const limitBin = join(t13WorkerDir, 'fake-limit.mjs');
+	writeFileSync(
+		limitBin,
+		`#!/usr/bin/env node
+let buffer = '';
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+const update = (value) => send({method: 'session/update', params: {sessionId: 'acp-t13', update: value}});
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') send({id: message.id, result: {protocolVersion: 1}});
+    else if (message.method === 'session/new') send({id: message.id, result: {sessionId: 'acp-t13', configOptions: []}});
+    else if (message.method === 'session/set_mode' || message.method === 'session/set_config_option') send({id: message.id, result: {}});
+    else if (message.method === 'session/prompt') {
+      update({sessionUpdate: 'usage_update', used: 120000, size: 200000});
+      update({sessionUpdate: 'agent_message_chunk', content: {type: 'text', text: 'partial answer'}});
+      update({sessionUpdate: 'usage_update', used: 160000, size: 200000});
+      send({id: message.id, result: {stopReason: 'max_turn_requests'}});
+      setTimeout(() => process.exit(0), 20);
+    }
+  }
+});
+`,
+	);
+	chmodSync(limitBin, 0o755);
+	const limitTranscript = join(t13WorkerDir, 'transcripts', 'limit-job.jsonl');
+	const limitSpec = modExports.buildSpec(
+		{
+			id: 'limit-job',
+			label: 'limit',
+			kind: 'agent',
+			owner: 'owner-t13',
+			cwd: t13WorkerDir,
+			logPath: join(t13WorkerDir, 'logs', 'limit-job.log'),
+			inboxDir: join(t13WorkerDir, 'inbox'),
+			jobsDir: join(t13WorkerDir, 'jobs'),
+			startedAt: fixedNow,
+			tailMax: 8000,
+			bin: limitBin,
+			prompt: 'work',
+			agentType: 'general-purpose',
+			agentId: 'limit-job',
+			transcriptPath: limitTranscript,
+			autoCompactWindow: 150000,
+			maxTurns: 2,
+		},
+		'/mod.ts',
+	);
+	assert.deepEqual(
+		limitSpec.args.slice(0, 2),
+		['--max-turns', '2'],
+		'the turn cap is passed to the host, which reports the stop reason',
+	);
+	writeFileSync(
+		join(t13WorkerDir, 'jobs', 'limit-job.json'),
+		JSON.stringify({
+			id: 'limit-job',
+			label: 'limit',
+			kind: 'agent',
+			agentId: 'limit-job',
+			state: 'queued',
+			prompt: 'work',
+			agentType: 'general-purpose',
+			cwd: t13WorkerDir,
+			logPath: limitSpec.logPath,
+			transcriptPath: limitTranscript,
+			autoCompactWindow: 150000,
+			maxTurns: 2,
+			startedAt: fixedNow,
+			owner: 'owner-t13',
+		}),
+	);
+	const limitChild = spawn(process.execPath, ['-e', workerText], {
+		cwd: t13WorkerDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(limitSpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	await new Promise((resolve) => limitChild.on('exit', resolve));
+	const limitRecord = JSON.parse(readFileSync(join(t13WorkerDir, 'jobs', 'limit-job.json'), 'utf8'));
+	const limitLogText = readFileSync(join(t13WorkerDir, 'logs', 'limit-job.log'), 'utf8');
+	const limitSignalFile = readdirSync(join(t13WorkerDir, 'inbox')).find((name) => name.includes('limit-job'));
+	const limitSignal = JSON.parse(readFileSync(join(t13WorkerDir, 'inbox', limitSignalFile), 'utf8'));
+	assert.equal(limitRecord.state, 'failed', 'a maxTurns stop fails the run');
+	assert.equal(limitRecord.partial, true, 'and the result is marked partial');
+	assert.equal(limitRecord.agentId, 'limit-job', 'the record keeps its agent id');
+	assert.equal(limitRecord.compactBoundary.trigger, 'auto', 'the boundary names its trigger');
+	assert.equal(limitRecord.compactBoundary.preTokens, 160000, 'the boundary carries the pre-compaction count');
+	assert.match(String(limitRecord.failureReason), /max turns reached/, 'the partial reason is on the record');
+	assert.match(String(limitSignal.body), /max turns reached/, 'and in the delivered signal');
+	assert.match(limitLogText, /compact_boundary/, 'the boundary is in the log');
+	assert.equal(limitSignal.partial, true, 'the signal is partial');
+	assert.equal(limitSignal.agentId, 'limit-job', 'the signal carries the agent id');
+	assert.equal(limitSignal.compactBoundary.preTokens, 160000, 'the signal carries the boundary');
+	const limitTranscriptText = readFileSync(limitTranscript, 'utf8');
+	assert.match(limitTranscriptText, /partial answer/, 'the transcript holds the streamed answer');
+	assert.match(limitTranscriptText, /compact_boundary/, 'and the compaction event');
+	ok('T13: maxTurns is partial and emits compact_boundary');
+
+	const partialOutcome = foregroundOutcome(
+		{state: 'failed', partial: true, failureReason: 'max turns reached; result is partial', label: 'limit', kind: 'agent'},
+		'partial answer',
+	);
+	assert.equal(partialOutcome.ok, true, 'a partial foreground result is not an error');
+	assert.equal(partialOutcome.partial, true);
+	assert.match(partialOutcome.text, /partial answer/, 'the partial output is returned');
+	assert.match(partialOutcome.text, /partial: max turns reached/, 'with the partial note');
+
+	// 85. a partial maxTurns job resumes its session -----------------------
+	const partialRuntime = makeRuntime({now: () => fixedNow});
+	const partialSession = makeSession();
+	// Seed the owning token so the session start drains this job's signal.
+	partialSession.appendCustomEntry({customType: 'subagent/owner', data: {token: 'owner-t13'}});
+	const partial = makeApi({spoolDir: t13WorkerDir, session: partialSession, runtime: partialRuntime.runtime});
+	mod(partial.api, partial.runtime);
+	partial.registeredHooks.onSessionStart({source: 'resume', sessionId: 't13'});
+	const limitDelivered = partial.userMessages.map((message) => message.text).join('\n');
+	assert.match(limitDelivered, /compact_boundary: auto at 160000 tokens/, 'the delivered result carries the boundary');
+	assert.match(limitDelivered, /partial/, 'and the partial state');
+	assert.match(limitDelivered, /subagent_resume limit-job/, 'and the resume hint');
+	const partialResume = await toolOf(partial, 'subagent_resume').run({input: {id: 'limit-job', prompt: 'continue'}});
+	assert.equal(partialResume.ok, true, JSON.stringify(partialResume));
+	const partialSpec = JSON.parse(partialRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.equal(partialSpec.resumeSession, 'acp-t13', 'the partial job resumes its ACP session');
+	assert.equal(partialSpec.autoCompactWindow, 150000, 'the compaction window carries over');
+	assert.equal(partialSpec.maxTurns, 2, 'the turn cap carries over');
+	assert.equal(partialSpec.prompt, 'continue', 'the new instruction is the resumed prompt');
+	ok('T13: a partial maxTurns job remains resumable');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);
