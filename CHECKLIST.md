@@ -138,14 +138,14 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 9: UI and persistence
 
-- [ ] Add the jobs pane.
-- [ ] Add state markers for the six states.
-- [ ] Add refresh and cancel controls.
-- [ ] Add the footer running count.
-- [ ] Add `/subagents list`, `jobs`, `cancel`, and `open`.
-- [ ] Add transcript open from the pane.
+- [x] Add the jobs pane. (T10: task rows, selection, open/stop/dismiss.)
+- [x] Add state markers for the six states.
+- [x] Add refresh and cancel controls. (T10 adds prev/next/enter/x/esc; Ctrl+B backgrounds a foreground run.)
+- [x] Add the footer running count. (T10 adds the 30-second `/tasks` hint.)
+- [x] Add `/subagents list`, `jobs`, `cancel`, and `open`.
+- [x] Add transcript open from the pane. (T10: pane Enter renders the transcript; `/tasks enter` also sends a follow-up.)
 - [ ] Add hot reload recovery.
-- Gate: manual smoke in two sessions.
+- Gate: manual smoke in two sessions. (Automated panel checks are in smoke 70-76; the two-session manual smoke remains.)
 
 ## Phase 10: Release
 
@@ -228,14 +228,16 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 - [x] Named agents, sibling roster at startup, `subagent_send` queue/start/resume.
 - [x] `ListAgents` foreground/background visibility; `SubagentHandback`.
-- [ ] Agent teams: teammates keep task and cron tools; teammate runs foreground; refuse `background: true` and `run_in_background: true`.
-- [ ] Forks: full history, same prompt/tools/model/permissions/prompt cache; `fork` type; `/subtask`.
-- [ ] Observe and steer: Enter, `x`, Esc; confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork.
-- [ ] Fork-mode defaults and controls; `run_in_background` removed where fork mode is on.
+- [x] Agent teams: teammates keep task and cron tools; teammate runs foreground; refuse `background: true` and `run_in_background: true`. (T10: smoke 74; `filterTools({team: true})`, `resolveTeamPolicy`.)
+- [x] Forks: full history, same prompt/tools/model/permissions/prompt cache; `fork` type; `/subtask`. (T10: smoke 70-73; CLI `--fork-session`, one-shot `--resume` follow-ups, `promptCache: shared`.)
+- [x] Observe and steer: move rows, Enter opens the transcript and sends follow-ups, `x` stops or dismisses, Esc returns. (T10: pane + `/tasks` next/prev/enter/send/x/stop/esc; smoke 72, 75.)
+- [ ] Confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork. (Host-owned commands; the mod has no interception seam for slash commands.)
+- [x] Fork-mode defaults and controls; `run_in_background` removed where fork mode is on. (T10: `resolveForkMode`; smoke 70-71.)
+- [x] Panel task rows: 30-second success/failure lifecycle, Ctrl+B, `/tasks`, `@mention` candidates. (T10: smoke 75.)
 - [ ] Permission prompts: foreground inline; background surfaced in the main session naming the agent; Esc denies one call without stopping it.
 - [ ] `waiting-input` carries the question or approval request and does not hang.
 - [ ] The transport ADR is accepted.
-- Gate: live-message, fork, team, and permission tests pass; ADR accepted.
+- Gate: live-message, fork, team, and permission tests pass; ADR accepted. (Fork/team/steer/panel tests pass: smoke 70-76. Permission-prompt behavior is T5/phase 8.)
 
 ## Phase 16: Surfaces, parity, and release
 

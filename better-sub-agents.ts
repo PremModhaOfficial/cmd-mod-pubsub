@@ -98,6 +98,29 @@ const LIVE_POLL_MS = 100;
 const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
 const ROSTER_MAIN = 'main';
 
+// Task rows. A success disappears immediately; a failure or stop stays visible for
+// this window so the user can read it, and `x` clears it early.
+const TASK_ROW_GRACE_MS = 30 * 1000;
+// Fork mode. On by default for a human, off for a non-interactive/SDK run. The
+// flag wins over the environment, which wins over the default.
+const FORK_MODE_FLAG = 'fork_mode';
+const FORK_MODE_ENV = 'BETTER_SUBAGENTS_FORK_MODE';
+const FORK_MODE_ENV_ALIAS = 'CLAUDE_CODE_FORK_MODE';
+const SDK_ENV = 'CLAUDE_AGENT_SDK';
+const SDK_ENV_ALIAS = 'BETTER_SUBAGENTS_SDK';
+const FORK_AGENT_TYPE = 'fork';
+// A teammate keeps the shared task list and the cron scheduler even when its
+// definition's tools list or disallowedTools would remove them.
+export const TEAM_TOOL_NAMES: string[] = [
+	'TaskCreate',
+	'TaskGet',
+	'TaskList',
+	'TaskUpdate',
+	'CronCreate',
+	'CronDelete',
+	'CronList',
+];
+
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
 // body is the worker's system prompt. Discovery follows the scope table: managed,
 // CLI, project (closest directory upward, then --add-dir), user, plugin, built-in.
@@ -356,9 +379,23 @@ try {
 }
 const logWrite = text => { try { fs.writeSync(out, text); } catch (e) {} };
 
-const child = spec.kind === 'agent'
-  ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['pipe', 'pipe', 'pipe']})
-  : spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', out, out]});
+// The fork path: the host CLI runs one print turn. stdout is the NDJSON event
+// stream, so it is parsed instead of logged; the result line names the fork
+// session, which is what a follow-up resumes.
+const isFork = spec.kind === 'fork';
+let forkStdout = '';
+let forkSessionId = typeof spec.forkSessionId === 'string' ? spec.forkSessionId : undefined;
+
+const child = isFork
+  ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe']})
+  : spec.kind === 'agent'
+    ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['pipe', 'pipe', 'pipe']})
+    : spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', out, out]});
+
+if (isFork && child.stdout && child.stderr) {
+  child.stdout.on('data', chunk => { forkStdout += chunk.toString(); });
+  child.stderr.on('data', chunk => logWrite(chunk.toString()));
+}
 
 let timedOut = false;
 let killTimer;
@@ -402,6 +439,10 @@ const finish = (code, spawnError, signal) => {
     shutdown();
     return;
   }
+  if (spec.kind === 'fork') {
+    finishFork(code, spawnError, signal);
+    return;
+  }
 
   const tail = readTail();
   const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
@@ -431,11 +472,229 @@ const finish = (code, spawnError, signal) => {
   settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, readReportTail(), wantsInput ? {question: lastLine} : undefined);
 };
 
+// One NDJSON parser for the fork path. Event lines become tool progress in the
+// transcript; the result line carries finalText, the stop reason, and the new
+// session id. Anything else is ignored, never guessed at.
+const parseForkLines = text => {
+  let result;
+  const toolLines = [];
+  for (const line of String(text).split('\\n')) {
+    if (!line.trim()) continue;
+    let parsed;
+    try { parsed = JSON.parse(line); } catch (e) { continue; }
+    if (parsed && parsed.type === 'event' && parsed.event) {
+      const event = parsed.event;
+      const name = String(event.name || event.toolName || event.tool || 'call');
+      if (event.type === 'tool_running') toolLines.push('[tool] ' + name);
+      else if (event.type === 'tool_completed') toolLines.push('[tool completed] ' + name);
+    } else if (parsed && parsed.type === 'result') {
+      result = parsed;
+    }
+  }
+  return {result: result, toolLines: toolLines};
+};
+
+const forkPollInterval = () => (typeof spec.controlPollMs === 'number' && spec.controlPollMs > 0 ? spec.controlPollMs : 100);
+
+// The fork keeps the process alive after the first turn, exactly like a live ACP
+// worker. A message cannot preempt the turn that is running - the host CLI has no
+// mid-turn steering - so it becomes the next --resume <fork> -p turn.
+const forkLiveLoop = async () => {
+  const controlDir = typeof spec.controlDir === 'string' ? spec.controlDir : '';
+  if (controlDir.length === 0) return;
+  const sendPath = path.join(controlDir, 'send.jsonl');
+  const cancelPath = path.join(controlDir, 'cancel');
+  const statePath = path.join(controlDir, 'state.json');
+  let offset = 0;
+  let partial = '';
+  let canceled = false;
+  let turnChild;
+  let messageCount = 0;
+  const queue = [];
+  const writeState = busy => {
+    try {
+      fs.mkdirSync(controlDir, {recursive: true});
+      const tmp = statePath + '.tmp-' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify({busy: !!busy, turns: messageCount, updatedAt: Date.now()}));
+      fs.renameSync(tmp, statePath);
+    } catch (e) {}
+  };
+  const readSend = () => {
+    let size;
+    try { size = fs.statSync(sendPath).size; } catch (e) { return; }
+    if (size <= offset) return;
+    let chunk = '';
+    try {
+      const fd = fs.openSync(sendPath, 'r');
+      const length = size - offset;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, offset);
+      fs.closeSync(fd);
+      offset = size;
+      chunk = buffer.toString('utf8');
+    } catch (e) { return; }
+    const lines = (partial + chunk).split('\\n');
+    partial = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry.message === 'string' && entry.message.length > 0) queue.push(entry);
+      } catch (e) {}
+    }
+  };
+  const timer = setInterval(() => {
+    readSend();
+    if (!canceled) {
+      try {
+        if (fs.existsSync(cancelPath)) {
+          canceled = true;
+          logWrite('[live] cancel requested\\n');
+          try { if (turnChild) turnChild.kill('SIGTERM'); } catch (e) {}
+        }
+      } catch (e) {}
+    }
+  }, forkPollInterval());
+  if (timer.unref) timer.unref();
+  writeState(false);
+  const idleMs = typeof spec.idleMs === 'number' && spec.idleMs >= 0 ? spec.idleMs : 30000;
+  while (!canceled) {
+    if (queue.length === 0) {
+      const deadline = Date.now() + idleMs;
+      while (queue.length === 0 && !canceled && Date.now() < deadline) {
+        const {promise, resolve} = Promise.withResolvers();
+        setTimeout(resolve, Math.min(50, forkPollInterval()));
+        await promise;
+      }
+      if (queue.length === 0) {
+        if (!canceled) logWrite('[live] idle window elapsed\\n');
+        break;
+      }
+    }
+    if (canceled) break;
+    const entry = queue.shift();
+    const from = typeof entry.from === 'string' ? entry.from : 'main';
+    const text = String(entry.message);
+    logWrite('\\n[live] message from ' + from + ': ' + text + '\\n');
+    writeState(true);
+    const startedAt = Date.now();
+    let turnStdout = '';
+    let turnCode = null;
+    let turnError;
+    try {
+      turnChild = spawn(spec.bin, ['--resume', String(forkSessionId || ''), '-p', text, '--output-format', 'json'], {cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe']});
+      if (turnChild.stdout) turnChild.stdout.on('data', chunk => { turnStdout += chunk.toString(); });
+      if (turnChild.stderr) turnChild.stderr.on('data', chunk => logWrite(chunk.toString()));
+      const {promise, resolve} = Promise.withResolvers();
+      turnChild.on('close', code => { turnCode = code; resolve(); });
+      turnChild.on('error', error => { turnError = error; resolve(); });
+      await promise;
+    } catch (error) {
+      turnError = error;
+    }
+    turnChild = undefined;
+    if (canceled) break;
+    const parsed = parseForkLines(turnStdout);
+    if (parsed.result && typeof parsed.result.sessionId === 'string' && parsed.result.sessionId.length > 0) {
+      forkSessionId = parsed.result.sessionId;
+      writeRecord({forkSessionId: forkSessionId});
+    }
+    for (const line of parsed.toolLines) logWrite(line + '\\n');
+    const reply = parsed.result && typeof parsed.result.finalText === 'string' ? parsed.result.finalText.trim() : '';
+    if (reply.length > 0) logWrite(reply + '\\n');
+    const failure = turnError !== undefined
+      ? 'live turn failed: ' + String(turnError && turnError.message || turnError)
+      : !parsed.result
+        ? 'live turn failed: fork exited before a result (exit ' + String(turnCode) + ')'
+        : parsed.result.subtype === 'error' || (typeof parsed.result.error === 'string' && parsed.result.error.length > 0)
+          ? 'live turn failed: ' + String(parsed.result.error || 'API error')
+          : undefined;
+    messageCount += 1;
+    const scan = scanOutput((failure === undefined ? 'reply to ' + from + ':' : failure + '\\nreply to ' + from + ':') + '\\n' + reply);
+    emit(signalEnvelope({
+      id: spec.id + '-msg-' + messageCount,
+      label: spec.label + ' (message)',
+      kind: 'message',
+      owner: spec.owner,
+      startedAt: startedAt,
+      logPath: spec.logPath,
+      sessionId: spec.sessionId
+    }, {
+      state: failure === undefined ? 'done' : 'failed',
+      exitCode: failure === undefined ? 0 : null,
+      finishedAt: Date.now(),
+      durationMs: 0,
+      title: (spec.name || spec.label) + (failure === undefined ? ' replied' : ' failed a live turn'),
+      body: scan.text,
+      scanned: true,
+      scanMatches: scan.matches
+    }));
+    writeState(false);
+  }
+  clearInterval(timer);
+  try { if (turnChild) turnChild.kill('SIGTERM'); } catch (e) {}
+};
+
+// The first fork turn. A result line is success; an event stream with no result,
+// a timeout, or an error subtype is a failure that still carries the last text.
+const finishFork = (code, spawnError, signal) => {
+  if (settled) return;
+  clearTimers();
+  const record = readRecord();
+  if (record.state === 'canceled') {
+    settled = true;
+    shutdown();
+    return;
+  }
+  const parsed = parseForkLines(forkStdout);
+  const result = parsed.result;
+  if (result && typeof result.sessionId === 'string' && result.sessionId.length > 0) {
+    forkSessionId = result.sessionId;
+    writeRecord({forkSessionId: forkSessionId});
+  }
+  for (const line of parsed.toolLines) logWrite(line + '\\n');
+  const text = result && typeof result.finalText === 'string' ? result.finalText.trim() : '';
+  if (text.length > 0) logWrite((text.charAt(text.length - 1) === '\\n' ? text : text + '\\n'));
+  const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
+  const errorText = result && typeof result.error === 'string' ? result.error : '';
+  const stopReason = result && typeof result.stopReason === 'string' ? result.stopReason : '';
+  const detail = timedOut
+    ? 'timed out after ' + timeoutLabel
+    : spawnError !== undefined
+      ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
+      : !result
+        ? 'fork exited before a result (exit ' + String(code) + ')'
+        : errorText.length > 0
+          ? errorText
+          : 'API error';
+  if (timedOut || spawnError !== undefined || !result) {
+    fail(detail, code);
+    shutdown();
+    return;
+  }
+  if (result.subtype === 'error' || errorText.length > 0) {
+    failApi(detail);
+    shutdown();
+    return;
+  }
+  if (stopReason === 'max_turn_requests' || stopReason === 'max_tokens') {
+    settle('failed', 'max turns reached; result is partial', code, text);
+  } else {
+    settle('done', 'exit 0', code === null ? 0 : code, text);
+  }
+  if (spec.live === true) {
+    forkLiveLoop().then(shutdown).catch(() => shutdown());
+    return;
+  }
+  shutdown();
+};
+
 if (typeof child.pid === 'number') {
   writeRecord({state: 'running', pid: child.pid, workerPid: process.pid});
 }
 
-child.on('exit', (code, signal) => finish(code, undefined, signal));
+child.on('exit', (code, signal) => { if (!isFork) finish(code, undefined, signal); });
+if (isFork) child.on('close', (code, signal) => finishFork(code, undefined, signal));
 child.on('error', err => finish(null, err));
 
 // The ACP client. One child, one session, one prompt. session/new creates the
@@ -1150,6 +1409,8 @@ export interface AgentDefinition {
 	effort?: string;
 	readOnly?: boolean;
 	oneShot?: boolean;
+	/** The `fork` type: inherits the main conversation instead of a fresh context. */
+	fork?: boolean;
 }
 
 export interface AgentEntry {
@@ -1548,6 +1809,15 @@ export const BUILTIN_AGENT_DEFINITIONS: AgentDefinition[] = [
 			'You are a general-purpose coding agent. Complete the assigned task end to end, then report what changed and how it was verified.',
 		source: 'builtin',
 		path: '',
+	},
+	{
+		name: FORK_AGENT_TYPE,
+		description:
+			'Fork the current conversation: full history, the main system prompt, tools, model, permissions, and prompt cache. Use it when the task needs the context already in this session.',
+		systemPrompt: '',
+		source: 'builtin',
+		path: '',
+		fork: true,
 	},
 ];
 
@@ -2368,7 +2638,7 @@ export function listAgentsVisible(options: {background?: boolean; crossSessionMe
 export interface WorkerSpecInput {
 	id: string;
 	label: string;
-	kind: 'command' | 'agent';
+	kind: 'command' | 'agent' | 'fork';
 	owner?: string;
 	cwd: string;
 	logPath: string;
@@ -2381,6 +2651,16 @@ export interface WorkerSpecInput {
 	/** This job's nesting level: the caller's depth plus one. */
 	depth?: number;
 	agentType?: string;
+	/** A fork: inherit the main conversation's prompt, tools, model, and cache. */
+	fork?: boolean;
+	/** The main conversation the fork copies; absent for a non-fork. */
+	mainSessionId?: string;
+	/** The session name the host assigns to the new fork. */
+	sessionName?: string;
+	/** `shared` for a fork, `own` for a non-fork. */
+	promptCache?: 'shared' | 'own';
+	/** The team a teammate belongs to. */
+	teamName?: string;
 	systemPrompt?: string;
 	model?: string;
 	effort?: string;
@@ -2431,6 +2711,27 @@ export interface WorkerSpec extends WorkerSpecInput {
 // speaks JSON-RPC over stdout/stdin. Shell jobs keep the /bin/sh argv.
 export function buildArgs(spec: WorkerSpec, modPath: string): string[] {
 	if (spec.kind === 'command') return ['-c', String(spec.command ?? '')];
+	if (spec.kind === 'fork') {
+		// ACP has no fork primitive; the host CLI fork copies the session and its
+		// prompt cache. `--output-format json` is what makes the new session id
+		// readable from the result line, so a follow-up can resume it.
+		const prompt = String(spec.prompt ?? '');
+		if (typeof spec.resumeSession === 'string' && spec.resumeSession.length > 0) {
+			return ['--resume', spec.resumeSession, '-p', prompt, '--output-format', 'json'];
+		}
+		const name = String(spec.sessionName ?? `subagent-${spec.id}`);
+		return [
+			'--fork-session',
+			'--resume',
+			String(spec.mainSessionId ?? ''),
+			'-n',
+			name,
+			'-p',
+			prompt,
+			'--output-format',
+			'json',
+		];
+	}
 	return ['--mod', modPath, 'acp'];
 }
 
@@ -2902,6 +3203,8 @@ export interface ToolFilterInput {
 	permissionMode?: string;
 	/** A background agent keeps every MCP tool and only the allowlisted built-ins. */
 	background?: boolean;
+	/** A teammate keeps the shared task and cron tools, even when filtered out. */
+	team?: boolean;
 }
 
 export type ToolFilterResult =
@@ -2909,7 +3212,10 @@ export type ToolFilterResult =
 	| {ok: false; error: string};
 
 export function filterTools(input: ToolFilterInput = {}): ToolFilterResult {
-	const available = unique(input.available ?? SUBAGENT_TOOL_UNIVERSE);
+	const available = unique([
+		...(input.available ?? SUBAGENT_TOOL_UNIVERSE),
+		...(input.team === true ? TEAM_TOOL_NAMES : []),
+	]);
 	const mcpServers = unique(input.mcpServers ?? []);
 	const requested = input.tools === undefined || input.tools.length === 0 ? undefined : input.tools;
 
@@ -2945,12 +3251,18 @@ export function filterTools(input: ToolFilterInput = {}): ToolFilterResult {
 		return true;
 	});
 
+	// A teammate keeps the task and cron tools even when its `disallowedTools` or
+	// its background filter would have removed them.
+	if (input.team === true) {
+		for (const tool of TEAM_TOOL_NAMES) if (!kept.includes(tool)) kept.push(tool);
+	}
+
 	if (requested !== undefined && kept.length === 0) {
 		// Name the entries, not the derived names: the author must be able to find the
 		// line in the definition.
 		return {ok: false, error: `tools list resolved to no available tool: ${requested.join(', ')}`};
 	}
-	return {ok: true, tools: kept, removed};
+	return {ok: true, tools: kept, removed: removed.filter(tool => !kept.includes(tool))};
 }
 
 function nonEmpty(value: unknown): string | undefined {
@@ -3048,6 +3360,7 @@ export interface LaunchResolutionInput {
 	background?: boolean;
 	availableTools?: string[];
 	mcpServers?: string[];
+	team?: boolean;
 }
 
 export type LaunchResolution =
@@ -3072,6 +3385,7 @@ export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResoluti
 		...(input.disallowedTools !== undefined ? {disallowedTools: input.disallowedTools} : {}),
 		...(input.permissionMode !== undefined ? {permissionMode: input.permissionMode} : {}),
 		...(input.background !== undefined ? {background: input.background} : {}),
+		...(input.team !== undefined ? {team: input.team} : {}),
 	});
 	if (!tools.ok) return tools;
 	const model = resolveModel({
@@ -3263,6 +3577,18 @@ interface JobRecord extends JobIdentity {
 	agentType?: string;
 	/** The addressable name from the spawn; absent for an anonymous agent. */
 	name?: string;
+	/** A fork: the main conversation's history, prompt, tools, model, cache. */
+	fork?: boolean;
+	/** The main conversation a fork copied. */
+	mainSessionId?: string;
+	/** The host's id for the fork session; follow-ups resume it. */
+	forkSessionId?: string;
+	/** `shared` for a fork, `own` for every other agent. */
+	promptCache?: string;
+	/** The team this teammate belongs to. */
+	teamName?: string;
+	/** Ctrl+B moved a foreground run to the background. */
+	backgroundedAt?: number;
 	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
 	 *  own end-of-turn signal is suppressed. */
 	handbackAt?: number;
@@ -3459,6 +3785,81 @@ export function resolveExecutionPolicy(input: ExecutionPolicyInput): ExecutionMo
 	return 'background';
 }
 
+// ---------------------------------------------------------------------------
+// Fork mode and agent teams
+//
+// Fork mode is the setting that decides whether the agents the model spawns run
+// in the background. The default is the session shape: a human driving gets it,
+// a non-interactive run and the Agent SDK do not. The flag and the environment
+// override the default in both directions, so an SDK caller can opt in.
+// ---------------------------------------------------------------------------
+
+export type ForkMode = 'on' | 'off';
+
+export interface ForkModeInput {
+	readonly interactive?: boolean;
+	/** The Agent SDK: off by default even when a TTY is attached. */
+	readonly sdk?: boolean;
+	readonly env?: Record<string, string | undefined>;
+	/** `--mod-option fork_mode=on|off|auto`. An explicit on/off wins. */
+	readonly flag?: string;
+}
+
+function forkToggle(value: unknown): ForkMode | undefined {
+	if (typeof value !== 'string') return undefined;
+	const normalized = value.trim().toLowerCase();
+	if (['on', 'true', '1', 'yes'].includes(normalized)) return 'on';
+	if (['off', 'false', '0', 'no'].includes(normalized)) return 'off';
+	return undefined;
+}
+
+export function resolveForkMode(input: ForkModeInput = {}): ForkMode {
+	const flag = forkToggle(input.flag);
+	if (flag !== undefined) return flag;
+	const env = input.env ?? {};
+	const fromEnv = forkToggle(env[FORK_MODE_ENV]) ?? forkToggle(env[FORK_MODE_ENV_ALIAS]);
+	if (fromEnv !== undefined) return fromEnv;
+	const inSdk =
+		input.sdk === true ||
+		forkToggle(env[SDK_ENV]) === 'on' ||
+		forkToggle(env[SDK_ENV_ALIAS]) === 'on' ||
+		forkToggle(env.COMMANDCODE_SDK) === 'on';
+	if (inSdk) return 'off';
+	return input.interactive === true ? 'on' : 'off';
+}
+
+export interface TeamPolicyInput {
+	readonly teammate: boolean;
+	readonly definitionBackground?: boolean;
+	readonly requested?: boolean;
+	readonly forkMode: ForkMode;
+}
+
+export type TeamPolicy = {readonly ok: true; readonly background: false} | {readonly ok: false; readonly error: string};
+
+// A teammate is always foreground. Its definition cannot pin it to the background,
+// and a caller may only ask for the background when fork mode is off (where
+// `run_in_background` still exists); with fork mode on the parameter is gone.
+export function resolveTeamPolicy(input: TeamPolicyInput): TeamPolicy {
+	if (input.teammate !== true) return {ok: true, background: false};
+	if (input.definitionBackground === true) {
+		return {
+			ok: false,
+			error:
+				`a teammate cannot run in the background: its definition sets background: true; ` +
+				'remove that field to join a team',
+		};
+	}
+	if (input.requested === true && input.forkMode === 'off') {
+		return {
+			ok: false,
+			error:
+				'a teammate cannot run in the background: remove run_in_background: true (teammates run in the foreground)',
+		};
+	}
+	return {ok: true, background: false};
+}
+
 export interface ForegroundJob {
 	readonly state?: unknown;
 	readonly failureReason?: unknown;
@@ -3510,6 +3911,87 @@ export function foregroundOutcome(job: ForegroundJob, log: string): ForegroundRe
 		return {ok: true, partial: true, text: `${text}\n\n[cut off: ${reason}]`};
 	}
 	return {ok: false, error: reason};
+}
+
+// ---------------------------------------------------------------------------
+// Task rows and the agent panel
+//
+// A row is a job shaped for the task list. Success disappears immediately (the
+// result is already in the feed); failure and stop stay for 30 seconds so the
+// user can read why, and `x` clears one early. Everything here is pure so the
+// lifecycle is asserted without a timer.
+// ---------------------------------------------------------------------------
+
+export interface TaskRowLike {
+	readonly id?: unknown;
+	readonly state?: unknown;
+	readonly startedAt?: unknown;
+	readonly finishedAt?: unknown;
+}
+
+export interface TaskRowOptions {
+	readonly now: number;
+	/** Ids the user dismissed with `x`. */
+	readonly dismissed?: ReadonlySet<string>;
+}
+
+export function taskRowVisible(job: TaskRowLike, options: TaskRowOptions): boolean {
+	const id = String(job.id ?? '');
+	if (id.length > 0 && options.dismissed?.has(id) === true) return false;
+	const state = canonicalState(job.state);
+	if (state === 'done') return false;
+	if (state === 'failed' || state === 'canceled') {
+		const finishedAt = typeof job.finishedAt === 'number' ? job.finishedAt : undefined;
+		if (finishedAt === undefined) return true;
+		return options.now - finishedAt <= TASK_ROW_GRACE_MS;
+	}
+	return true;
+}
+
+export function taskPanelRows<T extends TaskRowLike>(jobs: readonly T[], options: TaskRowOptions): T[] {
+	return jobs.filter(job => taskRowVisible(job, options));
+}
+
+// Move the selection through the visible rows. With no selection, forward starts
+// at the first row and backward at the last; the ends clamp instead of wrapping, so
+// a held key cannot spin the selection.
+export function moveTaskSelection(rows: readonly TaskRowLike[], selectedId: string | undefined, delta: number): string | undefined {
+	if (rows.length === 0) return undefined;
+	const current = rows.findIndex(row => String(row.id ?? '') === selectedId);
+	if (current === -1) return String((delta < 0 ? rows[rows.length - 1] : rows[0])?.id ?? '');
+	const next = Math.min(rows.length - 1, Math.max(0, current + (delta < 0 ? -1 : 1)));
+	return String(rows[next]?.id ?? '');
+}
+
+// The @mention typeahead is a name list, not a spawn: every valid custom,
+// built-in, and plugin-scoped definition, plus every named agent in this session.
+// Sorted and de-duplicated so the list reads the same on every open.
+export function mentionCandidates(
+	definitions: readonly {readonly name?: string; readonly valid?: boolean}[],
+	namedAgents: readonly string[] = [],
+): string[] {
+	const names = new Set<string>();
+	for (const definition of definitions) {
+		const name = String(definition.name ?? '').trim();
+		if (name.length > 0 && definition.valid !== false) names.add(name);
+	}
+	for (const agent of namedAgents) {
+		const name = String(agent ?? '').trim();
+		if (name.length > 0) names.add(name);
+	}
+	return [...names].sort();
+}
+
+// The footer keeps a `/tasks` hint for the same 30 seconds a failed row stays (and
+// a moment after a success), so a vanished success is still discoverable.
+export function tasksHintVisible(jobs: readonly TaskRowLike[], now: number): boolean {
+	return jobs.some(job => {
+		const state = canonicalState(job.state);
+		const finishedAt = typeof job.finishedAt === 'number' ? job.finishedAt : undefined;
+		if (finishedAt === undefined) return false;
+		if (state !== 'done' && state !== 'failed' && state !== 'canceled') return false;
+		return now - finishedAt <= TASK_ROW_GRACE_MS;
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -3844,6 +4326,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		default: '',
 		description: 'Comma-separated plugin roots; every child directory with an agents/ dir is a plugin.',
 	});
+	cmd.addFlag(FORK_MODE_FLAG, {
+		type: 'string',
+		default: 'auto',
+		description: 'Fork mode: auto (interactive on, non-interactive/SDK off), on, or off.',
+	});
 
 	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
 	// A flag still sitting on its default is not an override; anything else is.
@@ -3860,6 +4347,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			.map(value => value.trim())
 			.filter(value => value.length > 0);
 	const root = pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT);
+	const forkMode = resolveForkMode({
+		interactive: runtime.interactive === true,
+		env: runtime.env,
+		flag: readFlag(FORK_MODE_FLAG),
+	});
+	const forkModeEnabled = forkMode === 'on';
 	const inboxDir = join(root, 'inbox');
 	const claimedDir = join(root, 'claimed');
 	const orphanedDir = join(root, 'orphaned');
@@ -4641,6 +5134,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (counts.queued) parts.push(`${counts.queued} queued`);
 			if (counts['waiting-input']) parts.push(`${counts['waiting-input']} waiting`);
 			if (pending) parts.push(`${pending} signal${pending === 1 ? '' : 's'}`);
+			// A success leaves the footer hint for 30 seconds after its row disappears.
+			if (tasksHintVisible(jobCache, runtime.now())) parts.push('/tasks');
 			const text = parts.length > 0 ? `◈ ${parts.join(' · ')}` : '';
 			if (text === lastStatus) return;
 			lastStatus = text;
@@ -4780,14 +5275,28 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// rejects before the spawn and calls failJob(); nothing writes a failed record by
 	// hand.
 
+	// Ctrl+B: a foreground tool call that is already waiting. The next poll sees the
+	// id here and returns control to the model; the worker keeps running.
+	const backgroundedForegrounds = new Set<string>();
+	const dismissedTasks = new Set<string>();
+	let selectedTaskId: string | undefined;
+	let agentViewOpen = false;
+	let panelNotice: string | undefined;
+
 	interface JobIntent {
 		readonly label: string;
-		readonly kind: 'command' | 'agent';
+		readonly kind: 'command' | 'agent' | 'fork';
 		readonly command?: string;
 		readonly prompt?: string;
 		readonly cwd: string;
 		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
+		/** A fork: inherit the main conversation instead of building a fresh one. */
+		readonly fork?: boolean;
+		/** The main conversation the fork copies. */
+		readonly mainSessionId?: string;
+		/** The team this teammate belongs to. */
+		readonly teamName?: string;
 		/** This job's nesting level, and the job that spawned it. */
 		readonly depth?: number;
 		readonly parentJobId?: string;
@@ -4877,6 +5386,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						...(intent.resumeSession !== undefined ? {resumedFrom: intent.resumedFrom} : {}),
 					}
 				: {}),
+			...(intent.fork === true
+				? {fork: true, promptCache: 'shared', ...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {})}
+				: {}),
+			...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
 			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
 			...(intent.color !== undefined ? {color: intent.color} : {}),
@@ -5004,10 +5517,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const isAgent = intent.prompt !== undefined;
 		const live = isAgent && intent.live !== false;
 		// The roster is for an agent that can actually message a peer. Host definitions
-		// name the tool SendMessage; the mod registers it as subagent_send.
+		// name the tool SendMessage; the mod registers it as subagent_send. A fork
+		// already has the conversation (and its roster) and gets no fresh bundle.
 		const canSend =
 			intent.tools === undefined || intent.tools.includes('SendMessage') || intent.tools.includes('subagent_send');
-		const roster = isAgent && canSend ? rosterFor(intent.name) : {rosterNames: []};
+		const roster = isAgent && intent.fork !== true && canSend ? rosterFor(intent.name) : {rosterNames: []};
 		const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
 		if (live) {
 			try {
@@ -5039,6 +5553,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					: {}),
 				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
+				...(intent.fork === true
+					? {
+							fork: true,
+							promptCache: 'shared',
+							sessionName: sessionNameOf(id),
+							...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {}),
+						}
+					: {}),
+				...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
 				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
@@ -5071,6 +5594,21 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
 		let record = readJob(launched.id);
 		for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
+			if (backgroundedForegrounds.has(launched.id)) {
+				// Ctrl+B: stop waiting, but leave the worker alone. Its result now arrives
+				// as a normal signal, exactly like a spawn that asked for the background.
+				refreshJobs();
+				return {
+					ok: true,
+					id: launched.id,
+					pid: launched.pid,
+					result: {
+						ok: true,
+						partial: true,
+						text: `${String(record?.label ?? launched.id)} continues in the background; its result will arrive as a signal.`,
+					},
+				};
+			}
 			await runtime.sleep(FOREGROUND_POLL_MS);
 			record = readJob(launched.id);
 		}
@@ -5092,39 +5630,140 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	// ------------------------------------------------------------------ dashboard
 
+	// The task view reads the same 30-second rule the row lifecycle does. Selection
+	// is an id, not an index, so a row finishing during a move cannot shift the
+	// selection onto its neighbour.
+	function visibleTaskRows(): JobRecord[] {
+		return taskPanelRows(jobCache, {now: runtime.now(), dismissed: dismissedTasks});
+	}
+
+	function selectedTask(): JobRecord | undefined {
+		if (selectedTaskId === undefined) return undefined;
+		return visibleTaskRows().find(job => job.id === selectedTaskId);
+	}
+
+	function selectTask(delta: number): JobRecord | undefined {
+		const rows = visibleTaskRows();
+		selectedTaskId = moveTaskSelection(rows, selectedTaskId, delta);
+		cmd.ui.refreshWidgets();
+		return selectedTask();
+	}
+
+	function dismissOrStopTask(id: string): {ok: boolean; message: string} {
+		const job = readJob(id);
+		if (job === undefined) return {ok: false, message: `subagent: no job ${id}`};
+		const state = canonicalState(job.state);
+		if (state === 'queued' || state === 'running') return cancelJob(id);
+		dismissedTasks.add(id);
+		selectedTaskId = selectedTaskId === id ? undefined : selectedTaskId;
+		refreshJobs();
+		cmd.ui.refreshWidgets();
+		return {ok: true, message: `subagent: dismissed ${id} from the task view`};
+	}
+
+	// Ctrl+B. The newest foreground run is the one the user is waiting on; a
+	// background spawn is already background and is skipped.
+	function backgroundForegroundTask(): JobRecord | undefined {
+		const job = jobCache.find(candidate => {
+			const state = canonicalState(candidate.state);
+			return candidate.background === false && (state === 'queued' || state === 'running');
+		});
+		if (job === undefined) return undefined;
+		writeJob({...job, background: true, backgroundedAt: runtime.now(), updatedAt: runtime.now()});
+		backgroundedForegrounds.add(job.id);
+		refreshJobs();
+		return job;
+	}
+
 	cmd.ui.pane({
 		id: 'jobs',
 		title: 'Async subagents',
 		render: () => {
 			try {
+				const rows = visibleTaskRows();
 				const nodes: unknown[] = [
 					{
 						type: 'row',
 						children: [
 							{type: 'text', text: '◈ subagents', bold: true},
-							{type: 'text', text: ` ${jobCache.length} recent · ${countPending()} waiting`, dim: true},
+							{type: 'text', text: ` ${rows.length} task${rows.length === 1 ? '' : 's'} · ${countPending()} waiting`, dim: true},
 						],
 					},
 					{type: 'divider'},
 				];
-				if (jobCache.length === 0) {
-					nodes.push({type: 'text', text: 'No jobs fired in this spool yet.', dim: true});
+				if (rows.length === 0) {
+					nodes.push({type: 'text', text: 'No tasks running or recently failed.', dim: true});
 				}
-				for (const job of jobCache.slice(0, PANE_ROWS_MAX)) {
+				for (const job of rows.slice(0, PANE_ROWS_MAX)) {
 					const state = canonicalState(job.state);
 					const duration = typeof job.durationMs === 'number' ? ` ${(job.durationMs / 1000).toFixed(1)}s` : '';
 					const color = typeof job.color === 'string' && job.color.length > 0 ? job.color : '';
+					const selected = job.id === selectedTaskId ? '▸ ' : '  ';
 					nodes.push({
 						type: 'text',
-						text: `${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}${color.length > 0 ? `  ${color}` : ''}`,
+						text: `${selected}${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)').slice(0, 36)}  ${state}${duration}${color.length > 0 ? `  ${color}` : ''}`,
 						// The definition color is the agent's identity; the state color is the
 						// fallback, so an uncoloured job still reports its lifecycle.
 						color: color.length > 0 ? color : stateColor(state),
 					});
 				}
+				if (panelNotice !== undefined) {
+					nodes.push({type: 'divider'}, {type: 'text', text: panelNotice});
+				}
 				nodes.push({
 					type: 'row',
 					children: [
+						{
+							type: 'button',
+							label: 'Prev',
+							hotkey: '↑',
+							key: 'subagent-prev',
+							onPress: () => selectTask(-1),
+						},
+						{
+							type: 'button',
+							label: 'Next',
+							hotkey: '↓',
+							key: 'subagent-next',
+							onPress: () => selectTask(1),
+						},
+						{
+							type: 'button',
+							label: 'Enter',
+							hotkey: '↵',
+							key: 'subagent-open',
+							onPress: () => {
+								const job = selectedTask();
+								if (job === undefined) return;
+								agentViewOpen = true;
+								const shown = outputText(job.id, {});
+								panelNotice = shown.ok
+									? String(shown.content?.[0]?.text ?? '').slice(0, 4000)
+									: String(shown.error ?? 'cannot read the task');
+								cmd.ui.refreshWidgets();
+							},
+						},
+						{
+							type: 'button',
+							label: 'x',
+							hotkey: 'x',
+							key: 'subagent-dismiss',
+							onPress: () => {
+								const job = selectedTask();
+								if (job !== undefined) dismissOrStopTask(job.id);
+							},
+						},
+						{
+							type: 'button',
+							label: 'Esc',
+							hotkey: 'esc',
+							key: 'subagent-back',
+							onPress: () => {
+								selectedTaskId = undefined;
+								agentViewOpen = false;
+								cmd.ui.refreshWidgets();
+							},
+						},
 						{
 							type: 'button',
 							label: 'Refresh',
@@ -5215,6 +5854,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
 		const name = typeof input.name === 'string' && input.name.trim().length > 0 ? input.name.trim() : undefined;
+		const teamName =
+			typeof input.team_name === 'string' && input.team_name.trim().length > 0 ? input.team_name.trim() : undefined;
 		const requestedMaxTurns = Number(input.max_turns);
 		const timeoutMs = Number(input.timeout_ms);
 		// `subagent_type` is canonical; `agent_type` is the 1.x alias and must behave
@@ -5237,46 +5878,75 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (!resolved.ok) return badInput(resolved.error);
 			definition = resolved.definition;
 		}
+		const forkRequested = definition?.fork === true;
+		const teammate = prompt !== undefined && teamName !== undefined;
+		const requestedBackground = typeof input.run_in_background === 'boolean' ? input.run_in_background : undefined;
+		// A teammate's definition may not pin it to the background, and a caller may
+		// not ask for it while fork mode still exposes the parameter.
+		const teamPolicy = resolveTeamPolicy({
+			teammate,
+			definitionBackground: definition?.background,
+			...(requestedBackground !== undefined ? {requested: requestedBackground} : {}),
+			forkMode,
+		});
+		if (!teamPolicy.ok) return badInput(teamPolicy.error);
 		const requestedTools =
-			prompt === undefined ? undefined : (listField(input.tools) ?? definition?.tools);
+			prompt === undefined || forkRequested ? undefined : (listField(input.tools) ?? definition?.tools);
 		const requestedDisallowed =
-			prompt === undefined ? undefined : (listField(input.disallowed_tools) ?? definition?.disallowedTools);
+			prompt === undefined || forkRequested ? undefined : (listField(input.disallowed_tools) ?? definition?.disallowedTools);
 		// The definition's mode and the main session's mode are combined here, once.
 		// A definition asking for bypass in a default session is refused before the
-		// record exists, so no job is left queued behind a mode that cannot run.
-		const modeResolution = resolvePermissionMode(
-			requestedMode ?? definition?.permissionMode,
-			mainPermissionMode,
-		);
-		if (prompt !== undefined && !modeResolution.ok) return badInput(modeResolution.error);
-		const permissionMode = prompt === undefined ? undefined : modeResolution.ok ? modeResolution.mode : undefined;
+		// record exists, so no job is left queued behind a mode that cannot run. A
+		// fork skips this: it inherits the main session's permissions.
+		let permissionMode: string | undefined;
+		if (prompt !== undefined) {
+			if (forkRequested) {
+				permissionMode = mainPermissionMode ?? 'default';
+			} else {
+				const modeResolution = resolvePermissionMode(requestedMode ?? definition?.permissionMode, mainPermissionMode);
+				if (!modeResolution.ok) return badInput(modeResolution.error);
+				permissionMode = modeResolution.mode;
+			}
+		}
 		// Three inputs, one precedence table: the disable env, the definition's pinned
-		// background, then the caller's request. The default is background.
-		const background =
-			resolveExecutionPolicy({
-				requested: typeof input.run_in_background === 'boolean' ? input.run_in_background : undefined,
-				definitionBackground: definition?.background,
-				env: runtime.env,
-			}) === 'background';
-		const launch = resolveLaunch({
-			...(model !== undefined ? {requestedModel: model} : {}),
-			...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
-			...(typeof input.effort === 'string' ? {requestedEffort: input.effort} : {}),
-			...(definition?.effort !== undefined ? {definitionEffort: definition.effort} : {}),
-			env: runtime.env,
-			// The mod API exposes no main-model getter: an absent model means the ACP
-			// child inherits the user's configured model, which is the main one.
-			...(requestedTools !== undefined ? {tools: requestedTools} : {}),
-			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
-			...(permissionMode !== undefined ? {permissionMode} : {}),
-			background,
-			mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
-		});
+		// background, then the caller's request. Fork mode overrides all of them for a
+		// model-spawned agent (the parameter is gone from the schema) and a teammate
+		// is always foreground.
+		const background = teammate
+			? false
+			: forkModeEnabled
+				? true
+				: resolveExecutionPolicy({
+						...(requestedBackground !== undefined ? {requested: requestedBackground} : {}),
+						definitionBackground: definition?.background,
+						env: runtime.env,
+					}) === 'background';
+		const launch = forkRequested
+			? {ok: true as const, model: undefined, modelSource: 'inherit' as const, effort: undefined, effortSource: 'none' as const, tools: [], removed: []}
+			: resolveLaunch({
+					...(model !== undefined ? {requestedModel: model} : {}),
+					...(definition?.model !== undefined ? {definitionModel: definition.model} : {}),
+					...(typeof input.effort === 'string' ? {requestedEffort: input.effort} : {}),
+					...(definition?.effort !== undefined ? {definitionEffort: definition.effort} : {}),
+					env: runtime.env,
+					// The mod API exposes no main-model getter: an absent model means the ACP
+					// child inherits the user's configured model, which is the main one.
+					...(requestedTools !== undefined ? {tools: requestedTools} : {}),
+					...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
+					...(permissionMode !== undefined ? {permissionMode} : {}),
+					background,
+					...(teammate ? {team: true} : {}),
+					mcpServers: mcpServerNames(spool, [runtime.home, cmd.cwd]),
+				});
 		if (!launch.ok) return badInput(launch.error);
-		// Memory definitions auto-enable Read, Write, and Edit.
-		const launchTools = withMemoryTools(launch.tools, definition?.memory);
+		if (forkRequested && (sessionId === undefined || sessionId.length === 0)) {
+			return badInput('a fork needs the main session id; the session has not bound yet');
+		}
+		// Memory definitions auto-enable Read, Write, and Edit. A fork keeps the main
+		// tool pool untouched, so it gets no filter and no memory additions.
+		const launchTools = forkRequested ? undefined : withMemoryTools(launch.tools, definition?.memory);
 		const maxTurns =
-			prompt === undefined
+			prompt === undefined || forkRequested
 				? undefined
 				: Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0
 					? Math.round(requestedMaxTurns)
@@ -5284,23 +5954,27 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
 		const launched = await fire({
 			label,
-			kind: prompt !== undefined ? 'agent' : 'command',
+			kind: forkRequested ? 'fork' : prompt !== undefined ? 'agent' : 'command',
 			command,
 			prompt,
 			background,
 			cwd: runCwd,
 			...(name !== undefined ? {name} : {}),
+			...(teamName !== undefined ? {teamName} : {}),
 			agentType: definition?.name,
-			systemPrompt: definition?.systemPrompt,
-			startup: startupFor(definition, runCwd, prompt, launch.model),
-			model: prompt === undefined ? undefined : launch.model,
-			tools: prompt === undefined ? undefined : launchTools,
+			...(forkRequested
+				? {fork: true, ...(sessionId !== undefined ? {mainSessionId: sessionId} : {})}
+				: {}),
+			systemPrompt: forkRequested ? undefined : definition?.systemPrompt,
+			startup: forkRequested ? undefined : startupFor(definition, runCwd, prompt, launch.model),
+			model: prompt === undefined || forkRequested ? undefined : launch.model,
+			tools: launchTools,
 			...(requestedDisallowed !== undefined ? {disallowedTools: requestedDisallowed} : {}),
 			...(definition?.color !== undefined ? {color: definition.color} : {}),
 			maxTurns,
-			effort: prompt === undefined ? undefined : launch.effort,
+			effort: prompt === undefined || forkRequested ? undefined : launch.effort,
 			permissionMode,
-			isolation: definition?.isolation,
+			isolation: forkRequested ? undefined : definition?.isolation,
 			...(prompt === undefined ? {} : {background}),
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
@@ -5310,7 +5984,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (launched.result !== undefined) {
 			return launched.result.ok ? okText(launched.result.text) : badInput(launched.result.error);
 		}
-		const kind = definition !== undefined ? `agent (${definition.name})` : 'shell (/bin/sh -c)';
+		const kind =
+			definition !== undefined
+				? `${forkRequested ? 'fork' : 'agent'} (${definition.name})${teamName !== undefined ? ` on team ${teamName}` : ''}`
+				: 'shell (/bin/sh -c)';
 		return okText(
 			`spawned ${launched.id} "${label}" as ${kind}, pid ${launched.pid}.\n` +
 				`log ${join(logsDir, `${launched.id}.log`)}\n` +
@@ -5435,7 +6112,38 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 		// Resume the ACP session the first run created, so the new instruction continues
 		// with the context the worker already has. An older record without one starts a
-		// fresh session (the definition body still applies).
+		// fresh session (the definition body still applies). A fork resumes its fork
+		// session instead; forking again would lose the context it already has.
+		if (record.fork === true) {
+			if (record.forkSessionId === undefined) {
+				return badInput(`subagent: job ${id} is a fork with no recorded session; spawn it again`);
+			}
+			const forkLaunched = await fire({
+				label: `${String(record.label ?? id)} (resume)`,
+				kind: 'fork',
+				prompt: instruction,
+				background: record.teamName !== undefined ? false : true,
+				cwd: String(record.cwd ?? cmd.cwd),
+				agentType: FORK_AGENT_TYPE,
+				fork: true,
+				...(record.mainSessionId !== undefined ? {mainSessionId: record.mainSessionId} : {}),
+				resumeSession: record.forkSessionId,
+				resumedFrom: id,
+				...(record.permissionMode !== undefined ? {permissionMode: record.permissionMode} : {}),
+				...(record.name !== undefined ? {name: record.name} : {}),
+				...(record.teamName !== undefined ? {teamName: record.teamName} : {}),
+				...(record.owner !== undefined ? {owner: record.owner} : {}),
+			});
+			if (!forkLaunched.ok) return badInput(forkLaunched.error);
+			if (forkLaunched.result !== undefined) {
+				return forkLaunched.result.ok ? okText(forkLaunched.result.text) : badInput(forkLaunched.result.error);
+			}
+			return okText(
+				`resumed ${id} as ${forkLaunched.id} "${String(record.label ?? id)} (resume)", pid ${forkLaunched.pid}.\n` +
+					`log ${join(logsDir, `${forkLaunched.id}.log`)}\n` +
+					`The resumed fork reports back here as its own signal.`,
+			);
+		}
 		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
 		const resumeCwd = String(record.cwd ?? cmd.cwd);
 		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
@@ -5530,6 +6238,81 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// Live messaging. The target is a name, never a pid: the record decides whether
 	// the message is queued to a live worker or starts a new turn in its finished
 	// session, so a resume keeps the session the agent already has.
+	async function sendToRecord(record: JobRecord, message: string, from: string): Promise<ToolResult> {
+		const label = String(record.name ?? record.id);
+		const {alive, busy} = liveState(record);
+		if (alive) {
+			if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${label}: its control queue is not writable`);
+			return okText(
+				`${busy ? `queued for ${label}'s next safe point` : `sent to idle ${label}; it starts a turn`} (job ${record.id}).\n` +
+					`The reply arrives here as its own message signal.`,
+			);
+		}
+		const resumeCwd = String(record.cwd ?? cmd.cwd);
+		// A finished fork resumes the fork session the host created. It is the same
+		// session (and cache), not a second fork.
+		if (record.fork === true) {
+			if (record.forkSessionId === undefined) {
+				return badInput(`${label} has finished and its fork session was never recorded; spawn it again`);
+			}
+			const launched = await fire({
+				label: `${String(record.label ?? record.id)} (message)`,
+				kind: 'fork',
+				prompt: message,
+				background: record.teamName !== undefined ? false : true,
+				cwd: resumeCwd,
+				agentType: FORK_AGENT_TYPE,
+				fork: true,
+				...(record.mainSessionId !== undefined ? {mainSessionId: record.mainSessionId} : {}),
+				resumeSession: record.forkSessionId,
+				resumedFrom: record.id,
+				...(record.permissionMode !== undefined ? {permissionMode: record.permissionMode} : {}),
+				...(record.name !== undefined ? {name: record.name} : {}),
+				...(record.teamName !== undefined ? {teamName: record.teamName} : {}),
+				...(record.owner !== undefined ? {owner: record.owner} : {}),
+			});
+			if (!launched.ok) return badInput(launched.error);
+			return okText(
+				`resumed ${label} as ${launched.id} "${String(record.label ?? record.id)} (message)", pid ${launched.pid}.\n` +
+					`The reply arrives here as its own signal.`,
+			);
+		}
+		if (record.acpSessionId === undefined) {
+			return badInput(`${label} has finished and has no resumable session; spawn it again`);
+		}
+		// A finished agent resumes the ACP session it already has, with the same
+		// definition, startup context, tools, model, effort and permissions. The
+		// message is the new turn.
+		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
+		const launched = await fire({
+			label: `${String(record.label ?? record.id)} (message)`,
+			kind: 'agent',
+			prompt: message,
+			cwd: resumeCwd,
+			agentType: record.agentType,
+			systemPrompt: resumeDefinition?.systemPrompt,
+			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
+			model: record.model,
+			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.color !== undefined ? {color: record.color} : {}),
+			maxTurns: record.maxTurns,
+			effort: record.effort,
+			permissionMode: record.permissionMode,
+			timeoutMs: record.timeoutMs,
+			resumeSession: record.acpSessionId,
+			resumedFrom: record.id,
+			name: record.name,
+			owner: record.owner,
+			...(record.teamName !== undefined ? {background: false, teamName: record.teamName} : {}),
+		});
+		if (!launched.ok) return badInput(launched.error);
+		return okText(
+			`resumed ${label} as ${launched.id} "${String(record.label ?? record.id)} (message)", pid ${launched.pid}.\n` +
+				`The reply arrives here as its own signal.`,
+		);
+	}
+
 	const sendLiveRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
 		const to = String(input.to ?? '').trim();
 		const message = typeof input.message === 'string' ? input.message : '';
@@ -5564,85 +6347,52 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				`no agent named "${to}"${names.length > 0 ? `; addressable: ${names.join(', ')}` : '; no named agents in this session'}`,
 			);
 		}
-		const {alive, busy} = liveState(record);
-		if (alive) {
-			if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${to}: its control queue is not writable`);
-			return okText(
-				`${busy ? `queued for ${to}'s next safe point` : `sent to idle ${to}; it starts a turn`} (job ${record.id}).\n` +
-					`The reply arrives here as its own message signal.`,
-			);
-		}
-		if (record.acpSessionId === undefined) {
-			return badInput(`${to} has finished and has no resumable session; spawn it again`);
-		}
-		// A finished agent resumes the ACP session it already has, with the same
-		// definition, startup context, tools, model, effort and permissions. The
-		// message is the new turn.
-		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
-		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
-		const resumeCwd = String(record.cwd ?? cmd.cwd);
-		const launched = await fire({
-			label: `${String(record.label ?? record.id)} (message)`,
-			kind: 'agent',
-			prompt: message,
-			cwd: resumeCwd,
-			agentType: record.agentType,
-			systemPrompt: resumeDefinition?.systemPrompt,
-			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
-			model: record.model,
-			...(record.tools !== undefined ? {tools: record.tools} : {}),
-			...(record.color !== undefined ? {color: record.color} : {}),
-			maxTurns: record.maxTurns,
-			effort: record.effort,
-			permissionMode: record.permissionMode,
-			timeoutMs: record.timeoutMs,
-			resumeSession: record.acpSessionId,
-			resumedFrom: record.id,
-			name: record.name,
-			owner: record.owner,
-		});
-		if (!launched.ok) return badInput(launched.error);
-		return okText(
-			`resumed ${to} as ${launched.id} "${String(record.label ?? record.id)} (message)", pid ${launched.pid}.\n` +
-				`The reply arrives here as its own signal.`,
-		);
+		return sendToRecord(record, message, from);
 	};
 
 	addSurface(
 		'subagent_spawn',
-		'Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode.',
+		'Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode. Pass `team_name` to join an agent team as a foreground teammate. Pass `subagent_type: fork` to inherit the main conversation.' +
+			(forkModeEnabled ? ' Fork mode is on: agent jobs run in the background and `run_in_background` is not accepted.' : ''),
 		{
 			type: 'object',
-			properties: {
-				description: {type: 'string', description: 'Short name for this job, used in the signal title.'},
-				label: {type: 'string', description: 'Alias for description.'},
-				name: {type: 'string', description: 'Address this agent later with subagent_send. A named agent appears in its siblings\' roster.'},
-				prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
-				command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
-				agent_type: {type: 'string', description: "Deprecated alias for subagent_type. Use subagent_type."},
-				subagent_type: {
-					type: 'string',
-					description:
-						"Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins.",
-				},
-				model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
-				effort: {type: 'string', description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort."},
-				tools: {type: 'string', description: 'Comma-separated tool list (or an array). Only these tools remain; overrides the definition.'},
-				disallowed_tools: {type: 'string', description: 'Comma-separated tool list (or an array) to remove. Wins over tools.'},
-				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
-				permission_mode: {
-					type: 'string',
-					description:
-						"Permission mode for an agent job: default, acceptEdits, auto, dontAsk, bypassPermissions, plan, or manual. The main session's mode wins when it is acceptEdits, auto, or bypassPermissions; bypassPermissions otherwise requires the main session to be in it.",
-				},
-				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
-				run_in_background: {
-					type: 'boolean',
-					description:
-						'false waits for the run and returns its result in this call; true (or omitted) returns immediately and delivers the result as a signal. A definition pinned to background, or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, can override this.',
-				},
-				cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
-			},
+			properties: (() => {
+				const properties: Record<string, unknown> = {
+					description: {type: 'string', description: 'Short name for this job, used in the signal title.'},
+					label: {type: 'string', description: 'Alias for description.'},
+					name: {type: 'string', description: 'Address this agent later with subagent_send. A named agent appears in its siblings\' roster.'},
+					team_name: {type: 'string', description: 'Join this agent team. A teammate runs in the foreground and keeps the task and cron tools.'},
+					prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
+					command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
+					agent_type: {type: 'string', description: "Deprecated alias for subagent_type. Use subagent_type."},
+					subagent_type: {
+						type: 'string',
+						description:
+							"Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins.",
+					},
+					model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
+					effort: {type: 'string', description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort."},
+					tools: {type: 'string', description: 'Comma-separated tool list (or an array). Only these tools remain; overrides the definition.'},
+					disallowed_tools: {type: 'string', description: 'Comma-separated tool list (or an array) to remove. Wins over tools.'},
+					max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
+					permission_mode: {
+						type: 'string',
+						description:
+							"Permission mode for an agent job: default, acceptEdits, auto, dontAsk, bypassPermissions, plan, or manual. The main session's mode wins when it is acceptEdits, auto, or bypassPermissions; bypassPermissions otherwise requires the main session to be in it.",
+					},
+					timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
+					run_in_background: {
+						type: 'boolean',
+						description:
+							'false waits for the run and returns its result in this call; true (or omitted) returns immediately and delivers the result as a signal. A definition pinned to background, or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, can override this.',
+					},
+					cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
+					};
+				// Where fork mode is on, the model cannot ask for the foreground: the
+				// parameter is absent, not merely ignored.
+				if (forkModeEnabled) delete properties.run_in_background;
+				return properties;
+			})(),
 			required: [],
 		},
 		spawnRun,
@@ -5914,12 +6664,112 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			const shown = outputText(rest[0], {});
 			return {message: shown.ok ? String(shown.content?.[0]?.text ?? '') : String(shown.error ?? '')};
 		}
+		agentViewOpen = true;
 		try {
 			cmd.ui.openPane('jobs');
 		} catch {
 			/* headless */
 		}
 		return {message: 'subagents: opened the async subagents pane (list | jobs | cancel <id> | open <id>)'};
+	}
+
+	function recordForTarget(target: string | undefined): JobRecord | undefined {
+		const wanted = String(target ?? '').trim();
+		if (wanted.length === 0) return undefined;
+		return readJob(wanted) ?? namedJob(wanted);
+	}
+
+	function mentionText(prefix: string): string {
+		const definitions = registry.entries().map(entry => ({name: entry.name, valid: entry.valid}));
+		const typed = String(prefix ?? '').replace(/^@/, '').toLowerCase();
+		const names = mentionCandidates(definitions, rosterNames()).filter(name => name.toLowerCase().startsWith(typed));
+		return names.length > 0 ? names.map(name => `@${name}`).join('  ') : 'no matching @mention';
+	}
+
+	// `/tasks` is the keyboard surface for the panel: next/prev move the row,
+	// enter/open reads the transcript, send starts a follow-up, x stops or dismisses,
+	// and esc returns to the prompt. `x` on a live row stops it; on a terminal row it
+	// clears the row.
+	async function tasksHandler({args}: {args?: string}): Promise<{message: string}> {
+		const [sub, ...rest] = String(args ?? '').trim().split(/\s+/).filter(Boolean);
+		if (sub === undefined) {
+			agentViewOpen = true;
+			try {
+				cmd.ui.openPane('jobs');
+			} catch {
+				/* headless */
+			}
+			return {
+				message:
+					'tasks: opened the task view (next | prev | enter [message] | open <id> | send <id> <message> | x <id> | stop <id> | esc | mention <prefix>)',
+			};
+		}
+		if (sub === 'next' || sub === 'prev') {
+			const row = selectTask(sub === 'next' ? 1 : -1);
+			return {message: row === undefined ? 'tasks: no visible rows' : `tasks: selected ${row.id} (${canonicalState(row.state)})`};
+		}
+		if (sub === 'open' || sub === 'enter') {
+			const target = rest[0] ?? selectedTaskId;
+			const record = recordForTarget(target);
+			if (record === undefined) return {message: 'tasks: no task selected'};
+			selectedTaskId = record.id;
+			const shown = outputText(record.id, {});
+			if (sub === 'enter' && rest.length > 1) {
+				const sent = await sendToRecord(record, rest.slice(1).join(' '), ROSTER_MAIN);
+				return {message: `${shown.ok ? String(shown.content?.[0]?.text ?? '') : String(shown.error ?? '')}\n\n${sent.ok ? String(sent.content?.[0]?.text ?? '') : String(sent.error ?? '')}`};
+			}
+			return {message: shown.ok ? String(shown.content?.[0]?.text ?? '') : String(shown.error ?? '')};
+		}
+		if (sub === 'send') {
+			const record = recordForTarget(rest[0] ?? selectedTaskId);
+			const message = rest.slice(1).join(' ');
+			if (record === undefined) return {message: 'tasks: no task selected'};
+			if (message.trim().length === 0) return {message: 'tasks: usage: send <id> <message>'};
+			const sent = await sendToRecord(record, message, ROSTER_MAIN);
+			return {message: sent.ok ? String(sent.content?.[0]?.text ?? '') : String(sent.error ?? '')};
+		}
+		if (sub === 'stop' || sub === 'cancel') {
+			const record = recordForTarget(rest[0] ?? selectedTaskId);
+			if (record === undefined) return {message: 'tasks: no task selected'};
+			return {message: cancelJob(record.id).message};
+		}
+		if (sub === 'x' || sub === 'dismiss') {
+			const record = recordForTarget(rest[0] ?? selectedTaskId);
+			if (record === undefined) return {message: 'tasks: no task selected'};
+			return {message: dismissOrStopTask(record.id).message};
+		}
+		if (sub === 'esc' || sub === 'back') {
+			selectedTaskId = undefined;
+			agentViewOpen = false;
+			return {message: 'tasks: returned to the prompt'};
+		}
+		if (sub === 'mention') return {message: mentionText(rest.join(' '))};
+		return {message: 'tasks: usage: next | prev | enter [message] | open <id> | send <id> <message> | x <id> | stop <id> | esc'};
+	}
+
+	// `/subtask` is the user's fork when the agent view is closed. With the view
+	// open, a fork is already on screen; the user steers it from the row instead.
+	async function subtaskHandler({args}: {args?: string}): Promise<{message: string}> {
+		const prompt = String(args ?? '').trim();
+		if (prompt.length === 0) return {message: 'subtask: usage: /subtask <prompt>'};
+		if (agentViewOpen) return {message: 'subtask: the agent view is on; select a task row (or Esc) before starting another'};
+		if (sessionId === undefined || sessionId.length === 0) return {message: 'subtask: the main session has not bound yet; try again'};
+		const launched = await fire({
+			label: 'subtask',
+			kind: 'fork',
+			prompt,
+			background: true,
+			cwd: cmd.cwd,
+			agentType: FORK_AGENT_TYPE,
+			fork: true,
+			mainSessionId: sessionId,
+		});
+		if (!launched.ok) return {message: `subtask: ${launched.error}`};
+		return {
+			message:
+				`subtask: started fork ${launched.id} from the main conversation, pid ${launched.pid}.\n` +
+				`/tasks open ${launched.id} reads it; /tasks send ${launched.id} <message> steers it.`,
+		};
 	}
 
 	cmd.addCommand({
@@ -5935,6 +6785,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		handler: commandHandler,
 	});
 	cmd.addCommand({
+		name: 'tasks',
+		description: 'Agent panel: list running and recently failed tasks, open a transcript, send a follow-up, stop or dismiss a row',
+		argumentHint: 'next|prev|enter [message]|open <id>|send <id> <message>|x <id>|stop <id>|esc|mention <prefix>',
+		handler: tasksHandler,
+	});
+	cmd.addCommand({
+		name: 'subtask',
+		description: 'Start a fork of the main conversation when the agent view is off',
+		argumentHint: '<prompt>',
+		handler: subtaskHandler,
+	});
+	cmd.addCommand({
 		name: 'agents',
 		description: 'List subagent definitions: scope, validity, and the file that provides each one',
 		argumentHint: '[name|path]',
@@ -5946,6 +6808,24 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		argumentHint: '[plugins]',
 		handler: ({args}: {args?: string}) => ({message: doctorText(args)}),
 	});
+
+	// Ctrl+B is the host shortcut for "I no longer want to wait for this run". The
+	// worker keeps running; only the tool call returns early.
+	try {
+		cmd.addShortcut('ctrl+b', {
+			description: 'Move the running foreground subagent task to the background',
+			handler: () => {
+				const job = backgroundForegroundTask();
+				if (job === undefined) {
+					cmd.ui.notify('no foreground subagent task to background', 'info');
+					return;
+				}
+				cmd.ui.notify(`${String(job.label ?? job.id)} continues in the background; /tasks shows it`, 'info');
+			},
+		});
+	} catch {
+		/* a host without shortcuts */
+	}
 
 	// ------------------------------------------------------------------ lifecycle
 
