@@ -1411,6 +1411,420 @@ process.stdin.on('data', (data) => {
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
 
+	// 36. permission modes: the table, the alias, and the inheritance rules ----
+	const modeApi = seam.permissionModes;
+	assert.equal(typeof modeApi, 'object', 'the permission mode table is exported');
+	assert.deepEqual(
+		modeApi.list,
+		['default', 'acceptEdits', 'auto', 'dontAsk', 'bypassPermissions', 'plan'],
+		'the six canonical modes',
+	);
+	const modeRow = (name) => modeApi.table[name];
+	assert.equal(modeRow('default').acp, 'default', 'default maps to the ACP default mode');
+	assert.equal(modeRow('default').cli, 'standard', 'default maps to --permission-mode standard');
+	assert.equal(modeRow('acceptEdits').acp, 'auto-accept', 'acceptEdits maps to the ACP auto-accept mode');
+	assert.equal(modeRow('acceptEdits').cli, 'accept-edits', 'acceptEdits maps to --permission-mode accept-edits');
+	assert.equal(modeRow('plan').acp, 'plan', 'plan maps to the ACP plan mode');
+	assert.equal(modeRow('plan').cli, 'plan', 'plan maps to --permission-mode plan');
+	assert.equal(modeRow('plan').readOnly, true, 'plan is read-only');
+	assert.equal(modeRow('bypassPermissions').acp, 'bypass', 'bypassPermissions maps to the ACP bypass mode');
+	assert.equal(modeRow('bypassPermissions').cli, 'yolo', 'bypassPermissions maps to --permission-mode yolo');
+	assert.equal(modeRow('dontAsk').acp, 'dont-ask', 'dontAsk maps to the ACP dont-ask mode');
+	assert.equal(modeRow('dontAsk').autoDeny, true, 'dontAsk auto-denies');
+	assert.equal(modeRow('auto').acp, undefined, 'auto has no ACP mode');
+	assert.equal(modeRow('auto').inherits, true, 'auto wins inheritance');
+	assert.equal(modeApi.canonical('manual'), 'default', 'manual is an alias for default');
+	assert.equal(modeApi.canonical('standard'), 'default', 'the CLI default spelling normalizes');
+	assert.equal(modeApi.canonical('accept-edits'), 'acceptEdits', 'the CLI accept-edits spelling normalizes');
+	assert.equal(modeApi.canonical('yolo'), 'bypassPermissions', 'the CLI yolo spelling normalizes');
+	assert.equal(modeApi.canonical('dont-ask'), 'dontAsk', 'the CLI dont-ask spelling normalizes');
+	assert.equal(modeApi.canonical('nonsense'), undefined, 'an unknown mode has no canonical form');
+
+	const resolveMode = modeApi.resolve;
+	assert.deepEqual(resolveMode('plan', 'default'), {ok: true, mode: 'plan'}, 'a plan definition runs in plan mode');
+	assert.deepEqual(resolveMode(undefined, 'default'), {ok: true, mode: 'default'}, 'no mode means default');
+	assert.deepEqual(resolveMode('manual', 'default'), {ok: true, mode: 'default'}, 'manual resolves to default');
+	assert.deepEqual(resolveMode('plan', 'acceptEdits'), {ok: true, mode: 'acceptEdits'}, 'acceptEdits in the main session wins');
+	assert.deepEqual(resolveMode('plan', 'auto'), {ok: true, mode: 'auto'}, 'auto in the main session wins');
+	assert.deepEqual(resolveMode('plan', 'dontAsk'), {ok: true, mode: 'plan'}, 'dontAsk does not win');
+	assert.deepEqual(resolveMode('plan', 'plan'), {ok: true, mode: 'plan'}, 'plan does not win');
+	assert.deepEqual(
+		resolveMode('bypassPermissions', 'bypassPermissions'),
+		{ok: true, mode: 'bypassPermissions'},
+		'bypass runs only with bypass',
+	);
+	const bypassDenied = resolveMode('bypassPermissions', 'default');
+	assert.equal(bypassDenied.ok, false, 'bypassPermissions from a default session is rejected');
+	assert.match(bypassDenied.error, /requires the main session/, 'the rejection says why');
+	assert.deepEqual(resolveMode('nonsense', 'default'), {ok: true, mode: 'default'}, 'an unknown definition mode is ignored');
+	ok('permission modes: the ACP/CLI table, the manual alias, and inheritance');
+
+	// 37. the spawn path applies the table -----------------------------------
+	const permRoot = mkdtempSync(join(tmpdir(), 'subagent-perm-'));
+	const permProject = join(permRoot, 'project');
+	const permAgents = join(permProject, '.commandcode', 'agents');
+	const permHome = join(permRoot, 'home');
+	writeAgent(permAgents, 'planner.md', 'planner', 'plans', 'PLAN BODY', {permissionMode: 'plan'});
+	writeAgent(permAgents, 'yolo.md', 'yolo', 'yolo', 'YOLO BODY', {permissionMode: 'bypassPermissions'});
+	const spawnWithMode = async (type, mainMode, extra = {}) => {
+		const runtime = makeRuntime({
+			cwd: permProject,
+			home: permHome,
+			env: {
+				...process.env,
+				...(mainMode === undefined ? {} : {BETTER_SUBAGENTS_MAIN_PERMISSION_MODE: mainMode}),
+			},
+		});
+		const bundle = makeApi({
+			spoolDir: mkdtempSync(join(tmpdir(), 'subagent-perm-spool-')),
+			session: makeSession(),
+			runtime: runtime.runtime,
+		});
+		mod(bundle.api, bundle.runtime);
+		const before = runtime.spawnCalls.length;
+		const result = await toolOf(bundle, 'subagent_spawn').run({
+			input: {description: type, prompt: 'x', subagent_type: type, ...extra},
+		});
+		const call = runtime.spawnCalls[before];
+		return {result, spec: call === undefined ? undefined : JSON.parse(call.options.env.SUBAGENT_SPEC)};
+	};
+
+	const planLaunch = await spawnWithMode('planner', 'default');
+	assert.equal(planLaunch.result.ok, true, 'a plan definition spawns');
+	assert.equal(planLaunch.spec.permissionMode, 'plan', 'a plan definition launches with plan mode');
+	const deniedLaunch = await spawnWithMode('yolo', 'default');
+	assert.equal(deniedLaunch.result.ok, false, 'bypassPermissions from a default session is rejected');
+	assert.match(deniedLaunch.result.error, /requires the main session/, 'spawn reports the inheritance rule');
+	assert.equal(deniedLaunch.spec, undefined, 'nothing is spawned for a rejected mode');
+	const allowedLaunch = await spawnWithMode('yolo', 'bypassPermissions');
+	assert.equal(allowedLaunch.result.ok, true, 'the main session may lend bypass');
+	assert.equal(allowedLaunch.spec.permissionMode, 'bypassPermissions', 'bypass reaches the worker');
+	const inheritedLaunch = await spawnWithMode('planner', 'acceptEdits');
+	assert.equal(inheritedLaunch.spec.permissionMode, 'acceptEdits', 'the main session mode overrides the definition');
+	const callMode = await spawnWithMode('planner', 'default', {permission_mode: 'dontAsk'});
+	assert.equal(callMode.result.ok, true, 'a per-call permission_mode is accepted');
+	assert.equal(callMode.spec.permissionMode, 'dontAsk', 'the per-call mode reaches the worker');
+	const badCallMode = await spawnWithMode('planner', 'default', {permission_mode: 'nonsense'});
+	assert.equal(badCallMode.result.ok, false, 'an unknown permission_mode is refused');
+
+	// The main mode is observed live, not only from the env override: the host
+	// passes it to the system-prompt hook and emits permission_mode_changed.
+	const liveRuntime = makeRuntime({cwd: permProject, home: permHome, env: {...process.env}});
+	const live = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-perm-live-')),
+		session: makeSession(),
+		runtime: liveRuntime.runtime,
+	});
+	mod(live.api, live.runtime);
+	assert.equal(live.registeredHooks.appendSystemPrompt(), '', 'the main-session tap appends nothing');
+	assert.equal(
+		live.registeredHooks.appendSystemPrompt({permissionMode: 'acceptEdits'}),
+		'',
+		'the tap stays empty with a mode context',
+	);
+	await toolOf(live, 'subagent_spawn').run({input: {description: 'live', prompt: 'x', subagent_type: 'planner'}});
+	assert.equal(
+		JSON.parse(liveRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).permissionMode,
+		'acceptEdits',
+		'the hook context sets the main mode',
+	);
+	live.listeners.get('permission_mode_changed')[0]({mode: 'bypassPermissions'});
+	const liveBypass = await toolOf(live, 'subagent_spawn').run({
+		input: {description: 'live-bypass', prompt: 'x', subagent_type: 'yolo'},
+	});
+	assert.equal(liveBypass.ok, true, 'the permission_mode_changed event moves the main mode');
+	assert.equal(
+		JSON.parse(liveRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).permissionMode,
+		'bypassPermissions',
+		'bypass is allowed after the live event',
+	);
+	live.listeners.get('permission_mode_changed')[0]({mode: 'default'});
+	assert.equal(
+		(await toolOf(live, 'subagent_spawn').run({input: {description: 'live-yolo', prompt: 'x', subagent_type: 'yolo'}})).ok,
+		false,
+		'a later default event re-applies the bypass rule',
+	);
+	ok('spawn: plan launches in plan, bypass needs the main session, the main mode wins, per-call mode');
+
+	// 38. the ACP worker asks for approval ---------------------------------
+	// The fake server asks for permission instead of answering itself. The worker
+	// must not decide for the user: a background run settles `waiting-input` with
+	// the request, and a foreground run writes it to the control dir and waits.
+	const permDir = mkdtempSync(join(tmpdir(), 'subagent-perm-worker-'));
+	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(permDir, dir), {recursive: true});
+	const permCmd = join(permDir, 'fake-perm-cmd.mjs');
+	writeFileSync(
+		permCmd,
+		`#!/usr/bin/env node
+let buffer = '';
+let promptId;
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+const chunk = (text) => send({
+  method: 'session/update',
+  params: {sessionId: 'perm-1', update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text}}}
+});
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') {
+      send({id: message.id, result: {protocolVersion: 1}});
+    } else if (message.method === 'session/new') {
+      send({id: message.id, result: {sessionId: 'perm-1', modes: {currentModeId: 'default', availableModes: []}, configOptions: []}});
+    } else if (message.method === 'session/set_mode') {
+      chunk('SET_MODE ' + message.params.modeId + '\\n');
+      send({id: message.id, result: {}});
+    } else if (message.method === 'session/set_config_option') {
+      send({id: message.id, result: {}});
+    } else if (message.method === 'session/prompt') {
+      promptId = message.id;
+      send({
+        id: 91,
+        method: 'session/request_permission',
+        params: {
+          sessionId: 'perm-1',
+          toolCall: {title: 'Write file', kind: 'edit'},
+          options: [
+            {optionId: 'allow-once', name: 'Allow once', kind: 'allow_once'},
+            {optionId: 'allow-always', name: 'Always allow', kind: 'allow_always'},
+            {optionId: 'reject-once', name: 'Reject', kind: 'reject_once'}
+          ]
+        }
+      });
+    } else if (message.id === 91 && message.result) {
+      chunk('PERMISSION_REPLY ' + JSON.stringify(message.result) + '\\n');
+      send({id: promptId, result: {stopReason: 'end_turn'}});
+      setTimeout(() => process.exit(0), 20);
+    }
+  }
+});
+`,
+	);
+	chmodSync(permCmd, 0o755);
+
+	const runPermissionJob = (id, overrides = {}) => {
+		const spec = seam.buildSpec(
+			{
+				id,
+				label: id,
+				kind: 'agent',
+				owner: 'owner-test',
+				cwd: permDir,
+				logPath: join(permDir, 'logs', `${id}.log`),
+				inboxDir: join(permDir, 'inbox'),
+				jobsDir: join(permDir, 'jobs'),
+				startedAt: Date.now(),
+				tailMax: 8000,
+				bin: permCmd,
+				prompt: 'do the thing',
+				agentType: 'general-purpose',
+				systemPrompt: 'You are the test worker.',
+				permissionMode: 'default',
+				...overrides,
+			},
+			'/mod.ts',
+		);
+		writeFileSync(join(permDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued'}));
+		const child = spawn(process.execPath, ['-e', workerText], {
+			cwd: permDir,
+			env: {...process.env, SUBAGENT_SPEC: JSON.stringify(spec), BETTER_SUBAGENTS_WORKER: '1'},
+		});
+		const {promise, resolve} = Promise.withResolvers();
+		child.on('exit', resolve);
+		return {spec, exit: promise};
+	};
+	const finishPermissionJob = async (job) => {
+		const code = await Promise.race([job.exit, new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000))]);
+		assert.notEqual(code, 'timeout', 'the worker exits instead of hanging');
+		const id = job.spec.id;
+		return {
+			code,
+			log: readFileSync(join(permDir, 'logs', `${id}.log`), 'utf8'),
+			record: JSON.parse(readFileSync(join(permDir, 'jobs', `${id}.json`), 'utf8')),
+			signals: readdirSync(join(permDir, 'inbox'))
+				.filter((name) => name.includes(id))
+				.map((name) => JSON.parse(readFileSync(join(permDir, 'inbox', name), 'utf8'))),
+		};
+	};
+	const waitForFile = async (file, timeoutMs = 4000) => {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			if (existsSync(file)) return true;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		return false;
+	};
+
+	const background = await finishPermissionJob(runPermissionJob('perm-background'));
+	assert.equal(background.signals.length, 1, 'one signal for a worker that needs approval');
+	assert.equal(background.signals[0].state, 'waiting-input', 'an approval request settles waiting-input');
+	assert.equal(background.signals[0].permissionRequest.title, 'Write file', 'the request travels in the signal');
+	assert.deepEqual(
+		background.signals[0].permissionRequest.options.map((option) => option.kind),
+		['allow_once', 'allow_always', 'reject_once'],
+		'the options travel intact',
+	);
+	assert.match(background.signals[0].question, /Write file/, 'the question is human-readable');
+	assert.equal(background.record.awaitingInput, true, 'the record waits for input');
+	assert.equal(background.record.state, 'waiting-input', 'the record is waiting-input');
+	assert.equal(background.record.acpSessionId, 'perm-1', 'the session stays resumable');
+	assert.ok(!background.log.includes('PERMISSION_REPLY'), 'a background worker does not answer for the user');
+	ok('waiting-input: the approval request reaches the parent in the signal, and the worker does not hang');
+
+	// 39. a foreground prompt is inline, and Esc denies one call -------------
+	const interactiveId = 'perm-interactive';
+	const controlDir = join(permDir, 'control', interactiveId);
+	const interactive = await (async () => {
+		const job = runPermissionJob(interactiveId, {
+			interactive: true,
+			controlDir,
+			permissionTimeoutMs: 5000,
+		});
+		const permissionFile = join(controlDir, 'permission.json');
+		assert.equal(await waitForFile(permissionFile), true, 'a foreground prompt is written for the main session');
+		const request = JSON.parse(readFileSync(permissionFile, 'utf8'));
+		assert.equal(request.requestId, 91, 'the request carries the ACP id');
+		assert.equal(request.title, 'Write file', 'the request carries the tool call title');
+		writeFileSync(join(controlDir, 'permission-response.json'), JSON.stringify({outcome: 'cancelled'}));
+		return finishPermissionJob(job);
+	})();
+	assert.match(interactive.log, /\[permission\].*denied/, 'Esc denies the call');
+	assert.match(interactive.log, /PERMISSION_REPLY .*cancelled/, 'the worker returns the denial to ACP');
+	assert.equal(interactive.record.state, 'done', 'one denied call does not stop the turn');
+	assert.equal(interactive.signals[0].state, 'done', 'the job finishes normally after Esc');
+	assert.equal(
+		existsSync(join(controlDir, 'permission.json')),
+		false,
+		'the answered request is cleared',
+	);
+
+	// Approving continues too: the selected option goes back to ACP unchanged.
+	const approveId = 'perm-approve';
+	const approveControl = join(permDir, 'control', approveId);
+	const approved = await (async () => {
+		const job = runPermissionJob(approveId, {interactive: true, controlDir: approveControl, permissionTimeoutMs: 5000});
+		const permissionFile = join(approveControl, 'permission.json');
+		assert.equal(await waitForFile(permissionFile), true, 'the second inline prompt is written');
+		writeFileSync(
+			join(approveControl, 'permission-response.json'),
+			JSON.stringify({outcome: 'selected', optionId: 'allow-once'}),
+		);
+		return finishPermissionJob(job);
+	})();
+	assert.match(approved.log, /PERMISSION_REPLY .*allow-once/, 'the selected option reaches ACP');
+	assert.equal(approved.record.state, 'done', 'an approval continues the turn');
+
+	// An unanswered foreground prompt is bounded: it settles waiting-input rather
+	// than hanging the parent.
+	const timeoutId = 'perm-timeout';
+	const timedOut = await finishPermissionJob(
+		runPermissionJob(timeoutId, {
+			interactive: true,
+			controlDir: join(permDir, 'control', timeoutId),
+			permissionTimeoutMs: 100,
+		}),
+	);
+	assert.equal(timedOut.record.state, 'waiting-input', 'an unanswered prompt settles waiting-input');
+	assert.equal(timedOut.signals[0].permissionRequest.title, 'Write file', 'the request still travels');
+	ok('foreground: the prompt is inline, Esc denies one call, and the agent keeps running');
+
+	// 40. the mode decides an approval --------------------------------------
+	for (const [mode, acpMode, expected] of [
+		['dontAsk', 'dont-ask', 'cancelled'],
+		['plan', 'plan', 'cancelled'],
+		['bypassPermissions', 'bypass', 'selected'],
+	]) {
+		const run = await finishPermissionJob(runPermissionJob(`perm-${mode}`, {permissionMode: mode}));
+		assert.match(run.log, new RegExp(`SET_MODE ${acpMode}`), `${mode} maps to the ACP ${acpMode} mode`);
+		assert.equal(run.record.state, 'done', `${mode} does not stop the turn`);
+		if (expected === 'cancelled') {
+			assert.match(run.log, /PERMISSION_REPLY .*cancelled/, `${mode} auto-denies`);
+		} else {
+			assert.match(run.log, /PERMISSION_REPLY .*allow-once/, `${mode} skips the prompt`);
+		}
+	}
+	ok('permission modes: dontAsk and plan deny, bypass allows, each maps to its ACP mode');
+
+	// 41. the parent names the agent and keeps the job resumable -------------
+	const deliverySpool = mkdtempSync(join(tmpdir(), 'subagent-perm-delivery-'));
+	const deliverySession = makeSession();
+	const deliveryRuntime = makeRuntime({now: () => fixedNow});
+	const delivery = makeApi({spoolDir: deliverySpool, session: deliverySession, runtime: deliveryRuntime.runtime});
+	mod(delivery.api, delivery.runtime);
+	const deliveryOwner = ownerEntries(deliverySession)[0];
+	writeFileSync(
+		join(deliverySpool, 'inbox', `${fixedNow}-perm-delivery-1.json`),
+		JSON.stringify({
+			id: 'perm-delivery-1',
+			owner: deliveryOwner,
+			label: 'planner',
+			kind: 'agent',
+			state: 'waiting-input',
+			exitCode: null,
+			startedAt: fixedNow,
+			finishedAt: fixedNow,
+			durationMs: 1,
+			logPath: join(deliverySpool, 'logs', 'perm-delivery-1.log'),
+			sessionId: 'session-perm',
+			title: 'planner waiting-input',
+			body: 'approval required: Write file',
+			question: 'Approve "Write file"?',
+			permissionRequest: {
+				requestId: 91,
+				title: 'Write file',
+				options: [{optionId: 'allow-once', kind: 'allow_once', name: 'Allow once'}],
+			},
+		}),
+	);
+	const delivered = delivery.registeredHooks.onStop();
+	assert.equal(typeof delivered?.reason, 'string', 'a waiting-input signal reaches the model');
+	assert.match(delivered.reason, /planner waiting-input/, 'the signal names the agent');
+	assert.match(delivered.reason, /Approval required/i, 'the request is in the delivered text');
+	assert.match(delivered.reason, /Write file/, 'the prompt names the tool call');
+	assert.match(delivered.reason, /resumable|follow-up/i, 'the model is told the job stays resumable');
+	assert.equal(delivery.shownEntries.length, 1, 'the request is also a feed row');
+	ok('waiting-input delivery: names the agent, carries the request, and says the job is resumable');
+
+	// 42. a shell command that ends in a question carries it -----------------
+	const questionDir = mkdtempSync(join(tmpdir(), 'subagent-question-'));
+	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(questionDir, dir), {recursive: true});
+	const questionId = 'question-job';
+	const questionSpec = seam.buildSpec(
+		{
+			id: questionId,
+			label: 'question',
+			kind: 'command',
+			owner: 'owner-test',
+			cwd: questionDir,
+			logPath: join(questionDir, 'logs', `${questionId}.log`),
+			inboxDir: join(questionDir, 'inbox'),
+			jobsDir: join(questionDir, 'jobs'),
+			startedAt: Date.now(),
+			tailMax: 4000,
+			bin: '/bin/sh',
+			command: "printf 'Which branch? '",
+		},
+		'/mod.ts',
+	);
+	writeFileSync(join(questionDir, 'jobs', `${questionId}.json`), JSON.stringify({id: questionId, state: 'queued'}));
+	const questionChild = spawn(process.execPath, ['-e', workerText], {
+		cwd: questionDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(questionSpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	const questionExit = Promise.withResolvers();
+	questionChild.on('exit', questionExit.resolve);
+	await Promise.race([questionExit.promise, new Promise((resolve) => setTimeout(resolve, 5000))]);
+	const questionSignalFile = readdirSync(join(questionDir, 'inbox')).find((name) => name.includes(questionId));
+	assert.ok(questionSignalFile !== undefined, 'the question job emits a signal');
+	const questionSignal = JSON.parse(readFileSync(join(questionDir, 'inbox', questionSignalFile), 'utf8'));
+	assert.equal(questionSignal.state, 'waiting-input', 'a trailing question waits for input');
+	assert.equal(questionSignal.question, 'Which branch?', 'the question travels in the signal');
+	ok('waiting-input: a shell command that ends in a question carries it');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);

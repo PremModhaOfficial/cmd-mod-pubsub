@@ -175,31 +175,35 @@ const signalEnvelope = ${signalEnvelope.toString()};
 let settled = false;
 
 // One constructor for "this job reached this state": the record patch and the
-// signal are derived from the same facts, so they cannot disagree.
-const settle = (state, detail, code, tail) => {
+// signal are derived from the same facts, so they cannot disagree. The optional
+// extra argument carries the waiting-input payload (question, permissionRequest).
+const settle = (state, detail, code, tail, extra) => {
   if (settled) return;
   settled = true;
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
+  const payload = extra || {};
   writeRecord({
     state: state,
     exitCode: typeof code === 'number' ? code : undefined,
     finishedAt: finishedAt,
     durationMs: durationMs,
     failureReason: failed ? detail : undefined,
-    awaitingInput: state === 'waiting-input' ? true : undefined
+    awaitingInput: state === 'waiting-input' ? true : undefined,
+    question: typeof payload.question === 'string' ? payload.question : undefined,
+    permissionRequest: payload.permissionRequest
   });
   emit(signalEnvelope({
     id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
     startedAt: spec.startedAt, logPath: spec.logPath, sessionId: spec.sessionId
-  }, {
+  }, Object.assign({
     state: state,
     exitCode: typeof code === 'number' ? code : null,
     finishedAt: finishedAt,
     durationMs: durationMs,
     body: detail + (tail ? '\\n\\n' + tail : '')
-  }));
+  }, payload)));
 };
 
 const fail = (reason, code) => settle('failed', reason, code, '');
@@ -285,7 +289,7 @@ const finish = (code, spawnError, signal) => {
         : signal
           ? 'terminated by ' + signal
           : 'exit 0';
-  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
+  settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail, wantsInput ? {question: lastLine} : undefined);
 };
 
 if (typeof child.pid === 'number') {
@@ -315,6 +319,118 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
   const reply = (id, result) => sendMessage({id: id, result: result});
   const replyError = (id, code, message) => sendMessage({id: id, error: {code: code, message: message}});
 
+  // Permission prompts. ACP asks; the user decides. A background run cannot ask,
+  // so it settles waiting-input with the request on the signal and exits (the job
+  // stays resumable). A foreground run writes the request to its control dir and
+  // waits, bounded, for the parent's answer; Esc answers cancelled, which denies
+  // one call and lets the turn continue. dontAsk and plan deny without asking;
+  // bypass allows, because the main session already did.
+  const permissionFile = spec.controlDir ? path.join(spec.controlDir, 'permission.json') : '';
+  const permissionResponseFile = spec.controlDir ? path.join(spec.controlDir, 'permission-response.json') : '';
+
+  const writeJsonAtomic = (file, value) => {
+    try {
+      fs.mkdirSync(path.dirname(file), {recursive: true});
+      const tmp = file + '.tmp-' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify(value, null, 2));
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (e) { return false; }
+  };
+
+  const readPermissionResponse = () => {
+    if (permissionResponseFile.length === 0) return undefined;
+    try {
+      const response = JSON.parse(fs.readFileSync(permissionResponseFile, 'utf8'));
+      try { fs.rmSync(permissionResponseFile, {force: true}); } catch (e) {}
+      try { fs.rmSync(permissionFile, {force: true}); } catch (e) {}
+      return response;
+    } catch (e) { return undefined; }
+  };
+
+  const waitForPermissionResponse = () => {
+    const timeout = typeof spec.permissionTimeoutMs === 'number' && spec.permissionTimeoutMs > 0
+      ? spec.permissionTimeoutMs
+      : 30000;
+    const deadline = Date.now() + timeout;
+    const {promise, resolve} = Promise.withResolvers();
+    const tick = () => {
+      const response = readPermissionResponse();
+      if (response !== undefined) return resolve(response);
+      if (Date.now() >= deadline) return resolve(undefined);
+      const timer = setTimeout(tick, 25);
+      if (timer.unref) timer.unref();
+    };
+    tick();
+    return promise;
+  };
+
+  const answerPermission = (message, decision, options) => {
+    if (decision && decision.outcome === 'cancelled') {
+      reply(message.id, {outcome: {outcome: 'cancelled'}});
+      return 'denied';
+    }
+    const wanted = decision && typeof decision.optionId === 'string' ? decision.optionId : undefined;
+    const selected = wanted !== undefined
+      ? options.find(option => option.optionId === wanted)
+      : options.find(option => option.kind === 'allow_once')
+        || options.find(option => option.kind === 'allow_always')
+        || options.find(option => option.kind.indexOf('allow') === 0);
+    if (selected && selected.optionId.length > 0) {
+      reply(message.id, {outcome: {outcome: 'selected', optionId: selected.optionId}});
+      return 'allowed';
+    }
+    reply(message.id, {outcome: {outcome: 'cancelled'}});
+    return 'denied';
+  };
+
+  const handlePermission = async message => {
+    const rawOptions = message.params && Array.isArray(message.params.options) ? message.params.options : [];
+    const options = rawOptions.map(option => ({
+      optionId: String(option.optionId || ''),
+      kind: String(option.kind || ''),
+      name: String(option.name || '')
+    }));
+    const toolCall = message.params && message.params.toolCall;
+    const rawTitle = toolCall ? String(toolCall.title || toolCall.kind || '') : '';
+    const title = rawTitle.length > 0 ? rawTitle : 'a tool call';
+    const mode = spec.permissionMode;
+    logWrite('\\n[permission] ' + title + '\\n');
+    if (mode === 'bypassPermissions') {
+      logWrite('[permission] bypassPermissions -> ' + answerPermission(message, undefined, options) + '\\n');
+      return;
+    }
+    if (mode === 'dontAsk' || mode === 'plan') {
+      logWrite('[permission] ' + mode + ' -> ' + answerPermission(message, {outcome: 'cancelled'}, options) + '\\n');
+      return;
+    }
+    if (spec.interactive === true && permissionFile.length > 0) {
+      const request = {
+        requestId: message.id,
+        title: title,
+        toolCall: toolCall ? {title: title, kind: String(toolCall.kind || '')} : undefined,
+        options: options
+      };
+      if (writeJsonAtomic(permissionFile, request)) {
+        // A response left over from an earlier prompt must not answer this one.
+        try { fs.rmSync(permissionResponseFile, {force: true}); } catch (e) {}
+        logWrite('[permission] waiting for the main session\\n');
+        const response = await waitForPermissionResponse();
+        if (response !== undefined) {
+          logWrite('[permission] ' + answerPermission(message, response, options) + ' by the main session\\n');
+          return;
+        }
+        logWrite('[permission] no answer; waiting-input\\n');
+      }
+    }
+    const names = options.map(option => option.name).filter(name => name.length > 0);
+    settle('waiting-input', 'approval required: ' + title + (names.length > 0 ? ' (' + names.join(', ') + ')' : ''), null, '', {
+      question: 'Approve "' + title + '"?' + (names.length > 0 ? ' Options: ' + names.join(', ') + '.' : ''),
+      permissionRequest: {requestId: message.id, title: title, options: options}
+    });
+    shutdown();
+  };
+
   const handleLine = line => {
     let message;
     try { message = JSON.parse(line); } catch (e) { return; }
@@ -332,18 +448,14 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
         return;
       }
       if (message.method === 'session/request_permission') {
-        const options = (message.params && message.params.options) || [];
-        const title = message.params && message.params.toolCall ? String(message.params.toolCall.title || '') : '';
-        const allow = options.find(option => option.kind === 'allow_once')
-          || options.find(option => option.kind === 'allow_always')
-          || options[0];
-        if (allow && typeof allow.optionId === 'string') {
-          logWrite('\\n[permission] ' + title + ' -> ' + String(allow.name || allow.optionId) + '\\n');
-          reply(message.id, {outcome: {outcome: 'selected', optionId: allow.optionId}});
-        } else {
-          logWrite('\\n[permission] ' + title + ' -> denied (no allowed option)\\n');
-          reply(message.id, {outcome: {outcome: 'cancelled'}});
-        }
+        handlePermission(message).catch(error => {
+          logWrite('[permission] error: ' + String(error && error.message || error) + '\\n');
+          settle('waiting-input', 'approval required', null, '', {
+            question: 'Approve a tool call?',
+            permissionRequest: {requestId: message.id, title: 'a tool call', options: []}
+          });
+          shutdown();
+        });
         return;
       }
       if (message.method === 'fs/read_text_file') {
@@ -382,14 +494,16 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
   });
   child.stderr.on('data', chunk => logWrite(chunk.toString().replace(/\\s+$/, '') + '\\n'));
 
-  // Spec permissionMode -> ACP mode id. auto and bypassPermissions are deliberately
-  // absent: auto has no ACP equivalent and bypass is only inherited (phase 8).
+  // Spec permissionMode -> ACP mode id. auto is deliberately absent: it is the
+  // host classifier, which has no ACP equivalent, so the adapter leaves ACP in its
+  // own mode and logs it. Every other mode maps to a real ACP mode.
   const modeIds = {
     default: 'default',
     acceptEdits: 'auto-accept',
     dontAsk: 'dont-ask',
     plan: 'plan',
-    manual: 'default'
+    manual: 'default',
+    bypassPermissions: 'bypass'
   };
 
   const runPrompt = async () => {
@@ -1113,6 +1227,12 @@ export interface WorkerSpecInput {
 	model?: string;
 	effort?: string;
 	permissionMode?: string;
+	/** foreground run: approval prompts are asked inline instead of settling waiting-input */
+	interactive?: boolean;
+	/** per-job control directory for permission.json / permission-response.json */
+	controlDir?: string;
+	/** how long an inline prompt waits before settling waiting-input; default 30s */
+	permissionTimeoutMs?: number;
 	maxTurns?: number;
 	timeoutMs?: number;
 	resumeSession?: string;
@@ -1140,6 +1260,115 @@ export function buildSpec(input: WorkerSpecInput, modPath: string): WorkerSpec {
 	return spec;
 }
 
+// ---------------------------------------------------------------------------
+// Permission modes
+//
+// One table drives both transports: `acp` is the `session/set_mode` id the ACP
+// adapter sends, `cli` is the `cmd --permission-mode` value for the CLI paths.
+// The definition's mode and the main session's mode are combined in exactly one
+// place, so the inheritance rules cannot drift between callers.
+// ---------------------------------------------------------------------------
+
+export const PERMISSION_MODE_LIST = [
+	'default',
+	'acceptEdits',
+	'auto',
+	'dontAsk',
+	'bypassPermissions',
+	'plan',
+] as const;
+
+export type PermissionMode = (typeof PERMISSION_MODE_LIST)[number] | 'manual';
+export type CanonicalPermissionMode = (typeof PERMISSION_MODE_LIST)[number];
+
+export interface PermissionModeRow {
+	/** the ACP `session/set_mode` id; absent when ACP has no equivalent */
+	readonly acp?: string;
+	/** the `cmd --permission-mode` value; absent when the CLI cannot express it */
+	readonly cli?: string;
+	/** read-only exploration: writes are refused */
+	readonly readOnly?: boolean;
+	/** approval prompts are auto-denied; explicit allows still work */
+	readonly autoDeny?: boolean;
+	/** this mode wins over the definition's permissionMode when the main session is in it */
+	readonly inherits?: boolean;
+	/** this mode skips prompts and may only be used when the main session is in it */
+	readonly bypass?: boolean;
+}
+
+const PERMISSION_MODE_TABLE: Readonly<Record<CanonicalPermissionMode, PermissionModeRow>> = {
+	default: {acp: 'default', cli: 'standard'},
+	acceptEdits: {acp: 'auto-accept', cli: 'accept-edits', inherits: true},
+	auto: {inherits: true},
+	dontAsk: {acp: 'dont-ask', autoDeny: true},
+	bypassPermissions: {acp: 'bypass', cli: 'yolo', inherits: true, bypass: true},
+	plan: {acp: 'plan', cli: 'plan', readOnly: true},
+};
+
+// Every spelling the host accepts: the frontmatter names, the CLI names, and the
+// ACP ids. `manual` is the documented alias for `default`.
+const PERMISSION_MODE_ALIASES: Readonly<Record<string, CanonicalPermissionMode>> = {
+	manual: 'default',
+	standard: 'default',
+	'accept-edits': 'acceptEdits',
+	'auto-accept': 'acceptEdits',
+	'dont-ask': 'dontAsk',
+	yolo: 'bypassPermissions',
+	bypass: 'bypassPermissions',
+};
+
+export function canonicalPermissionMode(value: unknown): CanonicalPermissionMode | undefined {
+	if (typeof value !== 'string' || value.length === 0) return undefined;
+	const alias = PERMISSION_MODE_ALIASES[value];
+	if (alias !== undefined) return alias;
+	return Object.prototype.hasOwnProperty.call(PERMISSION_MODE_TABLE, value)
+		? (value as CanonicalPermissionMode)
+		: undefined;
+}
+
+export type PermissionResolution =
+	| {readonly ok: true; readonly mode: CanonicalPermissionMode}
+	| {readonly ok: false; readonly error: string};
+
+// The inheritance table in SPEC "Permission modes": a main session in
+// bypassPermissions, acceptEdits, or auto wins; otherwise the definition's mode
+// applies, except that bypassPermissions still requires the main session to be
+// in it. An unknown definition mode is ignored (default), never a launch error.
+export function resolvePermissionMode(definitionMode: unknown, mainMode: unknown): PermissionResolution {
+	const main = canonicalPermissionMode(mainMode) ?? 'default';
+	const definition = canonicalPermissionMode(definitionMode) ?? 'default';
+	if (PERMISSION_MODE_TABLE[main].inherits === true) return {ok: true, mode: main};
+	if (PERMISSION_MODE_TABLE[definition].bypass === true) {
+		return {
+			ok: false,
+			error: 'permissionMode "bypassPermissions" requires the main session to be in bypassPermissions',
+		};
+	}
+	return {ok: true, mode: definition};
+}
+
+export const permissionModes = {
+	list: PERMISSION_MODE_LIST,
+	table: PERMISSION_MODE_TABLE,
+	canonical: canonicalPermissionMode,
+	resolve: resolvePermissionMode,
+};
+
+// An ACP `session/request_permission` as the parent sees it: enough to show the
+// prompt, name the tool call, and return the chosen option.
+export interface PermissionRequestOption {
+	readonly optionId: string;
+	readonly kind?: string;
+	readonly name?: string;
+}
+
+export interface PermissionRequest {
+	readonly requestId?: number | string;
+	readonly title: string;
+	readonly toolCall?: {readonly title?: string; readonly kind?: string};
+	readonly options: PermissionRequestOption[];
+}
+
 // The identity a job record and its signal share. Declared once, so the two
 // shapes cannot drift: the record adds durable bookkeeping, the signal adds the
 // message that reaches the session.
@@ -1160,6 +1389,8 @@ interface Signal extends JobIdentity {
 	readonly exitCode?: number | null;
 	readonly title?: string;
 	readonly body?: string;
+	readonly question?: string;
+	readonly permissionRequest?: PermissionRequest;
 }
 
 interface JobRecord extends JobIdentity {
@@ -1185,6 +1416,8 @@ interface JobRecord extends JobIdentity {
 	failureReason?: string;
 	canceledAt?: number;
 	awaitingInput?: boolean;
+	question?: string;
+	permissionRequest?: PermissionRequest;
 }
 
 // The record write a signal implies.
@@ -1195,6 +1428,8 @@ interface JobPatch {
 	durationMs?: number;
 	failureReason?: string;
 	awaitingInput?: boolean;
+	question?: string;
+	permissionRequest?: PermissionRequest;
 }
 
 // ---------------------------------------------------------------------------
@@ -1327,7 +1562,16 @@ function signalOf(
 // a signal with different fields. Keep the body plain JS and self-contained.
 export function signalEnvelope(
 	record: JobIdentity,
-	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+	result: {
+		state: string;
+		finishedAt?: number;
+		durationMs?: number;
+		exitCode?: number | null;
+		title?: string;
+		body?: string;
+		question?: string;
+		permissionRequest?: PermissionRequest;
+	},
 ): Signal {
 	const label = String(record.label ?? record.id);
 	const state = String(result.state);
@@ -1345,6 +1589,8 @@ export function signalEnvelope(
 		sessionId: record.sessionId,
 		title: result.title ?? `${label} ${state}`,
 		body: result.body,
+		...(typeof result.question === 'string' ? {question: result.question} : {}),
+		...(result.permissionRequest !== undefined ? {permissionRequest: result.permissionRequest} : {}),
 	};
 }
 
@@ -1373,6 +1619,8 @@ function patchOf(signal: Signal): JobPatch {
 		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
 		if (state === 'waiting-input') patch.awaitingInput = true;
 	}
+	if (typeof signal.question === 'string') patch.question = signal.question;
+	if (signal.permissionRequest !== undefined) patch.permissionRequest = signal.permissionRequest;
 	return patch;
 }
 
@@ -1522,6 +1770,19 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// A headless worker loads this mod too. It has its own owner token and must never
 	// steal an unaddressed signal from the session that fired it.
 	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
+
+	// The main conversation's permission mode. There is no getter in the host API:
+	// the mode arrives through `permission_mode_changed` and the system-prompt hook
+	// context, and the environment override covers a host that knows it before the
+	// first event (and the suite). Absent means `default`, the safe reading: a
+	// definition can then never grant itself bypass.
+	let mainPermissionMode: CanonicalPermissionMode | undefined = canonicalPermissionMode(
+		runtime.env.BETTER_SUBAGENTS_MAIN_PERMISSION_MODE,
+	);
+	function noteMainPermissionMode(value: unknown): void {
+		const mode = canonicalPermissionMode(value);
+		if (mode !== undefined) mainPermissionMode = mode;
+	}
 
 	// Definitions are discovered once at bind, refreshed at each run start and by
 	// `/agents`, so a new file is picked up without a restart. Invalid files are
@@ -1697,14 +1958,26 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const log = typeof message.logPath === 'string' ? `\nlog ${message.logPath}` : '';
 		const body = typeof message.body === 'string' ? message.body.trim() : '';
 		const title = String(message.title ?? message.label ?? message.id ?? '(signal)');
+		// The worker names the agent (the title) and carries the request: the parent
+		// does not have to read the log to know what is being asked.
+		const request = message.permissionRequest;
+		const options = request === undefined ? '' : request.options.map(option => option.name ?? option.kind ?? option.optionId).filter(Boolean).join(', ');
+		const ask =
+			state === 'waiting-input'
+				? request !== undefined
+					? `\n\nApproval required: ${request.title}` + (options.length > 0 ? `\noptions: ${options}` : '')
+					: typeof message.question === 'string' && message.question.length > 0
+						? `\n\n${message.question}`
+						: ''
+				: '';
 		const next =
 			state === 'waiting-input'
-				? 'The worker stopped with a question. Answer it here, or fire a follow-up job.'
+				? 'The job is resumable: answer here, or fire a follow-up job. Nothing else arrives until then.'
 				: state === 'canceled'
 					? 'The job was canceled; nothing else will arrive for it.'
 					: 'This result arrived automatically. Read it now and use it in your current work; ' +
 						'do not poll for it and do not wait for it.';
-		return `[subagent] ${title}\n${facts}${log}` + (body.length > 0 ? `\n\n${body}` : '') + `\n\n${next}`;
+		return `[subagent] ${title}\n${facts}${log}` + (body.length > 0 ? `\n\n${body}` : '') + ask + `\n\n${next}`;
 	}
 
 	function readJob(id: string): JobRecord | undefined {
@@ -2488,8 +2761,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				'foreground runs are not implemented in this release; omit run_in_background (background is the default)',
 			);
 		}
-		for (const unsupported of ['permission_mode', 'isolation', 'tools']) {
+		for (const unsupported of ['isolation', 'tools']) {
 			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
+		}
+		const requestedMode =
+			typeof input.permission_mode === 'string' && input.permission_mode.trim().length > 0
+				? input.permission_mode.trim()
+				: undefined;
+		if (requestedMode !== undefined && canonicalPermissionMode(requestedMode) === undefined) {
+			return badInput(`unknown permission_mode "${requestedMode}"`);
+		}
+		if (requestedMode !== undefined && prompt === undefined) {
+			return badInput('permission_mode applies to agent jobs; a shell command has no permission mode');
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
 		const requestedMaxTurns = Number(input.max_turns);
@@ -2515,6 +2798,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			definition = resolved.definition;
 		}
 		const definitionModel = definition?.model === 'inherit' ? undefined : definition?.model;
+		// The definition's mode and the main session's mode are combined here, once.
+		// A definition asking for bypass in a default session is refused before the
+		// record exists, so no job is left queued behind a mode that cannot run.
+		const modeResolution = resolvePermissionMode(
+			requestedMode ?? definition?.permissionMode,
+			mainPermissionMode,
+		);
+		if (prompt !== undefined && !modeResolution.ok) return badInput(modeResolution.error);
+		const permissionMode = prompt === undefined ? undefined : modeResolution.ok ? modeResolution.mode : undefined;
 		const maxTurns =
 			prompt === undefined
 				? undefined
@@ -2532,7 +2824,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			model: prompt === undefined ? undefined : model ?? definitionModel,
 			maxTurns,
 			effort: definition?.effort,
-			permissionMode: definition?.permissionMode,
+			permissionMode,
 			isolation: definition?.isolation,
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
@@ -2716,6 +3008,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				},
 				model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
 				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
+				permission_mode: {
+					type: 'string',
+					description:
+						"Permission mode for an agent job: default, acceptEdits, auto, dontAsk, bypassPermissions, plan, or manual. The main session's mode wins when it is acceptEdits, auto, or bypassPermissions; bypassPermissions otherwise requires the main session to be in it.",
+				},
 				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
 				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
 				cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
@@ -2880,9 +3177,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// purpose there is this hook: the definition body is the worker's system
 		// prompt. The parent already has the definition, so only worker mode registers
 		// it, and only when a body was passed.
+		// In the main session the same hook is a read-only tap: the host passes the
+		// live permission mode, and an empty string appends nothing.
 		...(workerSpec?.systemPrompt !== undefined && workerSpec.systemPrompt.length > 0
 			? {appendSystemPrompt: () => String(workerSpec?.systemPrompt ?? '')}
-			: {}),
+			: !workerMode
+				? {
+						appendSystemPrompt: (context?: {permissionMode?: unknown}) => {
+							noteMainPermissionMode(context?.permissionMode);
+							return '';
+						},
+					}
+				: {}),
 		onSessionStart: (info: {source?: string; sessionId?: string}) => {
 			if (typeof info?.sessionId === 'string' && info.sessionId.length > 0) {
 				sessionId = info.sessionId;
@@ -2923,6 +3229,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			registry.refresh();
 			safeDrain();
 		}
+	});
+
+	// The live permission mode. Shift+Tab, `/mode`, and the plan tools move it; the
+	// spawn path reads the latest value when a definition is resolved.
+	cmd.on('permission_mode_changed', (event: {mode?: unknown}) => {
+		noteMainPermissionMode(event?.mode);
 	});
 
 	cmd.clock.every(DRAIN_INTERVAL_MS, safeDrain);

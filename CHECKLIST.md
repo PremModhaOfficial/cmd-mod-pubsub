@@ -127,10 +127,10 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [ ] Scan worker output for instruction-shaped text.
 - [ ] Insert the backslash into imitated system tags.
 - [ ] Add the `[harness: subagent output matched instruction-shaped pattern(s): ...]` marker.
-- [ ] Map `permissionMode` to the worker CLI flags.
-- [ ] Put a worker that needs approval into `waiting-input`.
-- [ ] Signal the parent with the question or the approval request.
-- [ ] Do not hang the worker.
+- [x] Map `permissionMode` to the worker CLI flags.
+- [x] Put a worker that needs approval into `waiting-input`.
+- [x] Signal the parent with the question or the approval request.
+- [x] Do not hang the worker.
 - Gate: scanning and `waiting-input` tests pass.
 
 ## Phase 9: UI and persistence

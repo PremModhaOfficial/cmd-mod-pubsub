@@ -104,9 +104,32 @@ With the mod installed, the body is injected through the host's `appendSystemPro
 worker. When the mod is loaded only with `--mod` (development), this host's `cmd acp` ignores `--mod`, so
 the worker carries the body at the front of the task prompt instead; the job log says which path ran.
 
-`permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
-arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
-background path is the only one that exists yet.
+`isolation` and `tools` are **refused explicitly** rather than silently ignored: they arrive in a later
+phase. A foreground run (`run_in_background: false`) is refused for the same reason — the background path
+is the only one that exists yet.
+
+### Permission modes
+
+A definition's `permissionMode` is resolved with the main conversation's mode before the worker starts:
+`default`, `acceptEdits`, `auto`, `dontAsk`, `bypassPermissions`, `plan`; `manual` is an alias for
+`default`. The main mode wins when it is `acceptEdits`, `auto`, or `bypassPermissions`; otherwise the
+definition's mode applies, except that `bypassPermissions` still requires the main conversation to be in
+it. `permission_mode` on `subagent_spawn` is a per-call override that follows the same rules. An unknown
+definition mode is ignored (default); an unknown per-call mode is refused.
+
+The mode reaches the worker with ACP `session/set_mode`: `acceptEdits` → `auto-accept`, `dontAsk` →
+`dont-ask`, `bypassPermissions` → `bypass`, `plan` → `plan`, `default`/`manual` → `default`. `auto` is the
+host classifier, which has no ACP equivalent, so it is left to the host. The same table carries the
+`cmd --permission-mode` spelling (`standard`, `accept-edits`, `yolo`, `plan`) for the CLI paths.
+
+A worker that needs approval lands in `waiting-input` with the request on its signal
+(`permissionRequest` and a human-readable `question`); the job keeps its ACP session id, so it stays
+resumable. A foreground run writes the request to `<subagent_dir>/control/<job id>/permission.json` and
+waits, bounded (30 seconds by default), for `permission-response.json`:
+`{"outcome":"selected","optionId":"…"}` approves, `{"outcome":"cancelled"}` denies. Esc is the cancelled
+answer: it denies that one call and the turn continues. If nobody answers, the run settles `waiting-input`
+instead of hanging. `dontAsk` and `plan` deny approval requests; `bypassPermissions` allows them.
+Background prompts are delivered in the main session as a signal that names the agent.
 
 ### Deprecated aliases (one release)
 
