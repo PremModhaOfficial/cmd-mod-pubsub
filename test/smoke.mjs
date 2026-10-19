@@ -15,12 +15,23 @@
 //      factory argument, so the OS never runs during the suite
 
 import assert from 'node:assert/strict';
-import {existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {
+	appendFileSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod, {jobStates} from '../pubsub.ts';
+import mod, {jobStates, ledgerFactory} from '../pubsub.ts';
 
 // ---------------------------------------------------------------- assertions
 
@@ -721,6 +732,100 @@ try {
 	);
 	assert.equal(pendingApi.userMessages.length, 0, 'nothing is delivered on an unknown identity');
 	ok('an unresolved owner is pending, not foreign and not a delivery guess');
+
+
+	// 17. ledger ------------------------------------------------------------
+	// The replay guard and retention are one module: retention drops the oldest facts
+	// in memory AND on disk, so a full ledger can never empty the guard.
+	const ledgerDir = mkdtempSync(join(tmpdir(), 'pubsub-ledger-'));
+	const ledgerPath = join(ledgerDir, 'delivered.jsonl');
+	const realFs = {
+		mkdir: (dir) => mkdirSync(dir, {recursive: true}),
+		readdir: (dir) => readdirSync(dir),
+		readFile: (file) => readFileSync(file, 'utf8'),
+		writeFile: (file, data) => writeFileSync(file, data),
+		appendFile: (file, data) => appendFileSync(file, data),
+		rename: (from, to) => renameSync(from, to),
+		remove: (file) => rmSync(file, {force: true, recursive: true}),
+		stat: (file) => {
+			const stats = statSync(file);
+			return {size: stats.size, mtimeMs: stats.mtimeMs};
+		},
+	};
+	let ledgerClock = fixedNow;
+	const ledgerOptions = {
+		fs: realFs,
+		path: ledgerPath,
+		now: () => (ledgerClock += 1),
+		max: 5,
+		keep: 3,
+		compactBytes: 1024 * 1024,
+	};
+	const ledger = ledgerFactory(ledgerOptions);
+	for (const id of ['one', 'two', 'three', 'four', 'five']) ledger.accept(id);
+	assert.equal(ledger.size(), 5, 'five facts fit under the cap');
+	assert.equal(ledger.has('one'), true);
+	ledger.accept('six');
+	assert.equal(ledger.has('six'), true, 'the newest fact is always kept');
+	assert.ok(ledger.size() <= 3, 'retention bounds the ledger instead of clearing it');
+	assert.equal(ledger.has('one'), false, 'the oldest fact is the one dropped');
+
+	const diskIds = () =>
+		readFileSync(ledgerPath, 'utf8')
+			.split('\n')
+			.filter(Boolean)
+			.map((line) => JSON.parse(line).id);
+	assert.equal(diskIds().length, ledger.size(), 'memory and disk hold the same number of facts');
+	assert.ok(diskIds().includes('six'), 'the kept facts are on disk');
+	assert.ok(!diskIds().includes('one'), 'the dropped facts are off disk too');
+	ledger.retain(1);
+	assert.equal(ledger.size(), 1, 'retain(n) is the only compaction');
+	assert.deepEqual(diskIds(), ['six'], 'and it rewrites the file to match');
+
+	const restarted = ledgerFactory({...ledgerOptions, now: () => (ledgerClock += 1)});
+	assert.equal(restarted.has('six'), true, 'a restart cannot replay a delivered signal');
+	assert.equal(restarted.size(), ledger.size(), 'the restart agrees with the disk');
+	for (let index = 0; index < 50; index += 1) restarted.accept(`bulk-${index}`);
+	assert.ok(restarted.size() > 0, 'a full ledger never clears its guard');
+	assert.equal(restarted.has('bulk-49'), true, 'the newest fact survives repeated retention');
+	ok('ledger: has/accept/retain keep memory and disk consistent and never clear');
+
+	// 18. no replay after a restart -----------------------------------------
+	const replayDir = mkdtempSync(join(tmpdir(), 'pubsub-replay-'));
+	const replaySession = makeSession();
+	const replayOne = makeApi({spoolDir: replayDir, session: replaySession, runtime: makeRuntime().runtime});
+	mod(replayOne.api, replayOne.runtime);
+	await replayOne.toolDefs
+		.find((def) => def.schema.name === 'pubsub_send')
+		.run({input: {title: 'once only', body: 'first'}});
+	assert.equal(replayOne.userMessages.length, 1, 'the first factory delivers once');
+	const deliveredId = replayOne.userMessages[0].text.match(/job (\S+)/)[1];
+	const replayOwner = ownerEntries(replaySession)[0];
+
+	// A second factory over the same spool and the same session: the durable ledger
+	// already knows that id, so a replayed copy must be cleared, not delivered.
+	const replayTwo = makeApi({spoolDir: replayDir, session: replaySession, runtime: makeRuntime().runtime});
+	mod(replayTwo.api, replayTwo.runtime);
+	writeFileSync(
+		join(replayDir, 'inbox', `${Date.now()}-replay.json`),
+		JSON.stringify({
+			id: deliveredId,
+			owner: replayOwner,
+			label: 'once only',
+			kind: 'note',
+			state: 'note',
+			title: 'once only',
+			body: 'first',
+		}),
+	);
+	replayTwo.listeners.get('run_start')[0]({sessionId: 'replay'});
+	assert.equal(replayTwo.userMessages.length, 0, 'a second factory does not replay a delivered signal');
+	assert.equal(
+		readdirSync(join(replayDir, 'inbox')).filter((name) => name.includes(deliveredId)).length,
+		0,
+		'the replayed copy is cleared, not delivered',
+	);
+	ok('no replay after a second factory over the same spool');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

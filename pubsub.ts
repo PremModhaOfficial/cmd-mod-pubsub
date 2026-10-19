@@ -71,11 +71,11 @@ const LOST_GRACE_MS = 30 * 1000;
 const RECONCILE_SCAN_MAX = 200;
 const LIST_SCAN_MAX = 50;
 const DELIVERED_LEDGER_MAX = 5000;
+const DELIVERED_LEDGER_KEEP = 2000;
 const LEDGER_COMPACT_BYTES = 512 * 1024;
 const PANE_ROWS_MAX = 12;
 const PENDING_SCAN_MAX = 500;
 const OWNER_TYPE = 'pubsub/owner';
-
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -510,6 +510,101 @@ function patchOf(signal: Signal): JobPatch {
 	return patch;
 }
 
+// ---------------------------------------------------------------------------
+// Ledger
+//
+// Exactly-once delivery needs a replay guard that survives a restart, and a spool
+// that does not grow forever. Both are the ledger's business: has(id) is the
+// guard, accept(id) makes the fact durable, and retain(n) is the only compaction.
+// Memory and disk are pruned together, so a size cap can never silently drop the
+// guard the way a clear() of the in-memory set did.
+// ---------------------------------------------------------------------------
+
+export interface Ledger {
+	has(id: string): boolean;
+	accept(id: string): void;
+	retain(limit: number): void;
+	size(): number;
+}
+
+export interface LedgerDeps {
+	readonly fs: SpoolFs;
+	readonly path: string;
+	readonly now: () => number;
+	/** facts kept before retention kicks in at accept() time */
+	readonly max: number;
+	/** facts kept when retention compacts */
+	readonly keep: number;
+	/** file size that triggers a compaction on load */
+	readonly compactBytes: number;
+}
+
+function createLedger(deps: LedgerDeps): Ledger {
+	const ids = new Map<string, number>(); // id -> accepted at
+	const ordered = (): [string, number][] => [...ids.entries()].sort((left, right) => left[1] - right[1]);
+
+	function write(): void {
+		const body = ordered()
+			.map(([id, at]) => JSON.stringify({id, at}))
+			.join('\n');
+		try {
+			deps.fs.writeFile(deps.path, body.length > 0 ? `${body}\n` : '');
+		} catch {
+			/* the in-memory guard still holds; the next accept retries the file */
+		}
+	}
+
+	// Keep the newest `limit` facts - in memory and on disk, in one step. Pruning only
+	// one of the two would either lose the guard at restart or let a restart replay.
+	function retain(limit: number): void {
+		const keep = ordered().slice(-Math.max(0, limit));
+		ids.clear();
+		for (const [id, at] of keep) ids.set(id, at);
+		write();
+	}
+
+	// Load before the first drain: a restart must not replay what a previous process
+	// already delivered.
+	try {
+		for (const line of deps.fs.readFile(deps.path).split('\n').filter(Boolean).slice(-deps.max)) {
+			try {
+				const entry = JSON.parse(line) as {id?: unknown; at?: unknown};
+				if (typeof entry.id === 'string') ids.set(entry.id, typeof entry.at === 'number' ? entry.at : 0);
+			} catch {
+				/* ignore a torn last line */
+			}
+		}
+	} catch {
+		/* no ledger yet */
+	}
+	try {
+		if (deps.fs.stat(deps.path).size > deps.compactBytes) retain(deps.keep);
+	} catch {
+		/* no ledger, or another process won the rewrite */
+	}
+
+	return {
+		has: id => ids.has(id),
+		accept: id => {
+			if (ids.has(id)) return;
+			const at = deps.now();
+			ids.set(id, at);
+			try {
+				deps.fs.appendFile(deps.path, JSON.stringify({id, at}) + '\n');
+			} catch {
+				/* the in-memory guard still protects this process */
+			}
+			// Never clear(): drop the oldest facts, in both places, when the ledger is full.
+			if (ids.size > deps.max) retain(deps.keep);
+		},
+		retain,
+		size: () => ids.size,
+	};
+}
+
+// Exported for the tests, which prove the guard survives retention and a restart.
+export const ledgerFactory = createLedger;
+
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
 	// Below this line the spool is touched only through the injected filesystem.
@@ -620,41 +715,17 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// than racing the previous tick over the same files.
 	let draining = false;
 
-	// A signal claimed twice (a lost claimed/ file replayed, or an onStop drain racing
-	// a timer tick) must not land twice. Seeded from the durable ledger so a restart
-	// cannot replay what a previous process already delivered.
-	const deliveredIds = new Set<string>();
-	const rememberDelivered = (id: string): void => {
-		deliveredIds.add(id);
-		try {
-			spool.appendFile(ledgerPath, JSON.stringify({id, at: runtime.now()}) + '\n');
-		} catch {
-			/* the in-memory set still protects this process */
-		}
-		if (deliveredIds.size > DELIVERED_LEDGER_MAX) deliveredIds.clear();
-	};
-
-	try {
-		const raw = spool.readFile(ledgerPath);
-		for (const line of raw.split('\n').filter(Boolean).slice(-DELIVERED_LEDGER_MAX)) {
-			try {
-				const entry = JSON.parse(line) as {id?: unknown};
-				if (typeof entry.id === 'string') deliveredIds.add(entry.id);
-			} catch {
-				/* ignore a torn last line */
-			}
-		}
-	} catch {
-		/* no ledger yet */
-	}
-	try {
-		if (spool.stat(ledgerPath).size > LEDGER_COMPACT_BYTES) {
-			const keep = [...deliveredIds].slice(-2000);
-			spool.writeFile(ledgerPath, keep.map(id => JSON.stringify({id, at: runtime.now()})).join('\n') + '\n');
-		}
-	} catch {
-		/* no ledger, or another process won the rewrite */
-	}
+	// A signal claimed twice (a lost claimed/ file replayed, or an onStop drain racing a
+	// timer tick) must not land twice. The guard is durable, so a restart cannot replay
+	// what a previous process already delivered.
+	const ledger = createLedger({
+		fs: spool,
+		path: ledgerPath,
+		now: runtime.now,
+		max: DELIVERED_LEDGER_MAX,
+		keep: DELIVERED_LEDGER_KEEP,
+		compactBytes: LEDGER_COMPACT_BYTES,
+	});
 
 	// A2A-style envelope: the job identity and state travel WITH the result, so the
 	// model can tell which worker finished, whether it passed, and where the full log is.
@@ -802,7 +873,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				continue;
 			}
 			const claim: Claim = {name, signal, live, claimed};
-			if (deliveredIds.has(signal.id)) {
+			if (ledger.has(signal.id)) {
 				// Delivered once already (a replayed claimed/ file): drop this copy.
 				settle(claim, 'accepted');
 				continue;
@@ -823,7 +894,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	function settle(claim: Claim, outcome: Settled): void {
 		if (outcome === 'accepted') {
-			rememberDelivered(claim.signal.id);
+			ledger.accept(claim.signal.id);
 			spool.remove(claim.claimed);
 			return;
 		}
@@ -1391,7 +1462,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			refreshJobs();
 			return {
 				ok: true,
-				content: [{type: 'text', text: deliveredIds.has(id) ? 'delivered' : 'queued for this session'}],
+				content: [{type: 'text', text: ledger.has(id) ? 'delivered' : 'queued for this session'}],
 			};
 		},
 	});
