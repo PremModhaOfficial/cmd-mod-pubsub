@@ -58,7 +58,7 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import {homedir} from 'node:os';
-import {dirname, join, resolve, sep} from 'node:path';
+import {dirname, isAbsolute, join, resolve, sep} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 // Bounds. Every loop and buffer below is capped on purpose.
@@ -562,14 +562,25 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // its factory. When the marker is absent, the body is carried in the prompt so
     // it can never silently disappear.
     const body = typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+    const rosterText = typeof spec.roster === 'string' ? spec.roster : '';
+    const startupText = typeof spec.startup === 'string' ? spec.startup : '';
     let hookReady = false;
     if (typeof spec.promptMarkerPath === 'string' && spec.promptMarkerPath.length > 0) {
       try { hookReady = fs.existsSync(spec.promptMarkerPath); } catch (e) { hookReady = false; }
     }
     let promptText = spec.prompt;
+    const preamble = [];
+    if (body.length > 0 && !hookReady) preamble.push('AGENT DEFINITION (your system prompt):\\n' + body);
+    if (rosterText.length > 0 && !hookReady) preamble.push(rosterText);
+    if (startupText.length > 0 && !hookReady) preamble.push(startupText);
+    if (preamble.length > 0) {
+      promptText = preamble.join('\\n\\n') + '\\n\\nTASK:\\n' + String(spec.prompt);
+    }
     if (body.length > 0 && !hookReady) {
-      promptText = 'AGENT DEFINITION (your system prompt):\\n' + body + '\\n\\nTASK:\\n' + String(spec.prompt);
       logWrite('[acp] mod not loaded in the ACP child; the definition body is in the prompt\\n');
+    }
+    if (startupText.length > 0) {
+      logWrite('[acp] startup context ' + startupText.length + ' chars (hook ' + (hookReady ? 'live' : 'absent') + ')\\n');
     }
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
     clearTimers();
@@ -645,8 +656,16 @@ export interface Runtime {
 	/** Whether a human is driving. A CLI agent file is refused when one is. */
 	readonly interactive: boolean;
 	readonly fs: SpoolFs;
-	/** git, through the seam. Worktree creation and every check call this. */
-	git(args: string[], cwd: string): GitResult;
+	/**
+	 * One bounded, synchronous command. Optional so a test can leave the OS out; a
+	 * failure is a value, never a throw.
+	 */
+	run?(command: string, args: string[], options: {cwd?: string; timeoutMs?: number}): {
+		ok: boolean;
+		stdout: string;
+		code?: number;
+		stderr?: string;
+	};
 }
 
 export type RuntimeOverrides = Partial<Omit<Runtime, 'fs'>> & {fs?: Partial<SpoolFs>};
@@ -704,11 +723,17 @@ const OS_RUNTIME: Runtime = {
 	home: homedir(),
 	interactive: process.stdin.isTTY === true,
 	fs: osSpoolFs(),
-	// The worktree needs the real binary. Everything it returns is plain data, so a
-	// failed git (not a repository, no ref) is a value, never a throw here.
-	git: (args, cwd) => {
-		const result = spawnSync('git', args, {cwd, encoding: 'utf8', timeout: 30_000});
+	// One bounded command. Everything it returns is plain data, so a failed git (not a
+	// repository, no ref) is a value, never a throw here.
+	run: (command, args, options) => {
+		const result = spawnSync(command, args, {
+			cwd: options.cwd,
+			encoding: 'utf8',
+			timeout: options.timeoutMs ?? 2000,
+			maxBuffer: 64 * 1024,
+		});
 		return {
+			ok: result.status === 0,
 			code: typeof result.status === 'number' ? result.status : 1,
 			stdout: String(result.stdout ?? ''),
 			stderr: String(result.stderr ?? result.error?.message ?? ''),
@@ -763,6 +788,8 @@ export interface AgentDefinition {
 	permissionMode?: string;
 	maxTurns?: number;
 	skills?: string[];
+	/** `user`, `project`, or `local`: the agent's own memory directory. */
+	memory?: AgentMemoryScope;
 	isolation?: string;
 	background?: boolean;
 	color?: string;
@@ -1114,8 +1141,11 @@ export function agentDefinitionFromSource(
 	if (effort !== undefined) definition.effort = effort;
 	const background = booleanField(fields.background);
 	const omitClaudeMd = booleanField(fields.omitClaudeMd);
+	const memoryValue = fields.memory;
+	const memory = memoryValue === 'user' || memoryValue === 'project' || memoryValue === 'local' ? memoryValue : undefined;
 	if (background !== undefined) definition.background = background;
 	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	if (memory !== undefined) definition.memory = memory;
 	return {ok: true, definition};
 }
 
@@ -1556,6 +1586,380 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Startup context and agent memory
+//
+// What a subagent sees at startup is a bundle, not the host's full prompt: the
+// definition body, the environment, the task, the CLAUDE.md/AGENTS.md hierarchy,
+// a git status snapshot, the full content of the named skills, a sibling roster,
+// the output style, and the agent's own MEMORY.md. The bundle is built in the
+// parent from the injected filesystem, so the omit rules live in one function
+// instead of in conditionals spread through spawn. A subagent never inherits the
+// parent's auto memory; `memory` gives it a directory and a MEMORY.md of its own.
+// ---------------------------------------------------------------------------
+
+export type AgentMemoryScope = 'user' | 'project' | 'local';
+
+const MEMORY_INDEX_FILE = 'MEMORY.md';
+const MEMORY_INDEX_LINES_MAX = 200;
+const MEMORY_INDEX_BYTES_MAX = 25 * 1024;
+const GIT_STATUS_MAX_CHARS = 2000;
+const STARTUP_WALK_DEPTH_MAX = 8;
+// The window the ACP session is told it has. A family alias resolves to its
+// documented window; an explicit override wins, and an unknown model gets the
+// common default rather than an unbounded number.
+const CONTEXT_WINDOW_DEFAULT = 200000;
+const CONTEXT_WINDOW_MAX = 10 * 1000 * 1000;
+const CONTEXT_WINDOW_FAMILIES: ReadonlyArray<readonly [RegExp, number]> = [
+	[/\[1m\]|-1m\b/i, 1000000],
+	[/opus|sonnet|haiku|fable/i, 200000],
+];
+const EXPLORE_PLAN_NAMES: Readonly<Record<string, true>> = {explore: true, plan: true};
+
+export interface StartupFile {
+	readonly path: string;
+	readonly content: string;
+}
+
+export interface StartupSkill extends StartupFile {
+	readonly name: string;
+}
+
+export interface StartupMemory {
+	readonly scope: AgentMemoryScope;
+	readonly dir: string;
+	readonly path: string;
+	readonly content: string;
+	readonly lines: number;
+	readonly truncated: boolean;
+}
+
+export interface StartupBundle {
+	readonly systemPrompt: string;
+	readonly environmentText: string;
+	readonly task: string;
+	readonly claudeMd: StartupFile[];
+	readonly agentsMd: StartupFile[];
+	readonly gitStatus?: string;
+	readonly skills: StartupSkill[];
+	readonly roster?: string[];
+	readonly outputStyle?: string;
+	readonly memory?: StartupMemory;
+	readonly contextWindow: number;
+	/** A subagent never inherits the parent's auto memory. */
+	readonly parentMemory: false;
+	/** The rendered context the worker receives. */
+	readonly text: string;
+}
+
+/** The definition fields startup reads. Structural, so AgentDefinition fits. */
+export interface StartupDefinition {
+	readonly name?: string;
+	readonly systemPrompt?: string;
+	readonly skills?: readonly string[];
+	readonly memory?: AgentMemoryScope;
+	readonly omitClaudeMd?: boolean;
+	/** `managed` skips the managed policy, matching the spec's managed agents. */
+	readonly scope?: string;
+	readonly outputStyle?: string;
+}
+
+export interface StartupOptions {
+	readonly cwd: string;
+	readonly home: string;
+	readonly fs: SpoolFs;
+	readonly env?: Record<string, string | undefined>;
+	readonly definition?: StartupDefinition;
+	readonly agentType?: string;
+	readonly prompt?: string;
+	readonly model?: string;
+	readonly outputStyle?: string;
+	readonly roster?: readonly string[];
+	/** Files the agent works with; their subdirectory CLAUDE.md still loads. */
+	readonly paths?: readonly string[];
+	/** A snapshot already taken by the caller, or undefined for no snapshot. */
+	readonly gitStatus?: string;
+	readonly now?: number;
+	readonly platform?: string;
+}
+
+function readStartupFile(fs: SpoolFs, path: string): string | undefined {
+	try {
+		return fs.readFile(path);
+	} catch {
+		return undefined;
+	}
+}
+
+function startupFile(fs: SpoolFs, path: string): StartupFile | undefined {
+	const content = readStartupFile(fs, path);
+	return content === undefined ? undefined : {path, content};
+}
+
+// Project discovery walks up from the working directory and renders outermost
+// first, so broad instructions come before the nearest ones.
+function projectDirsUpward(cwd: string): string[] {
+	const dirs: string[] = [];
+	let current = cwd;
+	for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+		dirs.push(current);
+		const parent = dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+	return dirs.reverse();
+}
+
+// A path-scoped instruction file is loaded even when the hierarchy is omitted:
+// the agent is working with files in that directory, so the rule applies.
+function subdirectoryClaudeMd(fs: SpoolFs, cwd: string, paths: readonly string[]): StartupFile[] {
+	const seen = new Set<string>();
+	const files: StartupFile[] = [];
+	for (const path of paths) {
+		const absolute = isAbsolute(path) ? path : join(cwd, path);
+		let dir = dirname(absolute);
+		for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+			if (dir === cwd || dir === dirname(dir) || !dir.startsWith(cwd)) break;
+			const filePath = join(dir, 'CLAUDE.md');
+			if (seen.has(filePath)) break;
+			seen.add(filePath);
+			const file = startupFile(fs, filePath);
+			if (file !== undefined) files.push(file);
+			dir = dirname(dir);
+		}
+	}
+	return files;
+}
+
+export function claudeMdHierarchy(options: StartupOptions): {claudeMd: StartupFile[]; agentsMd: StartupFile[]} {
+	const env = options.env ?? {};
+	const fs = options.fs;
+	const definition = options.definition;
+	const agentType = (options.agentType ?? definition?.name ?? '').toLowerCase();
+	const claudeMd: StartupFile[] = [];
+	const agentsMd: StartupFile[] = [];
+	// Explore and Plan start without project instructions, but a path-scoped
+	// CLAUDE.md still loads because the agent works with files there.
+	const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
+	// Managed policy loads even under omitClaudeMd, except for a managed agent.
+	if (!skipHierarchy && definition?.scope !== 'managed') {
+		const managedPath =
+			env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join(options.home, '.commandcode', 'managed', 'CLAUDE.md');
+		const managed = startupFile(fs, managedPath);
+		if (managed !== undefined) claudeMd.push(managed);
+	}
+	if (!skipHierarchy && definition?.omitClaudeMd !== true) {
+		const user = startupFile(
+			fs,
+			env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join(options.home, '.commandcode', 'CLAUDE.md'),
+		);
+		if (user !== undefined) claudeMd.push(user);
+		for (const dir of projectDirsUpward(options.cwd)) {
+			const project = startupFile(fs, join(dir, 'CLAUDE.md'));
+			if (project !== undefined) claudeMd.push(project);
+			const local = startupFile(fs, join(dir, 'CLAUDE.local.md'));
+			if (local !== undefined) claudeMd.push(local);
+		}
+		// AGENTS.md is project instructions too, so it follows the same omit rule.
+		for (const dir of projectDirsUpward(options.cwd)) {
+			const agents = startupFile(fs, join(dir, 'AGENTS.md'));
+			if (agents !== undefined) agentsMd.push(agents);
+		}
+	}
+	claudeMd.push(...subdirectoryClaudeMd(fs, options.cwd, options.paths ?? []));
+	return {claudeMd, agentsMd};
+}
+
+export function skillFileFor(
+	name: string,
+	options: {cwd: string; home: string; fs: SpoolFs},
+): string | undefined {
+	if (name.length === 0) return undefined;
+	const candidates: string[] = [];
+	for (const dir of projectDirsUpward(options.cwd)) {
+		candidates.push(join(dir, '.commandcode', 'skills', name, 'SKILL.md'));
+		candidates.push(join(dir, '.claude', 'skills', name, 'SKILL.md'));
+	}
+	candidates.push(join(options.home, '.commandcode', 'skills', name, 'SKILL.md'));
+	candidates.push(join(options.home, '.claude', 'skills', name, 'SKILL.md'));
+	for (const candidate of candidates) {
+		if (readStartupFile(options.fs, candidate) !== undefined) return candidate;
+	}
+	return undefined;
+}
+
+export function memoryDirFor(scope: AgentMemoryScope, name: string, options: {cwd: string; home: string}): string {
+	const root =
+		scope === 'user'
+			? join(options.home, '.commandcode', 'agent-memory')
+			: scope === 'project'
+				? join(options.cwd, '.commandcode', 'agent-memory')
+				: join(options.cwd, '.commandcode', 'agent-memory-local');
+	return join(root, name);
+}
+
+// The first 200 lines or 25KB of MEMORY.md, whichever comes first. Bytes, not
+// UTF-16 code units: the bound is on what is injected into the context.
+export function readMemoryIndex(
+	path: string,
+	fs: SpoolFs,
+): {content: string; lines: number; truncated: boolean} {
+	let source: string;
+	try {
+		source = fs.readFile(path);
+	} catch {
+		return {content: '', lines: 0, truncated: false};
+	}
+	const allLines = source.split('\n');
+	// A trailing newline is not a line of content, so a 200-line file that ends
+	// with one is not reported as truncated.
+	if (allLines.length > 0 && allLines[allLines.length - 1] === '') allLines.pop();
+	const lineBound = allLines.slice(0, MEMORY_INDEX_LINES_MAX).join('\n');
+	let content = lineBound;
+	let truncatedByBytes = false;
+	if (Buffer.byteLength(lineBound, 'utf8') > MEMORY_INDEX_BYTES_MAX) {
+		const buffer = Buffer.from(lineBound, 'utf8').subarray(0, MEMORY_INDEX_BYTES_MAX);
+		content = buffer.toString('utf8').replace(/\uFFFD$/, '');
+		truncatedByBytes = true;
+	}
+	const truncatedByLines = allLines.length > MEMORY_INDEX_LINES_MAX;
+	return {
+		content,
+		lines: content.length === 0 ? 0 : content.split('\n').length,
+		truncated: truncatedByLines || truncatedByBytes,
+	};
+}
+
+// MEMORY.md is the agent's own memory. The parent's auto memory never follows a
+// non-fork subagent, so this is the only memory that reaches the bundle.
+function startupMemory(options: StartupOptions): StartupMemory | undefined {
+	const scope = options.definition?.memory;
+	const name = options.definition?.name;
+	if (scope === undefined || name === undefined || name.length === 0) return undefined;
+	const dir = memoryDirFor(scope, name, {cwd: options.cwd, home: options.home});
+	try {
+		options.fs.mkdir(dir);
+	} catch {
+		// A read-only location must not fail the spawn: the agent still starts.
+	}
+	const path = join(dir, MEMORY_INDEX_FILE);
+	const index = readMemoryIndex(path, options.fs);
+	return {scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated};
+}
+
+export function contextWindowForModel(
+	model: string | undefined,
+	env: Record<string, string | undefined> = {},
+): number {
+	const override = Number(env.BETTER_SUBAGENTS_CONTEXT_WINDOW ?? env.CLAUDE_CODE_CONTEXT_WINDOW);
+	if (Number.isFinite(override) && override >= 1000) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
+	const value = (model ?? '').toLowerCase();
+	for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
+		if (pattern.test(value)) return window;
+	}
+	return CONTEXT_WINDOW_DEFAULT;
+}
+
+// A memory definition must be able to read and write its own MEMORY.md.
+export function withMemoryTools(
+	tools: readonly string[] | undefined,
+	memory: AgentMemoryScope | undefined,
+): string[] | undefined {
+	if (memory === undefined) return tools === undefined ? undefined : [...tools];
+	const result = tools === undefined ? [] : [...tools];
+	for (const tool of ['Read', 'Write', 'Edit']) if (!result.includes(tool)) result.push(tool);
+	return result;
+}
+
+export function gitStatusSnapshot(runtime: Pick<Runtime, 'run'>, cwd: string): string | undefined {
+	const run = runtime.run;
+	if (typeof run !== 'function') return undefined;
+	try {
+		const result = run('git', ['status', '--short', '--branch'], {cwd});
+		return result.ok ? result.stdout : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function trimGitStatus(status: string | undefined): string | undefined {
+	if (status === undefined) return undefined;
+	const text = status.replace(/\s+$/, '');
+	if (text.length === 0) return undefined;
+	return text.length > GIT_STATUS_MAX_CHARS ? `${text.slice(0, GIT_STATUS_MAX_CHARS)}\n(truncated)` : text;
+}
+
+function renderStartup(bundle: Omit<StartupBundle, 'text'>): string {
+	const sections: string[] = [bundle.environmentText];
+	if (bundle.claudeMd.length > 0) {
+		const files = bundle.claudeMd.map(file => `## ${file.path}\n${file.content}`);
+		sections.push(['# Project instructions (CLAUDE.md)', ...files].join('\n\n'));
+	}
+	if (bundle.agentsMd.length > 0) {
+		const files = bundle.agentsMd.map(file => `## ${file.path}\n${file.content}`);
+		sections.push(['# AGENTS.md', ...files].join('\n\n'));
+	}
+	if (bundle.gitStatus !== undefined) sections.push(`# Git status\n${bundle.gitStatus}`);
+	if (bundle.skills.length > 0) {
+		const skills = bundle.skills.map(skill => `## ${skill.name} (${skill.path})\n${skill.content}`);
+		sections.push(['# Skills (full content)', ...skills].join('\n\n'));
+	}
+	if (bundle.roster !== undefined && bundle.roster.length > 0) {
+		sections.push(`# Sibling agents\n${bundle.roster.map(name => `- ${name}`).join('\n')}`);
+	}
+	if (bundle.outputStyle !== undefined) sections.push(`# Output style\n${bundle.outputStyle}`);
+	if (bundle.memory !== undefined) {
+		const bound = bundle.memory.truncated ? ' (truncated to the first 200 lines or 25KB)' : '';
+		sections.push(`# Agent memory\n${bundle.memory.path}${bound}\n${bundle.memory.content}`);
+	}
+	return sections.join('\n\n');
+}
+
+export function buildStartupBundle(options: StartupOptions): StartupBundle {
+	const env = options.env ?? {};
+	const definition = options.definition;
+	const agentType = (options.agentType ?? definition?.name ?? '').toLowerCase();
+	const contextWindow = contextWindowForModel(options.model, env);
+	const {claudeMd, agentsMd} = claudeMdHierarchy(options);
+	// Explore and Plan skip the git status snapshot along with the instructions.
+	const gitStatus = EXPLORE_PLAN_NAMES[agentType] === true ? undefined : trimGitStatus(options.gitStatus);
+	// The full content of every named skill; an unlisted skill stays invocable
+	// through the Skill tool and is not preloaded here.
+	const skills: StartupSkill[] = [];
+	for (const name of definition?.skills ?? []) {
+		const path = skillFileFor(name, options);
+		const content = path === undefined ? undefined : readStartupFile(options.fs, path);
+		if (path !== undefined && content !== undefined) skills.push({name, path, content});
+	}
+	const roster = options.roster === undefined ? undefined : [...options.roster];
+	const outputStyle = options.outputStyle ?? definition?.outputStyle;
+	const memory = startupMemory(options);
+	const date = new Date(options.now ?? Date.now()).toISOString().slice(0, 10);
+	const environment = [
+		'# Environment',
+		`working directory: ${options.cwd}`,
+		`platform: ${options.platform ?? 'unknown'}`,
+		`date: ${date}`,
+	];
+	if (options.model !== undefined) environment.push(`model: ${options.model}`);
+	environment.push(`context window: ${contextWindow} tokens`);
+	const base: Omit<StartupBundle, 'text'> = {
+		systemPrompt: definition?.systemPrompt ?? '',
+		environmentText: environment.join('\n'),
+		task: options.prompt ?? '',
+		claudeMd,
+		agentsMd,
+		...(gitStatus !== undefined ? {gitStatus} : {}),
+		skills,
+		...(roster !== undefined ? {roster} : {}),
+		...(outputStyle !== undefined ? {outputStyle} : {}),
+		...(memory !== undefined ? {memory} : {}),
+		contextWindow,
+		parentMemory: false,
+	};
+	return {...base, text: renderStartup(base)};
+}
+
+// ---------------------------------------------------------------------------
 // Worker spec
 //
 // The worker is one detached Node process. `buildSpec` is the only place a spec
@@ -1595,6 +1999,8 @@ export interface WorkerSpecInput {
 	worktree?: string;
 	/** Checkout roots this job must never enter. */
 	mainCheckouts?: string[];
+	/** The rendered startup bundle: CLAUDE.md, git status, skills, memory, roster. */
+	startup?: string;
 }
 
 export interface WorkerSpec extends WorkerSpecInput {
@@ -1634,6 +2040,24 @@ export interface GitResult {
 /** The git half of the runtime seam. */
 export interface GitSeam {
 	git(args: string[], cwd: string): GitResult;
+}
+
+/**
+ * git over the runtime's one bounded `run`. The worktree code speaks GitResult, so
+ * the OS call and its fake stay one seam.
+ */
+export function gitSeam(runtime: Pick<Runtime, 'run'>): GitSeam {
+	return {
+		git(args, cwd) {
+			const reply = runtime.run?.('git', args, {cwd, timeoutMs: 30_000});
+			if (reply === undefined) return {code: 1, stdout: '', stderr: 'git is not available'};
+			return {
+				code: typeof reply.code === 'number' ? reply.code : reply.ok ? 0 : 1,
+				stdout: String(reply.stdout ?? ''),
+				stderr: String(reply.stderr ?? ''),
+			};
+		},
+	};
 }
 
 /** The filesystem calls creation needs. */
@@ -2366,6 +2790,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
 	// Below this line the spool is touched only through the injected filesystem.
 	const spool = runtime.fs;
+	// One git seam for worktree creation, cleanup and the isolation guard.
+	const git = gitSeam(runtime);
 	cmd.addFlag('subagent_dir', {
 		type: 'string',
 		default: SUBAGENT_DIR_DEFAULT,
@@ -2505,6 +2931,45 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		};
 	}
 
+	// The worker's system prompt: the definition body, the rendered sibling roster
+	// (supplied by the live session), then the startup bundle. The parent builds
+	// all three, so the hook is registered only in worker mode and only when there
+	// is something to append.
+	function workerSystemPrompt(): string {
+		const roster = (workerSpec as {roster?: unknown} | undefined)?.roster;
+		const parts = [
+			typeof workerSpec?.systemPrompt === 'string' ? workerSpec.systemPrompt : '',
+			typeof roster === 'string' ? roster : '',
+			typeof workerSpec?.startup === 'string' ? workerSpec.startup : '',
+		].filter(part => part.length > 0);
+		return parts.join('\n\n');
+	}
+
+	// The startup bundle for one agent job, built from the same definition the
+	// worker receives. It is rendered in the parent from the injected filesystem.
+	// The roster is supplied by the live session (T9); a subagent never inherits
+	// the parent's auto memory, only its own MEMORY.md.
+	function startupFor(
+		definition: AgentDefinition | undefined,
+		cwd: string,
+		prompt: string | undefined,
+		model: string | undefined,
+	): string | undefined {
+		if (definition === undefined || prompt === undefined) return undefined;
+		return buildStartupBundle({
+			cwd,
+			home: runtime.home,
+			env: runtime.env,
+			fs: runtime.fs,
+			definition,
+			agentType: definition.name,
+			prompt,
+			model,
+			gitStatus: gitStatusSnapshot(runtime, cwd),
+			now: runtime.now(),
+		}).text;
+	}
+
 	const deliverAs = (): 'steer' | 'follow-up' =>
 		(pick('subagent_deliver', 'steer', 'pubsub_deliver', 'steer') === 'follow-up' ? 'follow-up' : 'steer');
 
@@ -2615,7 +3080,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// Already decided by the restart reconcile or an earlier format: report the kept
 		// path again without touching git, so delivery never loses the note.
 		if (job.worktreeFinalized === true) return {kept: job.worktreeKept === true, path: job.worktree};
-		const decision = finalizeWorktree(runtime, job);
+		const decision = finalizeWorktree(git, job);
 		if (decision === undefined) return undefined;
 		job.worktreeFinalized = true;
 		job.worktreeKept = decision.kept;
@@ -3177,8 +3642,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		/** This job's nesting level, and the job that spawned it. */
 		readonly depth?: number;
 		readonly parentJobId?: string;
-		/** the definition body, delivered as the worker's system prompt */
+		/** The definition body, delivered as the worker's system prompt */
 		readonly systemPrompt?: string;
+		/** The rendered startup bundle: instructions, git status, skills, memory */
+		readonly startup?: string;
 		readonly model?: string;
 		readonly maxTurns?: number;
 		readonly effort?: string;
@@ -3336,7 +3803,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// cwd and the guard all carry one path. A creation failure is one failed job.
 		const isolation =
 			intent.isolation === 'worktree'
-				? createJobWorktree(runtime, {cwd: intent.cwd, path: join(worktreesDir, id)})
+				? createJobWorktree({git: git.git, fs: spool}, {cwd: intent.cwd, path: join(worktreesDir, id)})
 				: undefined;
 		const owner = ownerId();
 		const record = makeRecord(
@@ -3384,6 +3851,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				depth,
 				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
+				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
 				...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
 				...(intent.effort !== undefined ? {effort: intent.effort} : {}),
@@ -3550,15 +4018,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0
 					? Math.round(requestedMaxTurns)
 					: definition?.maxTurns;
+		const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
+		const resolvedModel = prompt === undefined ? undefined : model ?? definitionModel;
 		const launched = fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
 			command,
 			prompt,
-			cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
+			cwd: runCwd,
 			agentType: definition?.name,
 			systemPrompt: definition?.systemPrompt,
-			model: prompt === undefined ? undefined : model ?? definitionModel,
+			startup: startupFor(definition, runCwd, prompt, resolvedModel),
+			model: resolvedModel,
 			maxTurns,
 			effort: definition?.effort,
 			permissionMode: definition?.permissionMode,
@@ -3685,13 +4156,16 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// with the context the worker already has. An older record without one starts a
 		// fresh session (the definition body still applies).
 		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const resumeCwd = String(record.cwd ?? cmd.cwd);
+		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
 		const launched = fire({
 			label: `${String(record.label ?? id)} (resume)`,
 			kind: 'agent',
 			prompt: instruction,
-			cwd: String(record.cwd ?? cmd.cwd),
+			cwd: resumeCwd,
 			agentType: record.agentType,
-			systemPrompt: definition?.ok === true ? definition.definition.systemPrompt : undefined,
+			systemPrompt: resumeDefinition?.systemPrompt,
+			startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
 			maxTurns: record.maxTurns,
 			effort: record.effort,
@@ -3972,16 +4446,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// Worktree isolation is enforced where the tools run. This mod is loaded both in
 	// the session and in the ACP worker, so one guard covers both: a subagent with a
 	// worktree, and any session that is itself a linked worktree.
-	const isolation = isolationRoots(runtime, String(workerSpec?.cwd ?? runtime.cwd), workerSpec);
+	const isolation = isolationRoots(git, String(workerSpec?.cwd ?? runtime.cwd), workerSpec);
 
 	cmd.hooks({
 		// The worker process loads this mod with `cmd --mod <file> acp`. Its whole
-		// purpose there is this hook: the definition body is the worker's system
-		// prompt. The parent already has the definition, so only worker mode registers
-		// it, and only when a body was passed.
-		...(workerSpec?.systemPrompt !== undefined && workerSpec.systemPrompt.length > 0
-			? {appendSystemPrompt: () => String(workerSpec?.systemPrompt ?? '')}
-			: {}),
+		// purpose there is this hook: the definition body and the startup bundle are
+		// the worker's system prompt. The parent already has both, so only worker mode
+		// registers it, and only when there is something to append.
+		...(workerSystemPrompt().length > 0 ? {appendSystemPrompt: () => workerSystemPrompt()} : {}),
 		// A blocked tool returns the reason as its result, so the model learns where it
 		// is allowed to work instead of silently retrying.
 		...(isolation !== undefined

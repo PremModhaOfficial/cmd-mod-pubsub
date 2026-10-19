@@ -1116,12 +1116,15 @@ try {
 		home: homeRoot,
 		// The `full` definition sets `isolation: worktree`; the seam answers as a repo
 		// so the job can start without touching a real checkout.
-		git: (args) => {
+		run: (command, args) => {
+			if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not available'};
 			const key = args.join(' ');
-			if (key === 'rev-parse --show-toplevel') return {code: 0, stdout: `${nestedRoot}\n`, stderr: ''};
-			if (key.startsWith('rev-parse --path-format')) return {code: 0, stdout: `${nestedRoot}/.git\n`, stderr: ''};
-			if (key.startsWith('symbolic-ref')) return {code: 0, stdout: 'origin/main\n', stderr: ''};
-			return {code: 0, stdout: '', stderr: ''};
+			if (key === 'rev-parse --show-toplevel') return {ok: true, code: 0, stdout: `${nestedRoot}\n`, stderr: ''};
+			if (key.startsWith('rev-parse --path-format')) {
+				return {ok: true, code: 0, stdout: `${nestedRoot}/.git\n`, stderr: ''};
+			}
+			if (key.startsWith('symbolic-ref')) return {ok: true, code: 0, stdout: 'origin/main\n', stderr: ''};
+			return {ok: true, code: 0, stdout: '', stderr: ''};
 		},
 	});
 	const registrySpool = mkdtempSync(join(tmpdir(), 'subagent-registry-spool-'));
@@ -1452,6 +1455,12 @@ process.stdin.on('data', (data) => {
 		return {git, calls};
 	};
 	const okGit = {code: 0, stdout: '', stderr: ''};
+	// The runtime seam is one generic `run`; this maps the worktree-sized fake onto it.
+	const runOf = (seam) => (command, args, options) => {
+		if (command !== 'git') return {ok: false, code: 1, stdout: '', stderr: 'not git'};
+		const answer = seam.git(args, options?.cwd);
+		return {ok: answer.code === 0, code: answer.code, stdout: answer.stdout, stderr: answer.stderr};
+	};
 	const repoGit = gitSeam({
 		'rev-parse --show-toplevel': {code: 0, stdout: '/repo\n', stderr: ''},
 		'rev-parse --path-format=absolute --git-common-dir': {code: 0, stdout: '/repo/.git\n', stderr: ''},
@@ -1647,13 +1656,13 @@ process.stdin.on('data', (data) => {
 	);
 
 	const normalDir = mkdtempSync(join(tmpdir(), 'subagent-wt-normal-'));
-	const normalRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo', git: repoGit.git}).runtime;
+	const normalRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo', run: runOf(repoGit)}).runtime;
 	const normalApi = makeApi({spoolDir: normalDir, session: makeSession(), runtime: normalRuntime});
 	mod(normalApi.api, normalRuntime);
 	assert.equal(normalApi.registeredHooks.beforeToolCall, undefined, 'a normal main-checkout session registers no guard');
 
 	const linkedDir = mkdtempSync(join(tmpdir(), 'subagent-wt-linked-'));
-	const linkedRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo-wt', git: linkedGit.git}).runtime;
+	const linkedRuntime = makeRuntime({now: () => fixedNow, cwd: '/repo-wt', run: runOf(linkedGit)}).runtime;
 	const linkedApi = makeApi({spoolDir: linkedDir, session: makeSession(), runtime: linkedRuntime});
 	mod(linkedApi.api, linkedRuntime);
 	assert.equal(typeof linkedApi.registeredHooks.beforeToolCall, 'function', 'a linked-worktree session guards its own tools');
@@ -1678,7 +1687,7 @@ process.stdin.on('data', (data) => {
 		'worktree add': okGit,
 		'status --porcelain': {code: 0, stdout: '?? changed.txt\n', stderr: ''},
 	});
-	const fireRuntime = makeRuntime({now: () => fixedNow, cwd: project, git: fireGit.git, execPath: '/usr/bin/node'});
+	const fireRuntime = makeRuntime({now: () => fixedNow, cwd: project, run: runOf(fireGit), execPath: '/usr/bin/node'});
 	const fireApi = makeApi({spoolDir: fireDir, session: makeSession(), runtime: fireRuntime.runtime});
 	mod(fireApi.api, fireRuntime.runtime);
 	const spawnedIso = await toolOf(fireApi, 'subagent_spawn').run({
@@ -2313,6 +2322,282 @@ process.stdin.on('data', (data) => {
 	assert.match(agentListing, /added {2}project {2}valid/, '/agents lists an --add-dir definition');
 	assert.match(agentListing, /fromFile {2}cli {2}valid/, '/agents lists a CLI definition');
 	ok('scopes: managed, CLI, project, user, plugin, precedence, --add-dir, plugin names, /doctor');
+
+	// 43. startup context and agent memory ----------------------------------
+	// The bundle is a pure seam: it is built from the definition and the working
+	// directory, then carried in the worker spec. Each component is exposed as a
+	// field, so the omit rules are asserted directly instead of through a prompt.
+	const startupExports = await import('../better-sub-agents.ts');
+	assert.equal(typeof startupExports.buildStartupBundle, 'function', 'the startup bundle is a pure seam');
+	assert.equal(typeof startupExports.memoryDirFor, 'function', 'memory directory resolution is exported');
+	assert.equal(typeof startupExports.readMemoryIndex, 'function', 'the MEMORY.md bound is exported');
+	assert.equal(typeof startupExports.contextWindowForModel, 'function', 'the context window is model-sized');
+	assert.equal(typeof startupExports.withMemoryTools, 'function', 'memory auto-enables Read/Write/Edit');
+
+	const startupRoot = mkdtempSync(join(tmpdir(), 'subagent-startup-'));
+	const startupHome = mkdtempSync(join(tmpdir(), 'subagent-startup-home-'));
+	const startupSub = join(startupRoot, 'packages', 'app');
+	mkdirSync(startupSub, {recursive: true});
+	writeFileSync(join(startupRoot, 'CLAUDE.md'), 'PROJECT-INSTRUCTIONS');
+	writeFileSync(join(startupRoot, 'AGENTS.md'), 'AGENTS-INSTRUCTIONS');
+	writeFileSync(join(startupRoot, 'CLAUDE.local.md'), 'LOCAL-INSTRUCTIONS');
+	writeFileSync(join(startupSub, 'CLAUDE.md'), 'SUBDIR-INSTRUCTIONS');
+	mkdirSync(join(startupHome, '.commandcode', 'managed'), {recursive: true});
+	writeFileSync(join(startupHome, '.commandcode', 'CLAUDE.md'), 'USER-INSTRUCTIONS');
+	writeFileSync(join(startupHome, '.commandcode', 'managed', 'CLAUDE.md'), 'MANAGED-POLICY');
+	mkdirSync(join(startupRoot, '.commandcode', 'skills', 'review'), {recursive: true});
+	writeFileSync(join(startupRoot, '.commandcode', 'skills', 'review', 'SKILL.md'), 'SKILL-BODY-FULL');
+	writeFileSync(join(startupRoot, '.commandcode', 'skills', 'review', 'notes.txt'), 'not the skill');
+
+	const startupDefinition = {
+		name: 'reviewer',
+		systemPrompt: 'You review.',
+		skills: ['review'],
+		memory: 'project',
+	};
+	const startupInput = {
+		cwd: startupRoot,
+		home: startupHome,
+		fs: realFs,
+		definition: startupDefinition,
+		prompt: 'TASK-BODY',
+		model: 'claude-sonnet-4-5',
+		roster: ['main', 'Tester'],
+		outputStyle: 'concise',
+		gitStatus: '## main\n M file.ts',
+		now: Date.UTC(2026, 9, 20),
+		platform: 'linux x64',
+	};
+	const bundle = startupExports.buildStartupBundle(startupInput);
+	assert.equal(bundle.systemPrompt, 'You review.', 'the agent system prompt is the definition body');
+	assert.equal(bundle.task, 'TASK-BODY', 'the task message is part of the bundle');
+	assert.ok(bundle.environmentText.includes(startupRoot), 'the environment carries the working directory');
+	assert.match(bundle.environmentText, /2026-10-20/, 'the environment carries the date');
+	assert.match(bundle.environmentText, /linux x64/, 'the environment carries the platform');
+	assert.equal(bundle.contextWindow, 200000, 'the context window is sized by the model');
+	const claudeText = bundle.claudeMd.map((file) => file.content).join('\n');
+	for (const marker of ['MANAGED-POLICY', 'USER-INSTRUCTIONS', 'PROJECT-INSTRUCTIONS', 'LOCAL-INSTRUCTIONS']) {
+		assert.ok(claudeText.includes(marker), `the hierarchy includes ${marker}`);
+	}
+	assert.ok(bundle.agentsMd.some((file) => file.content === 'AGENTS-INSTRUCTIONS'), 'AGENTS.md loads as project instructions');
+	assert.equal(bundle.gitStatus, '## main\n M file.ts', 'the git status snapshot is included');
+	assert.equal(bundle.skills.length, 1, 'only the named skill is preloaded');
+	assert.equal(bundle.skills[0].content, 'SKILL-BODY-FULL', 'the full skill content is preloaded');
+	assert.deepEqual(bundle.roster, ['main', 'Tester'], 'the roster is a snapshot');
+	assert.equal(bundle.outputStyle, 'concise', 'the output style is exposed');
+	assert.equal(bundle.parentMemory, false, 'there is no parent auto memory');
+	assert.equal(bundle.memory.scope, 'project', 'the agent has its own memory');
+	assert.equal(
+		bundle.memory.dir,
+		join(startupRoot, '.commandcode', 'agent-memory', 'reviewer'),
+		'project memory lives under the project',
+	);
+	assert.ok(existsSync(bundle.memory.dir), 'a memory definition creates its directory');
+	assert.equal(bundle.memory.content, '', 'an absent MEMORY.md injects nothing');
+	for (const marker of ['PROJECT-INSTRUCTIONS', 'AGENTS-INSTRUCTIONS', 'SKILL-BODY-FULL', 'Tester', 'concise', '## main']) {
+		assert.ok(bundle.text.includes(marker), `the rendered bundle carries ${marker}`);
+	}
+	ok('startup bundle: system prompt, environment, task, CLAUDE.md/AGENTS.md, git status, skills, roster, output style, no parent memory');
+
+	// 44. MEMORY.md is bounded by lines and bytes, whichever comes first.
+	writeFileSync(join(bundle.memory.dir, 'MEMORY.md'), Array.from({length: 300}, (_, index) => `line ${index + 1}`).join('\n'));
+	const bounded = startupExports.readMemoryIndex(join(bundle.memory.dir, 'MEMORY.md'), realFs);
+	assert.equal(bounded.lines, 200, 'MEMORY.md is injected as at most 200 lines');
+	assert.equal(bounded.truncated, true, 'a longer MEMORY.md is marked truncated');
+	assert.match(bounded.content, /line 200/, 'line 200 is inside the bound');
+	assert.ok(!bounded.content.includes('line 201'), 'line 201 is beyond the bound');
+	const rebuiltMemory = startupExports.buildStartupBundle(startupInput);
+	assert.match(rebuiltMemory.memory.content, /line 1\b/, 'the agent memory is injected into the bundle');
+	writeFileSync(join(bundle.memory.dir, 'MEMORY.md'), 'x'.repeat(30 * 1024));
+	const boundedBytes = startupExports.readMemoryIndex(join(bundle.memory.dir, 'MEMORY.md'), realFs);
+	assert.equal(boundedBytes.content.length, 25 * 1024, 'MEMORY.md is injected as at most 25KB');
+	assert.equal(boundedBytes.truncated, true, 'the byte bound marks truncation');
+	assert.equal(
+		startupExports.memoryDirFor('user', 'reviewer', {cwd: startupRoot, home: startupHome}),
+		join(startupHome, '.commandcode', 'agent-memory', 'reviewer'),
+		'user memory lives under the home directory',
+	);
+	assert.equal(
+		startupExports.memoryDirFor('project', 'reviewer', {cwd: startupRoot, home: startupHome}),
+		join(startupRoot, '.commandcode', 'agent-memory', 'reviewer'),
+		'project memory lives under the project',
+	);
+	assert.equal(
+		startupExports.memoryDirFor('local', 'reviewer', {cwd: startupRoot, home: startupHome}),
+		join(startupRoot, '.commandcode', 'agent-memory-local', 'reviewer'),
+		'local memory lives under the local directory',
+	);
+	assert.deepEqual(startupExports.withMemoryTools(['Bash'], 'project'), ['Bash', 'Read', 'Write', 'Edit'], 'memory adds Read, Write and Edit');
+	assert.deepEqual(startupExports.withMemoryTools(undefined, 'user'), ['Read', 'Write', 'Edit'], 'memory alone selects the three tools');
+	assert.deepEqual(startupExports.withMemoryTools(['Bash'], undefined), ['Bash'], 'no memory leaves the tools untouched');
+	assert.equal(startupExports.contextWindowForModel('claude-sonnet-4-5'), 200000, 'a known model has its window');
+	assert.equal(startupExports.contextWindowForModel(undefined), 200000, 'an unknown model falls back to the default window');
+	assert.equal(
+		startupExports.contextWindowForModel('claude-opus-4-1', {BETTER_SUBAGENTS_CONTEXT_WINDOW: '1000000'}),
+		1000000,
+		'the context window can be sized explicitly',
+	);
+	const memoryParsed = startupExports.agentDefinitionFromSource(
+		'---\nname: remembers\ndescription: d\nmemory: local\n---\nbody',
+		'remembers.md',
+		'project',
+	);
+	assert.equal(memoryParsed.ok === true && memoryParsed.definition.memory, 'local', 'the memory field parses');
+	const badMemory = startupExports.agentDefinitionFromSource(
+		'---\nname: forgets\ndescription: d\nmemory: galaxy\n---\nbody',
+		'forgets.md',
+		'project',
+	);
+	assert.equal(badMemory.ok === true && badMemory.definition.memory, undefined, 'an unknown memory scope is ignored');
+	ok('agent memory: directory per scope, the 200-line/25KB MEMORY.md bound, automatic tools');
+
+	// 45. omitClaudeMd skips user, project and local instructions; managed policy stays.
+	const omitted = startupExports.buildStartupBundle({
+		...startupInput,
+		definition: {...startupDefinition, omitClaudeMd: true},
+	});
+	assert.deepEqual(omitted.claudeMd.map((file) => file.content), ['MANAGED-POLICY'], 'omitClaudeMd keeps only managed policy');
+	assert.deepEqual(omitted.agentsMd, [], 'omitClaudeMd also skips AGENTS.md');
+	// Explore and Plan skip the hierarchy and the git status snapshot entirely.
+	for (const agentType of ['explore', 'plan']) {
+		const skipped = startupExports.buildStartupBundle({
+			...startupInput,
+			agentType,
+			definition: {name: agentType, systemPrompt: 'read only'},
+		});
+		assert.deepEqual(skipped.claudeMd, [], `${agentType} skips the CLAUDE.md hierarchy`);
+		assert.deepEqual(skipped.agentsMd, [], `${agentType} skips AGENTS.md`);
+		assert.equal(skipped.gitStatus, undefined, `${agentType} skips the git status snapshot`);
+		assert.equal(skipped.skills.length, 0, `${agentType} still honours its own definition`);
+		assert.equal(skipped.task, 'TASK-BODY', `${agentType} still receives the task`);
+	}
+	// A subdirectory CLAUDE.md loads even with omitClaudeMd and for Explore, because
+	// the agent is working with files there.
+	const subdirectory = startupExports.buildStartupBundle({
+		...startupInput,
+		definition: {...startupDefinition, omitClaudeMd: true},
+		paths: ['packages/app/src/file.ts'],
+	});
+	assert.ok(
+		!subdirectory.claudeMd.some((file) => file.content === 'PROJECT-INSTRUCTIONS'),
+		'omitClaudeMd still skips the walked hierarchy',
+	);
+	assert.ok(
+		subdirectory.claudeMd.some((file) => file.content === 'SUBDIR-INSTRUCTIONS'),
+		'a subdirectory CLAUDE.md still loads',
+	);
+	const exploreSubdirectory = startupExports.buildStartupBundle({
+		...startupInput,
+		agentType: 'explore',
+		definition: {name: 'explore', systemPrompt: 'read only'},
+		paths: [join('packages', 'app', 'src', 'file.ts')],
+	});
+	assert.ok(
+		exploreSubdirectory.claudeMd.some((file) => file.content === 'SUBDIR-INSTRUCTIONS'),
+		'Explore still loads a subdirectory CLAUDE.md',
+	);
+	ok('omit rules: omitClaudeMd keeps managed policy, Explore and Plan skip instructions and git status, subdirectory CLAUDE.md still loads');
+
+	// 46. The bundle reaches the worker: the system prompt when the hook is live, the
+	// prompt when it is not.
+	const startupHookBundle = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-startup-hook-')),
+		session: makeSession(),
+		runtime: makeRuntime({
+			env: {
+				...process.env,
+				BETTER_SUBAGENTS_WORKER: '1',
+				SUBAGENT_SPEC: JSON.stringify({
+					systemPrompt: 'DEFINITION BODY',
+					roster: 'ROSTER-LINE',
+					startup: 'STARTUP-CONTEXT-X',
+				}),
+			},
+		}).runtime,
+	});
+	mod(startupHookBundle.api, startupHookBundle.runtime);
+	assert.equal(typeof startupHookBundle.registeredHooks.appendSystemPrompt, 'function', 'the worker hook is registered');
+	const hookText = startupHookBundle.registeredHooks.appendSystemPrompt();
+	assert.match(hookText, /DEFINITION BODY/, 'the definition body is still the base system prompt');
+	assert.match(hookText, /STARTUP-CONTEXT-X/, 'the startup bundle joins the system prompt');
+	assert.ok(hookText.indexOf('ROSTER-LINE') > hookText.indexOf('DEFINITION BODY'), 'the roster follows the body');
+	assert.ok(hookText.indexOf('STARTUP-CONTEXT-X') > hookText.indexOf('ROSTER-LINE'), 'the startup bundle follows the roster');
+
+	const startupAcpSpec = seam.buildSpec(
+		{
+			id: 'acp-startup',
+			label: 'acp-startup',
+			kind: 'agent',
+			owner: 'owner-test',
+			cwd: acpDir,
+			logPath: join(acpDir, 'logs', 'acp-startup.log'),
+			inboxDir: join(acpDir, 'inbox'),
+			jobsDir: join(acpDir, 'jobs'),
+			startedAt: Date.now(),
+			tailMax: 8000,
+			bin: fakeCmd,
+			prompt: 'the task',
+			agentType: 'general-purpose',
+			systemPrompt: 'WORKER-SYSTEM',
+			roster: 'ROSTER-LINE',
+			startup: 'STARTUP-CONTEXT-X',
+			promptMarkerPath: join(acpDir, 'logs', 'acp-startup.mod'),
+		},
+		'/mod.ts',
+	);
+	writeFileSync(join(acpDir, 'jobs', 'acp-startup.json'), JSON.stringify({id: 'acp-startup', state: 'queued'}));
+	const startupChild = spawn(process.execPath, ['-e', workerText], {
+		cwd: acpDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(startupAcpSpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	const startupExit = Promise.withResolvers();
+	startupChild.on('exit', startupExit.resolve);
+	await startupExit.promise;
+	const startupLog = readFileSync(join(acpDir, 'logs', 'acp-startup.log'), 'utf8');
+	assert.match(startupLog, /PROMPT "AGENT DEFINITION[\s\S]*STARTUP-CONTEXT-X[\s\S]*TASK:\\nthe task"/, 'without the hook the bundle precedes the task');
+	assert.ok(startupLog.indexOf('ROSTER-LINE') < startupLog.indexOf('STARTUP-CONTEXT-X'), 'the roster precedes the startup bundle');
+	assert.match(startupLog, /STARTUP-CONTEXT-X/, 'the startup bundle reaches the worker prompt');
+
+	// The whole path: a memory definition is discovered, its directory is created,
+	// and its startup context lands in the worker spec.
+	writeAgent(
+		join(startupRoot, '.commandcode', 'agents'),
+		'memorizer.md',
+		'memorizer',
+		'remembers things',
+		'MEMORIZER BODY',
+		{memory: 'project', skills: 'review'},
+	);
+	const memorizerMemory = join(startupRoot, '.commandcode', 'agent-memory', 'memorizer');
+	mkdirSync(memorizerMemory, {recursive: true});
+	writeFileSync(join(memorizerMemory, 'MEMORY.md'), 'MEMORY-BODY');
+	const startupRuntime = makeRuntime({
+		now: () => fixedNow,
+		cwd: startupRoot,
+		home: startupHome,
+		run: (command, args) =>
+			command === 'git' && args[0] === 'status'
+				? {ok: true, stdout: '## main\n M file.ts'}
+				: {ok: false, stdout: ''},
+	});
+	const startupApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-startup-spawn-')),
+		session: makeSession(),
+		runtime: startupRuntime.runtime,
+	});
+	mod(startupApi.api, startupApi.runtime);
+	const startupSpawn = await toolOf(startupApi, 'subagent_spawn').run({
+		input: {description: 'remember', prompt: 'do it', subagent_type: 'memorizer', cwd: startupRoot},
+	});
+	assert.equal(startupSpawn.ok, true, 'a memory definition spawns');
+	const startupSpec = JSON.parse(startupRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.match(startupSpec.startup, /PROJECT-INSTRUCTIONS/, 'CLAUDE.md reaches the worker spec');
+	assert.match(startupSpec.startup, /# Git status\n## main/, 'the git status snapshot reaches the worker spec');
+	assert.match(startupSpec.startup, /SKILL-BODY-FULL/, 'preloaded skill content reaches the worker spec');
+	assert.match(startupSpec.startup, /MEMORY-BODY/, 'the bounded MEMORY.md reaches the worker spec');
+	assert.match(startupSpec.startup, /context window: 200000 tokens/, 'the model-sized context window is in the bundle');
+	ok('startup context reaches the worker: system prompt when hooked, prompt otherwise, and a memory definition end to end');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);

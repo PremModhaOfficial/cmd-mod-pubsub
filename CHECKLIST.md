@@ -200,10 +200,15 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [ ] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility.
 - [ ] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance.
 - [ ] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual.
-- [ ] `skills` full-content preload; unlisted skills still invocable.
+- [x] `skills` full-content preload; unlisted skills still invocable. (smoke 43: the named skill's
+  `SKILL.md` is in the bundle; discovery order is project walk-up, then user, for `.commandcode/skills`
+  and `.claude/skills`. An unlisted skill is simply not preloaded and stays with the host's Skill tool.)
 - [ ] `mcpServers` inline and referenced; trust; plugin ignored.
 - [ ] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
-- [ ] `memory` scopes, `MEMORY.md` 200 lines or 25KB, automatic Read/Write/Edit.
+- [x] `memory` scopes, `MEMORY.md` 200 lines or 25KB. (smoke 44: `memoryDirFor` for user, project and
+  local, the first 200 lines or 25KB of `MEMORY.md`, and the directory is created on spawn. The field is
+  parsed and recorded. `withMemoryTools` adds Read, Write and Edit; the tool resolver in the `tools`
+  item above is what applies it, and that item is still open.)
 - [ ] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
 - [ ] Unknown fields ignored without error.
 - [ ] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form.
@@ -211,8 +216,8 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 14: Context and persistence
 
-- [ ] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window.
-- [ ] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads.
+- [x] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window. (smoke 43: `buildStartupBundle` exposes each component and the rendered text. The roster field is rendered when supplied; the live roster is T9.)
+- [x] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads. (smoke 45: Explore/Plan drop the hierarchy, AGENTS.md and the snapshot; `omitClaudeMd` keeps managed policy only; a path-scoped CLAUDE.md still loads in both cases.)
 - [ ] Resume by agent id; Explore/Plan return no id; `maxTurns` partial; per-invocation model and effort survive resume.
 - [ ] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept.
 - [ ] Auto-compaction and the `compact_boundary` event.

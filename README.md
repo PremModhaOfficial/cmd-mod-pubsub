@@ -109,7 +109,7 @@ Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fa
 `general` is accepted as the host-reserved alias for `general-purpose`.
 
 Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
-`skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
+`skills`, `memory`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
 with a missing name or description, a bad first line, a colon or over-256-character name, or unparseable
 YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
 skip with its reason, and `/doctor` reports each duplicate and invalid file with the fix.
@@ -128,6 +128,27 @@ linked worktree applies the same checks to its own tools and to every subagent i
 With the mod installed, the body is injected through the host's `appendSystemPrompt` hook in the ACP
 worker. When the mod is loaded only with `--mod` (development), this host's `cmd acp` ignores `--mod`, so
 the worker carries the body at the front of the task prompt instead; the job log says which path ran.
+
+### Startup context
+
+Every agent job starts from a bundle built in the parent, not from the parent's conversation:
+
+- the definition body, the working directory, platform, date, model, and that model's context window;
+- the CLAUDE.md hierarchy (managed policy, user, each project directory from the root down, `CLAUDE.local.md`)
+  and `AGENTS.md`, loaded as project instructions;
+- a bounded `git status --short --branch` snapshot;
+- the full content of every skill named in `skills`;
+- the sibling roster, the output style, and the agent's own `MEMORY.md`.
+
+Explore and Plan skip the instruction hierarchy and the git snapshot. `omitClaudeMd` skips the user,
+project, and local CLAUDE.md files and `AGENTS.md`, keeping managed policy unless the agent is managed. A
+CLAUDE.md in a subdirectory the agent works with still loads in both cases. A subagent never inherits the
+parent's auto memory.
+
+`memory: user | project | local` creates `~/.commandcode/agent-memory/<name>/`,
+`<cwd>/.commandcode/agent-memory/<name>/`, or `<cwd>/.commandcode/agent-memory-local/<name>/`, and injects
+the first 200 lines or 25KB of its `MEMORY.md`, whichever comes first. The worker's system prompt carries
+the bundle when the `appendSystemPrompt` hook is live; otherwise it precedes the task in the prompt.
 
 `permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
 arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
@@ -283,7 +304,7 @@ interface, and the smoke test drives every one of them.
 
 | Seam | Interface | Why it is a module |
 | --- | --- | --- |
-| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs`, `git` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs`, `run` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. Worktree git goes through `run` via `gitSeam`. |
 | States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
 | Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
 | Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |
