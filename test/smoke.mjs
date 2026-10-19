@@ -4166,14 +4166,20 @@ process.stdin.on('data', (data) => {
 	assert.ok(tasksCommand, '/tasks is registered');
 	const openedFork = await tasksCommand.handler({args: `open ${forkId}`});
 	assert.match(String(openedFork.message), /ORANGE/, 'the task view opens the fork transcript');
+	const sendsBeforeView = forkRuntime.spawnCalls.length;
+	const viewSend = await tasksCommand.handler({args: `send ${forkId} steer from the panel`});
+	assert.match(String(viewSend.message), /resumed/i, '/tasks send resumes the fork');
+	assert.equal(forkRuntime.spawnCalls.length, sendsBeforeView + 1, 'the task view starts the follow-up');
+	const viewSendSpec = JSON.parse(forkRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(viewSendSpec.prompt, 'steer from the panel', 'the panel message is the follow-up turn');
 
 	// Stop: a running fork becomes canceled and emits exactly one signal.
 	writeFileSync(
 		join(forkDir, 'jobs', `${forkId}.json`),
 		JSON.stringify({...finishedFork, state: 'running', forkSessionId: undefined, pid: 646464, workerPid: undefined}, null, 2),
 	);
-	const stoppedFork = await toolOf(forkBundle, 'subagent_cancel').run({input: {id: forkId}});
-	assert.equal(stoppedFork.ok, true, JSON.stringify(stoppedFork));
+	const stoppedFork = await tasksCommand.handler({args: `stop ${forkId}`});
+	assert.match(String(stoppedFork.message), /canceled/i, '/tasks stop cancels the fork');
 	const stoppedRecord = JSON.parse(readFileSync(join(forkDir, 'jobs', `${forkId}.json`), 'utf8'));
 	assert.equal(stoppedRecord.state, 'canceled', 'x/stop cancels the fork');
 	assert.equal(stoppedRecord.owner ?? forkOwner, forkOwner, 'the canceled record keeps its owner');
