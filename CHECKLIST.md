@@ -8,14 +8,18 @@ Verification command: `node test/smoke.mjs`
 
 ## Phase 0: Baseline
 
-- [ ] Record current `cmd-mod-pubsub` test results.
-- [ ] Create branch `better-sub-agents`.
-- [ ] Copy `pubsub.ts` to `better-sub-agents.ts`.
-- [ ] Rename the repository to `cmd-mod-better-sub-agents`.
-- [ ] Update `package.json` name, version, description, repository, homepage, bugs, and files.
-- [ ] Update README title and install path.
-- [ ] Update CI paths.
-- Gate: the existing smoke test passes unchanged.
+- [x] Record current `cmd-mod-pubsub` test results.
+  - Baseline on `main` @ `977e74b` (`node test/smoke.mjs`): the 0.1.0 release script has no suite.
+  - Baseline on `better-sub-agents` @ `2a3d58d` before this pass: **21 ok / PASS** (Node 26.12.0).
+- [x] Create branch `better-sub-agents`.
+- [x] Copy `pubsub.ts` to `better-sub-agents.ts` (`git mv`, so the history follows the file).
+- [ ] Rename the repository to `cmd-mod-better-sub-agents`. (Deferred to Phase 10 by instruction: the
+  GitHub URL in `package.json` stays `cmd-mod-pubsub` until the repository itself is renamed.)
+- [x] Update `package.json` name, version, description, repository, homepage, bugs, and files.
+- [x] Update README title and install path.
+- [x] Update CI paths. (`ci.yml` runs `node test/smoke.mjs`, which is path-free; the import inside the
+  suite moved to `../better-sub-agents.ts`. A grep for `pubsub.ts` finds only the deprecated aliases.)
+- Gate: the existing smoke test passes unchanged. — **21 ok / PASS after the rename.**
 
 ## Phase 1: Spec and harness
 

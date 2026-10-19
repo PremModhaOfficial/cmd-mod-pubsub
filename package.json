@@ -1,15 +1,16 @@
 {
-	"name": "cmd-mod-pubsub",
-	"version": "0.1.0",
-	"description": "Command Code mod: fire-and-forget async jobs that signal back to the session that fired them",
+	"name": "cmd-mod-better-sub-agents",
+	"version": "2.0.0",
+	"description": "Command Code mod: async subagents that run detached and signal their result back to the session that spawned them",
 	"type": "module",
 	"license": "MIT",
 	"author": "Prem Modha",
 	"keywords": [
 		"cmd-mod",
 		"command-code",
-		"pubsub",
-		"async-agents"
+		"subagents",
+		"async-agents",
+		"pubsub"
 	],
 	"repository": {
 		"type": "git",
@@ -20,12 +21,13 @@
 		"url": "https://github.com/PremModhaOfficial/cmd-mod-pubsub/issues"
 	},
 	"files": [
-		"pubsub.ts",
+		"better-sub-agents.ts",
 		"README.md",
 		"LICENSE"
 	],
 	"scripts": {
-		"test": "node test/smoke.mjs"
+		"test": "node test/smoke.mjs",
+		"test:e2e": "node test/e2e.mjs"
 	},
 	"engines": {
 		"node": ">=22.18"

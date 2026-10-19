@@ -1,6 +1,6 @@
-// Smoke test for the pubsub mod.
+// Smoke test for the better-sub-agents mod.
 //
-// Runs against the real `pubsub.ts` source with Node's native TypeScript type
+// Runs against the real `better-sub-agents.ts` source with Node's native TypeScript
 // stripping, so no build step and no dependencies. Everything the mod touches
 // (spool dirs, session transcript, UI, OS) is a fake.
 //
@@ -31,7 +31,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod, {jobStates, ledgerFactory} from '../pubsub.ts';
+import mod, {jobStates, ledgerFactory} from '../better-sub-agents.ts';
 
 // ---------------------------------------------------------------- assertions
 
@@ -256,10 +256,10 @@ function ownerEntries(session) {
 // The detached worker is a string in the mod, so a syntax error in it would only
 // surface inside a process nobody is watching. Compile it here instead.
 function workerSource() {
-	const source = readFileSync(new URL('../pubsub.ts', import.meta.url), 'utf8');
+	const source = readFileSync(new URL('../better-sub-agents.ts', import.meta.url), 'utf8');
 	const start = source.indexOf('const WORKER_SOURCE = `');
 	const end = source.indexOf('\n`;', start);
-	assert.ok(start > 0 && end > start, 'WORKER_SOURCE must be findable in pubsub.ts');
+	assert.ok(start > 0 && end > start, 'WORKER_SOURCE must be findable in better-sub-agents.ts');
 	const literal = source.slice(start + 'const WORKER_SOURCE = '.length, end + 2);
 	return Function(`"use strict"; return ${literal};`)();
 }

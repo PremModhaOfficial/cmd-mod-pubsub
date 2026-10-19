@@ -1,4 +1,4 @@
-# cmd-mod-pubsub
+# cmd-mod-better-sub-agents
 
 A [Command Code](https://github.com/PremModhaOfficial) mod that turns a blocking "fire an agent and wait"
 into **fire-and-forget**: you start a worker, your session carries on immediately, and when the worker
@@ -31,14 +31,14 @@ one JSON file and exits. If a signal lands while no session is running, it is st
 
 ```bash
 # as a global mod
-cp pubsub.ts ~/.commandcode/mods/
+cp better-sub-agents.ts ~/.commandcode/mods/
 
 # or load it for one run, without installing
-cmd --mod ./pubsub.ts
+cmd --mod ./better-sub-agents.ts
 ```
 
 No dependencies, no build step, no `npm install`. The mod is a single file: the detached worker's source
-is inlined into it, so `pubsub.ts` is the whole mod.
+is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 ## Tools
 
@@ -196,7 +196,7 @@ state code and would make the `waiting-input` heuristic a unit test, but it need
 node test/smoke.mjs   # prints PASS
 ```
 
-The smoke test imports `pubsub.ts` directly with Node's native TypeScript type stripping and drives it with
+The smoke test imports `better-sub-agents.ts` directly with Node's native TypeScript type stripping and drives it with
 a fake `ModApi` and a fake `Runtime` — no dependencies, no build, no network, no process. It covers the
 public surface (tools, command, flags, renderer, pane, hooks, timers) and each seam on its own: the runtime
 seam is really used (one spawn, both kills through the injected `kill`, the injected clock on the record),
