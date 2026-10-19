@@ -2,7 +2,7 @@
 //
 // Runs against the real `pubsub.ts` source with Node's native TypeScript type
 // stripping, so no build step and no dependencies. Everything the mod touches
-// (spool dirs, session transcript, UI) is a fake.
+// (spool dirs, session transcript, UI, OS) is a fake.
 //
 // What this proves:
 //   1. the file is loadable as an ES module and default-exports a factory
@@ -11,9 +11,11 @@
 //   4. two sessions get DIFFERENT owner tokens, and a drain in session B never
 //      delivers a signal fired by session A  <- the cross-session isolation invariant
 //   5. untagged legacy signals are quarantined to `orphaned/`, never delivered
+//   6. the runtime seam is real: spawn, kill and the clock come from the second
+//      factory argument, so the OS never runs during the suite
 
 import assert from 'node:assert/strict';
-import {existsSync, mkdtempSync, readdirSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
@@ -51,13 +53,51 @@ function makeSession() {
 	};
 }
 
-// A ModApi fake. Every member the harness exposes to a mod is present, even the
-// ones pubsub does not use, so a future version cannot silently start crashing.
-function makeApi({spoolDir, session}) {
+// The OS seam. The mod takes a runtime object as the second factory argument:
+// spawn, kill, the clock and the spool filesystem. Production fills it from the
+// OS; here it is a fake, so a spawn failure or a cancel escalation is a function
+// call instead of a process.
+function makeChild({pid = 424242} = {}) {
+	const handlers = new Map();
+	return {
+		pid,
+		on(event, handler) {
+			const list = handlers.get(event) ?? [];
+			list.push(handler);
+			handlers.set(event, list);
+		},
+		unref() {},
+		kill() {},
+		// test-only: drive the handle's listeners
+		emit(event, value) {
+			for (const handler of handlers.get(event) ?? []) handler(value);
+		},
+	};
+}
+
+function makeRuntime(overrides = {}) {
+	const spawnCalls = [];
+	const kills = [];
+	const runtime = {
+		spawn(command, args, options) {
+			const child = makeChild();
+			spawnCalls.push({command, args, options, child});
+			return child;
+		},
+		kill(pid, signal) {
+			kills.push({pid, signal});
+		},
+		...overrides,
+	};
+	return {runtime, spawnCalls, kills};
+}
+
+// A ModApi fake with exactly the surface the mod uses. No speculative members:
+// if the mod starts reaching for something else, the suite fails loudly.
+function makeApi({spoolDir, session, runtime}) {
 	const toolDefs = [];
 	const commandDefs = [];
 	const rendererDefs = [];
-	const shortcutDefs = [];
 	const flagDefs = new Map();
 	const flagOverrides = new Map([['pubsub_dir', spoolDir]]);
 	const registeredHooks = {};
@@ -66,15 +106,10 @@ function makeApi({spoolDir, session}) {
 	const afterTicks = [];
 	const paneDefs = [];
 	const openPaneCalls = [];
-	const closePaneCalls = [];
-	const refreshWidgetCalls = [];
 	const statusCalls = [];
 	const shownEntries = [];
 	const userMessages = [];
 	const stateValues = new Map();
-	const stateSubscribers = [];
-	const storeValues = new Map();
-	const eventHandlers = new Map();
 
 	const api = {
 		// ---- registration
@@ -93,9 +128,6 @@ function makeApi({spoolDir, session}) {
 		},
 		addCommand(def) {
 			commandDefs.push(def);
-		},
-		addShortcut(def) {
-			shortcutDefs.push(def);
 		},
 		hooks(h) {
 			Object.assign(registeredHooks, h);
@@ -116,9 +148,6 @@ function makeApi({spoolDir, session}) {
 		},
 		sendUserMessage(text, options) {
 			userMessages.push({text, options});
-			return true;
-		},
-		isIdle() {
 			return true;
 		},
 
@@ -142,36 +171,6 @@ function makeApi({spoolDir, session}) {
 			set(key, value) {
 				stateValues.set(key, value);
 			},
-			subscribe(fn) {
-				stateSubscribers.push(fn);
-				return () => {};
-			},
-		},
-		store: {
-			get(key) {
-				return storeValues.get(key);
-			},
-			set(key, value) {
-				storeValues.set(key, value);
-			},
-			delete(key) {
-				storeValues.delete(key);
-			},
-			clear() {
-				storeValues.clear();
-			},
-		},
-		events: {
-			on(name, handler) {
-				eventHandlers.set(name, handler);
-				return () => {};
-			},
-			off(name) {
-				eventHandlers.delete(name);
-			},
-			emit() {
-				return undefined;
-			},
 		},
 
 		// ---- ui
@@ -184,13 +183,7 @@ function makeApi({spoolDir, session}) {
 				openPaneCalls.push(id);
 				return true;
 			},
-			closePane(id) {
-				closePaneCalls.push(id);
-				return true;
-			},
-			refreshWidgets() {
-				refreshWidgetCalls.push(Date.now());
-			},
+			refreshWidgets() {},
 			setStatus(text) {
 				statusCalls.push(text);
 			},
@@ -199,23 +192,14 @@ function makeApi({spoolDir, session}) {
 
 		// ---- process surface
 		cwd: process.cwd(),
-		exec() {
-			return Promise.resolve({code: 0, stdout: '', stderr: ''});
-		},
-		process: {
-			spawn() {
-				return {pid: 424242, on() {}, unref() {}, kill() {}};
-			},
-			pid: process.pid,
-		},
 	};
 
 	return {
 		api,
+		runtime,
 		toolDefs,
 		commandDefs,
 		rendererDefs,
-		shortcutDefs,
 		flagDefs,
 		registeredHooks,
 		listeners,
@@ -251,11 +235,11 @@ try {
 	const spoolDir = mkdtempSync(join(tmpdir(), 'pubsub-smoke-'));
 	const sessionA = makeSession();
 	const sessionB = makeSession();
-	const a = makeApi({spoolDir, session: sessionA});
-	const b = makeApi({spoolDir, session: sessionB});
+	const a = makeApi({spoolDir, session: sessionA, runtime: makeRuntime().runtime});
+	const b = makeApi({spoolDir, session: sessionB, runtime: makeRuntime().runtime});
 
-	mod(a.api);
-	mod(b.api);
+	mod(a.api, a.runtime);
+	mod(b.api, b.runtime);
 	ok('factory ran twice (two sessions, one shared spool)');
 
 	// 2. registration -------------------------------------------------------
@@ -363,6 +347,50 @@ try {
 	);
 	assert.equal((await fire.run({input: {command: 'true'}})).ok, false, 'pubsub_fire requires a label');
 	ok('tool input validation and list/cancel paths behave');
+
+	// 9. runtime seam -------------------------------------------------------
+	// A fresh spool and a fake clock, so these assertions cannot be perturbed by
+	// the shared-spool sections above.
+	const seamDir = mkdtempSync(join(tmpdir(), 'pubsub-seam-'));
+	const fixedNow = 1_700_000_000_000;
+	const seamRuntime = makeRuntime({now: () => fixedNow});
+	const seamSession = makeSession();
+	const c = makeApi({spoolDir: seamDir, session: seamSession, runtime: seamRuntime.runtime});
+	mod(c.api, c.runtime);
+
+	const seamFire = c.toolDefs.find((def) => def.schema.name === 'pubsub_fire');
+	const fired = await seamFire.run({input: {label: 'seam', command: 'printf hi'}});
+	assert.equal(fired.ok, true, `pubsub_fire must succeed through the fake runtime: ${JSON.stringify(fired)}`);
+	assert.equal(seamRuntime.spawnCalls.length, 1, 'exactly one spawn must come out of the injected runtime');
+	const spawnCall = seamRuntime.spawnCalls[0];
+	assert.equal(spawnCall.command, process.execPath, 'the detached worker runs on the current node');
+	assert.equal(spawnCall.args[0], '-e', 'the worker source is passed with -e');
+	assert.equal(spawnCall.options.detached, true, 'the worker is detached');
+	assert.equal(spawnCall.options.env.PUBSUB_WORKER, '1', 'the worker is marked as a worker');
+	const spec = JSON.parse(spawnCall.options.env.PUBSUB_SPEC);
+	assert.equal(spec.label, 'seam', 'the job spec carries the label');
+	assert.equal(spec.command, 'printf hi', 'the job spec carries the command');
+	const firedId = spec.id;
+
+	const recordPath = join(seamDir, 'jobs', `${firedId}.json`);
+	const record = JSON.parse(readFileSync(recordPath, 'utf8'));
+	assert.equal(record.startedAt, fixedNow, 'the job record uses the injected clock');
+	assert.equal(record.workerPid, 424242, 'the injected worker pid lands on the record');
+
+	seamRuntime.kills.length = 0;
+	const seamCancel = c.toolDefs.find((def) => def.schema.name === 'pubsub_cancel');
+	const canceledJob = await seamCancel.run({input: {id: firedId}});
+	assert.equal(canceledJob.ok, true, `pubsub_cancel must cancel the fired job: ${JSON.stringify(canceledJob)}`);
+	assert.deepEqual(
+		seamRuntime.kills[0],
+		{pid: 424242, signal: 'SIGTERM'},
+		'the first kill goes through the injected runtime',
+	);
+	const escalate = c.afterTicks.at(-1);
+	assert.equal(typeof escalate?.fn, 'function', 'cancel schedules a SIGKILL escalation');
+	escalate.fn();
+	assert.deepEqual(seamRuntime.kills.at(-1), {pid: 424242, signal: 'SIGKILL'}, 'escalation also uses the runtime');
+	ok('spawn, kill and the clock all cross the runtime seam');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

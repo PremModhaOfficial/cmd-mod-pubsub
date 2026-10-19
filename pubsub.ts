@@ -203,6 +203,106 @@ process.on('uncaughtException', err => {
 });
 `;
 
+// ---------------------------------------------------------------------------
+// Runtime seam
+//
+// Every OS call the mod makes goes through one interface: the clock, spawning and
+// killing processes, and the spool filesystem. Production wires the OS adapter
+// below; a test passes fakes, so spawn failure, kill escalation and clock-driven
+// recovery are drivable without a real process, a real wait or a real crash.
+// ---------------------------------------------------------------------------
+
+export interface ChildHandle {
+	readonly pid?: number;
+	on(event: 'error', handler: (error: unknown) => void): void;
+	on(event: 'exit', handler: (code: number | null, signal: string | null) => void): void;
+	unref(): void;
+	kill(signal?: string): void;
+}
+
+export interface SpawnOptions {
+	cwd?: string;
+	detached?: boolean;
+	stdio?: 'ignore' | Array<'ignore' | number>;
+	env?: Record<string, string | undefined>;
+}
+
+export interface SpoolFs {
+	mkdir(dir: string): void;
+	readdir(dir: string): string[];
+	readFile(file: string): string;
+	writeFile(file: string, data: string): void;
+	appendFile(file: string, data: string): void;
+	rename(from: string, to: string): void;
+	remove(file: string): void;
+	stat(file: string): {size: number; mtimeMs: number};
+}
+
+export interface Runtime {
+	now(): number;
+	spawn(command: string, args: string[], options: SpawnOptions): ChildHandle;
+	kill(pid: number, signal: string): void;
+	alive(pid: unknown): boolean;
+	readonly pid: number;
+	readonly execPath: string;
+	readonly env: Record<string, string | undefined>;
+	readonly fs: SpoolFs;
+}
+
+export type RuntimeOverrides = Partial<Omit<Runtime, 'fs'>> & {fs?: Partial<SpoolFs>};
+
+function osSpoolFs(): SpoolFs {
+	return {
+		mkdir: dir => {
+			mkdirSync(dir, {recursive: true});
+		},
+		readdir: dir => readdirSync(dir),
+		readFile: file => readFileSync(file, 'utf8'),
+		writeFile: (file, data) => writeFileSync(file, data),
+		appendFile: (file, data) => appendFileSync(file, data),
+		rename: (from, to) => renameSync(from, to),
+		remove: file => {
+			rmSync(file, {force: true, recursive: true});
+		},
+		stat: file => {
+			const stats = statSync(file);
+			return {size: stats.size, mtimeMs: stats.mtimeMs};
+		},
+	};
+}
+
+// The production adapter. Only this object is allowed to name node:fs,
+// node:child_process or process.
+const OS_RUNTIME: Runtime = {
+	now: () => Date.now(),
+	spawn: (command, args, options) => spawn(command, args, options as never) as unknown as ChildHandle,
+	kill: (pid, signal) => {
+		process.kill(pid, signal as never);
+	},
+	alive: pid => {
+		if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+		try {
+			process.kill(pid, 0);
+			return true;
+		} catch (error) {
+			return (error as {code?: string}).code === 'EPERM';
+		}
+	},
+	pid: process.pid,
+	execPath: process.execPath,
+	env: process.env,
+	fs: osSpoolFs(),
+};
+
+// The test adapter is the same interface with functions swapped out.
+function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
+	return {
+		...OS_RUNTIME,
+		...overrides,
+		fs: {...OS_RUNTIME.fs, ...overrides.fs},
+	};
+}
+
 interface Signal {
 	readonly id: string;
 	readonly owner?: string;
@@ -243,7 +343,10 @@ interface JobRecord {
 	awaitingInput?: boolean;
 }
 
-export default function (cmd: ModApi): void {
+export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
+	const runtime = osRuntime(overrides);
+	// Below this line the spool is touched only through the injected filesystem.
+	const spool = runtime.fs;
 	cmd.addFlag('pubsub_dir', {
 		type: 'string',
 		default: join(homedir(), '.commandcode', 'pubsub'),
@@ -263,12 +366,12 @@ export default function (cmd: ModApi): void {
 	const jobsDir = join(root, 'jobs');
 	const ledgerPath = join(root, 'delivered.jsonl');
 	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir]) {
-		mkdirSync(dir, {recursive: true});
+		spool.mkdir(dir);
 	}
 
 	// A headless worker loads this mod too. It has its own owner token and must never
 	// steal an unaddressed signal from the session that fired it.
-	const workerMode = process.env.PUBSUB_WORKER === '1';
+	const workerMode = runtime.env.PUBSUB_WORKER === '1';
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
 		cmd.getFlag('pubsub_deliver') === 'follow-up' ? 'follow-up' : 'steer';
@@ -307,7 +410,7 @@ export default function (cmd: ModApi): void {
 		}
 	}
 	function requireOwner(): string {
-		return ensureOwner() ?? `process-${process.pid}`;
+		return ensureOwner() ?? `process-${runtime.pid}`;
 	}
 
 	// A renderer so a signal shows up as a real feed row rather than raw JSON.
@@ -328,7 +431,7 @@ export default function (cmd: ModApi): void {
 	const rememberDelivered = (id: string): void => {
 		deliveredIds.add(id);
 		try {
-			appendFileSync(ledgerPath, JSON.stringify({id, at: Date.now()}) + '\n');
+			spool.appendFile(ledgerPath, JSON.stringify({id, at: runtime.now()}) + '\n');
 		} catch {
 			/* the in-memory set still protects this process */
 		}
@@ -336,7 +439,7 @@ export default function (cmd: ModApi): void {
 	};
 
 	try {
-		const raw = readFileSync(ledgerPath, 'utf8');
+		const raw = spool.readFile(ledgerPath);
 		for (const line of raw.split('\n').filter(Boolean).slice(-DELIVERED_LEDGER_MAX)) {
 			try {
 				const entry = JSON.parse(line) as {id?: unknown};
@@ -349,9 +452,9 @@ export default function (cmd: ModApi): void {
 		/* no ledger yet */
 	}
 	try {
-		if (statSync(ledgerPath).size > LEDGER_COMPACT_BYTES) {
+		if (spool.stat(ledgerPath).size > LEDGER_COMPACT_BYTES) {
 			const keep = [...deliveredIds].slice(-2000);
-			writeFileSync(ledgerPath, keep.map(id => JSON.stringify({id, at: Date.now()})).join('\n') + '\n');
+			spool.writeFile(ledgerPath, keep.map(id => JSON.stringify({id, at: runtime.now()})).join('\n') + '\n');
 		}
 	} catch {
 		/* no ledger, or another process won the rewrite */
@@ -389,7 +492,7 @@ export default function (cmd: ModApi): void {
 
 	function readJob(id: string): JobRecord | undefined {
 		try {
-			const parsed = JSON.parse(readFileSync(join(jobsDir, `${id}.json`), 'utf8')) as JobRecord;
+			const parsed = JSON.parse(spool.readFile(join(jobsDir, `${id}.json`))) as JobRecord;
 			return parsed && typeof parsed.id === 'string' ? parsed : undefined;
 		} catch {
 			return undefined;
@@ -399,9 +502,9 @@ export default function (cmd: ModApi): void {
 	function writeJob(record: JobRecord): void {
 		try {
 			const file = join(jobsDir, `${record.id}.json`);
-			const tmp = `${file}.mod-${process.pid}-${Date.now()}`;
-			writeFileSync(tmp, JSON.stringify(record, null, 2));
-			renameSync(tmp, file);
+			const tmp = `${file}.mod-${runtime.pid}-${runtime.now()}`;
+			spool.writeFile(tmp, JSON.stringify(record, null, 2));
+			spool.rename(tmp, file);
 		} catch {
 			/* the in-memory list still shows it */
 		}
@@ -410,7 +513,7 @@ export default function (cmd: ModApi): void {
 	function readRecentJobs(limit: number): JobRecord[] {
 		let names: string[];
 		try {
-			names = readdirSync(jobsDir).filter(name => name.endsWith('.json') && !name.includes('.tmp-'));
+			names = spool.readdir(jobsDir).filter(name => name.endsWith('.json') && !name.includes('.tmp-'));
 		} catch {
 			return [];
 		}
@@ -418,7 +521,7 @@ export default function (cmd: ModApi): void {
 		const jobs: JobRecord[] = [];
 		for (const name of names.slice(-limit).reverse()) {
 			try {
-				jobs.push(JSON.parse(readFileSync(join(jobsDir, name), 'utf8')) as JobRecord);
+				jobs.push(JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord);
 			} catch {
 				/* skip a torn record */
 			}
@@ -428,10 +531,10 @@ export default function (cmd: ModApi): void {
 
 	function enqueueSignal(message: Signal): void {
 		try {
-			const stamp = `${Date.now()}-${message.id}-${process.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
+			const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
 			const tmp = join(inboxDir, `.tmp-${stamp}`);
-			writeFileSync(tmp, JSON.stringify(message, null, 2));
-			renameSync(tmp, join(inboxDir, stamp));
+			spool.writeFile(tmp, JSON.stringify(message, null, 2));
+			spool.rename(tmp, join(inboxDir, stamp));
 		} catch {
 			/* a durable signal is best effort; the job record still has the result */
 		}
@@ -449,16 +552,16 @@ export default function (cmd: ModApi): void {
 
 	function quarantine(file: string, name: string): void {
 		try {
-			renameSync(file, join(orphanedDir, `${Date.now()}-${Math.random().toString(36).slice(2, 6)}-${name}`));
+			spool.rename(file, join(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${name}`));
 		} catch {
-			rmSync(file, {force: true});
+			spool.remove(file);
 		}
 	}
 
 	function markDelivered(id: string): void {
 		const job = readJob(id);
 		if (job === undefined) return;
-		job.deliveredAt = Date.now();
+		job.deliveredAt = runtime.now();
 		job.updatedAt = job.deliveredAt;
 		writeJob(job);
 	}
@@ -482,30 +585,30 @@ export default function (cmd: ModApi): void {
 		if (draining) return;
 		draining = true;
 		try {
-			const names = readdirSync(inboxDir).filter(name => name.endsWith('.json'));
+			const names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
 			for (const name of names.slice(0, FILES_PER_DRAIN_MAX)) {
 				const live = join(inboxDir, name);
 				const claimed = join(claimedDir, name);
 				// Claim by rename first: rename is atomic, so exactly one drainer wins a
 				// given file even if two sessions are running against one spool.
 				try {
-					renameSync(live, claimed);
+					spool.rename(live, claimed);
 				} catch {
 					continue;
 				}
 				let message: Signal;
 				try {
-					message = JSON.parse(readFileSync(claimed, 'utf8')) as Signal;
+					message = JSON.parse(spool.readFile(claimed)) as Signal;
 				} catch {
-					rmSync(claimed, {force: true});
+					spool.remove(claimed);
 					continue;
 				}
 				if (typeof message.id !== 'string' || message.id.length === 0) {
-					rmSync(claimed, {force: true});
+					spool.remove(claimed);
 					continue;
 				}
 				if (deliveredIds.has(message.id)) {
-					rmSync(claimed, {force: true});
+					spool.remove(claimed);
 					continue;
 				}
 				const owner = classify(message);
@@ -516,7 +619,7 @@ export default function (cmd: ModApi): void {
 				if (owner !== 'mine') {
 					// Another session's result, or ownership not known yet. Put it back.
 					try {
-						renameSync(claimed, live);
+						spool.rename(claimed, live);
 					} catch {
 						/* it stays claimable and will be swept later if abandoned */
 					}
@@ -524,12 +627,12 @@ export default function (cmd: ModApi): void {
 				}
 				try {
 					deliver(message);
-					rmSync(claimed, {force: true});
+					spool.remove(claimed);
 				} catch {
 					// No session bound yet. Put it back so the next tick can deliver it
 					// instead of dropping the signal on the floor.
 					try {
-						renameSync(claimed, live);
+						spool.rename(claimed, live);
 					} catch {
 						/* keep it in claimed/; a later run can still drain that */
 					}
@@ -555,7 +658,7 @@ export default function (cmd: ModApi): void {
 		const out: Signal[] = [];
 		let names: string[];
 		try {
-			names = readdirSync(inboxDir).filter(name => name.endsWith('.json'));
+			names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
 		} catch {
 			return out;
 		}
@@ -563,23 +666,23 @@ export default function (cmd: ModApi): void {
 			const live = join(inboxDir, name);
 			const claimed = join(claimedDir, name);
 			try {
-				renameSync(live, claimed);
+				spool.rename(live, claimed);
 			} catch {
 				continue;
 			}
 			let message: Signal | undefined;
 			try {
-				message = JSON.parse(readFileSync(claimed, 'utf8')) as Signal;
+				message = JSON.parse(spool.readFile(claimed)) as Signal;
 			} catch {
-				rmSync(claimed, {force: true});
+				spool.remove(claimed);
 				continue;
 			}
 			if (typeof message.id !== 'string' || message.id.length === 0) {
-				rmSync(claimed, {force: true});
+				spool.remove(claimed);
 				continue;
 			}
 			if (deliveredIds.has(message.id)) {
-				rmSync(claimed, {force: true});
+				spool.remove(claimed);
 				continue;
 			}
 			const owner = classify(message);
@@ -589,16 +692,16 @@ export default function (cmd: ModApi): void {
 			}
 			if (owner !== 'mine') {
 				try {
-					renameSync(claimed, live);
+					spool.rename(claimed, live);
 				} catch {
-					rmSync(claimed, {force: true});
+					spool.remove(claimed);
 				}
 				continue;
 			}
 			rememberDelivered(message.id);
 			markDelivered(message.id);
 			out.push(message);
-			rmSync(claimed, {force: true});
+			spool.remove(claimed);
 		}
 		return out;
 	}
@@ -606,17 +709,17 @@ export default function (cmd: ModApi): void {
 	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
 	// that died between claim and remove so a long-lived spool cannot grow forever.
 	function sweepClaimed(): void {
-		const now = Date.now();
+		const now = runtime.now();
 		let names: string[];
 		try {
-			names = readdirSync(claimedDir);
+			names = spool.readdir(claimedDir);
 		} catch {
 			return;
 		}
 		for (const name of names) {
 			const file = join(claimedDir, name);
 			try {
-				if (now - statSync(file).mtimeMs > CLAIMED_TTL_MS) rmSync(file, {force: true});
+				if (now - spool.stat(file).mtimeMs > CLAIMED_TTL_MS) spool.remove(file);
 			} catch {
 				/* another drain won it */
 			}
@@ -625,38 +728,28 @@ export default function (cmd: ModApi): void {
 
 	function sweepOrphaned(): void {
 		if (workerMode) return;
-		const now = Date.now();
+		const now = runtime.now();
 		let names: string[];
 		try {
-			names = readdirSync(orphanedDir);
+			names = spool.readdir(orphanedDir);
 		} catch {
 			return;
 		}
 		for (const name of names) {
 			const file = join(orphanedDir, name);
 			try {
-				if (now - statSync(file).mtimeMs > ORPHANED_TTL_MS) rmSync(file, {force: true});
+				if (now - spool.stat(file).mtimeMs > ORPHANED_TTL_MS) spool.remove(file);
 			} catch {
 				/* another process won it */
 			}
 		}
 	}
 
-	function pidAlive(pid: unknown): boolean {
-		if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as {code?: string}).code === 'EPERM';
-		}
-	}
-
 	function hasPendingSignal(id: string): boolean {
 		try {
 			return (
-				readdirSync(inboxDir).some(name => name.includes(id)) ||
-				readdirSync(claimedDir).some(name => name.includes(id))
+				spool.readdir(inboxDir).some(name => name.includes(id)) ||
+				spool.readdir(claimedDir).some(name => name.includes(id))
 			);
 		} catch {
 			return false;
@@ -668,11 +761,11 @@ export default function (cmd: ModApi): void {
 	// one with no signal on disk means the result is gone.
 	function reconcileJobs(): void {
 		if (workerMode) return;
-		const now = Date.now();
+		const now = runtime.now();
 		for (const job of readRecentJobs(RECONCILE_SCAN_MAX)) {
 			const state = canonicalState(job.state);
 			if (state === 'queued' || state === 'running') {
-				if (pidAlive(job.pid) || pidAlive(job.workerPid)) continue;
+				if (runtime.alive(job.pid) || runtime.alive(job.workerPid)) continue;
 				if (hasPendingSignal(job.id)) continue;
 				const startedAt = Number(job.startedAt ?? 0) || 0;
 				if (now - startedAt < LOST_GRACE_MS) continue;
@@ -697,14 +790,14 @@ export default function (cmd: ModApi): void {
 	function countPending(): number {
 		let names: string[];
 		try {
-			names = readdirSync(inboxDir).filter(name => name.endsWith('.json'));
+			names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
 		} catch {
 			return 0;
 		}
 		let count = 0;
 		for (const name of names.slice(0, 500)) {
 			try {
-				const message = JSON.parse(readFileSync(join(inboxDir, name), 'utf8')) as Signal;
+				const message = JSON.parse(spool.readFile(join(inboxDir, name))) as Signal;
 				if (typeof message.id === 'string' && !deliveredIds.has(message.id) && classify(message) === 'mine') count++;
 			} catch {
 				/* torn file */
@@ -715,7 +808,7 @@ export default function (cmd: ModApi): void {
 
 	function countOrphaned(): number {
 		try {
-			return readdirSync(orphanedDir).length;
+			return spool.readdir(orphanedDir).length;
 		} catch {
 			return 0;
 		}
@@ -753,7 +846,7 @@ export default function (cmd: ModApi): void {
 		if (signature !== lastJobsSignature) {
 			lastJobsSignature = signature;
 			try {
-				cmd.state.set('jobsTick', Date.now());
+				cmd.state.set('jobsTick', runtime.now());
 			} catch {
 				/* pre-bind or a host without state */
 			}
@@ -821,7 +914,7 @@ export default function (cmd: ModApi): void {
 	function killPid(pid: unknown, signal: string): void {
 		if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return;
 		try {
-			process.kill(pid, signal as never);
+			runtime.kill(pid, signal as never);
 		} catch {
 			/* already gone */
 		}
@@ -833,7 +926,7 @@ export default function (cmd: ModApi): void {
 		const state = canonicalState(job.state);
 		if (TERMINAL_STATES.has(state)) return `pubsub: job ${id} is already ${state}`;
 
-		const now = Date.now();
+		const now = runtime.now();
 		const startedAt = Number(job.startedAt ?? now) || now;
 		job.state = 'canceled';
 		job.canceledAt = now;
@@ -974,10 +1067,10 @@ export default function (cmd: ModApi): void {
 			}
 
 			const owner = requireOwner();
-			const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 			const cwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
 			const logPath = join(logsDir, `${id}.log`);
-			const startedAt = Date.now();
+			const startedAt = runtime.now();
 			const kind = prompt !== undefined ? 'agent' : 'command';
 			const spec = {
 				id,
@@ -990,7 +1083,7 @@ export default function (cmd: ModApi): void {
 				jobsDir,
 				startedAt,
 				tailMax: LOG_TAIL_BYTES_MAX,
-				bin: process.env.COMMANDCODE_BIN ?? 'cmd',
+				bin: runtime.env.COMMANDCODE_BIN ?? 'cmd',
 				sessionId,
 				...(prompt !== undefined ? {prompt} : {command}),
 			};
@@ -1016,14 +1109,14 @@ export default function (cmd: ModApi): void {
 
 			let worker;
 			try {
-				worker = spawn(process.execPath, ['-e', WORKER_SOURCE], {
+				worker = runtime.spawn(runtime.execPath, ['-e', WORKER_SOURCE], {
 					cwd,
 					detached: true,
 					stdio: 'ignore',
-					env: {...process.env, PUBSUB_SPEC: JSON.stringify(spec), PUBSUB_WORKER: '1'},
+					env: {...runtime.env, PUBSUB_SPEC: JSON.stringify(spec), PUBSUB_WORKER: '1'},
 				});
 			} catch (error) {
-				const now = Date.now();
+				const now = runtime.now();
 				record.state = 'failed';
 				record.failureReason = `spawn error: ${String((error as Error)?.message ?? error)}`;
 				record.finishedAt = now;
@@ -1045,7 +1138,7 @@ export default function (cmd: ModApi): void {
 			worker.on('error', error => {
 				const current = readJob(id);
 				if (current !== undefined && canonicalState(current.state) === 'canceled') return;
-				const now = Date.now();
+				const now = runtime.now();
 				writeJob({
 					...(current ?? record),
 					id,
@@ -1068,7 +1161,7 @@ export default function (cmd: ModApi): void {
 			worker.unref();
 
 			if (typeof worker.pid !== 'number') {
-				const now = Date.now();
+				const now = runtime.now();
 				record.state = 'failed';
 				record.failureReason = 'the worker process did not start';
 				record.finishedAt = now;
@@ -1088,7 +1181,7 @@ export default function (cmd: ModApi): void {
 			// `running`, and a blind overwrite would drag it back to `queued`.
 			const latest = readJob(id) ?? record;
 			latest.workerPid = worker.pid;
-			latest.updatedAt = Date.now();
+			latest.updatedAt = runtime.now();
 			writeJob(latest);
 			refreshJobs();
 			return {
@@ -1125,7 +1218,7 @@ export default function (cmd: ModApi): void {
 			if (title.length === 0) return {ok: false, error: 'title is required'};
 			const body = typeof input.body === 'string' ? input.body : '';
 			const owner = requireOwner();
-			const id = `direct-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 			enqueueSignal({
 				id,
 				owner,
