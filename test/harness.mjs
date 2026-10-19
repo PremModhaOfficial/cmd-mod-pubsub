@@ -113,6 +113,11 @@ export function makeRuntime(overrides = {}) {
 			return false;
 		},
 		async sleep() {},
+		// Not a repository by default: worktree code that runs without an explicit
+		// answer fails closed instead of touching the developer's real git.
+		git() {
+			return {code: 128, stdout: '', stderr: 'not a git repository'};
+		},
 		...overrides,
 	};
 	return {runtime, spawnCalls, kills};

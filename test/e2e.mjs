@@ -8,16 +8,19 @@
 //   2. a real ACP agent job runs to completion and signals
 //   3. a job that overruns its timeout is killed and reports a timeout
 //   4. a finished agent job is resumed in its own worker session
+//   5. a real git worktree is created from the default branch, removed when
+//      unchanged, and kept when changed
 //
 // Requires: `cmd` on PATH (or COMMANDCODE_BIN), a signed-in Command Code, and
 // network. Not run in CI for that reason. `node test/e2e.mjs`.
 
 import assert from 'node:assert/strict';
-import {existsSync, mkdtempSync, readdirSync, readFileSync} from 'node:fs';
+import {spawnSync} from 'node:child_process';
+import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
-import mod from '../better-sub-agents.ts';
+import mod, {createJobWorktree, finalizeWorktree} from '../better-sub-agents.ts';
 import {makeApi, makeSession, ok, toolOf} from './harness.mjs';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -91,6 +94,52 @@ try {
 	assert.match(api.userMessages[0].text, new RegExp(`\\[subagent\\] printf job done`), 'addressed as a signal');
 	assert.match(api.userMessages[0].text, /hello-e2e/, 'with the log tail');
 	ok('the signal is delivered to the session that fired it');
+
+	// 1b. a real worktree ------------------------------------------------------
+	// The smoke suite fakes git. This proves the real lifecycle: a worktree from
+	// the default branch (not the parent's HEAD), removed when unchanged, kept when
+	// changed.
+	const repo = mkdtempSync(join(tmpdir(), 'subagent-e2e-repo-'));
+	const realGit = (args, cwd) => {
+		const result = spawnSync('git', args, {cwd, encoding: 'utf8'});
+		return {code: typeof result.status === 'number' ? result.status : 1, stdout: String(result.stdout ?? ''), stderr: String(result.stderr ?? '')};
+	};
+	const git = (args, cwd) => {
+		const result = realGit(['-c', 'user.email=e2e@example.com', '-c', 'user.name=E2E', ...args], cwd);
+		assert.equal(result.code, 0, `git ${args.join(' ')}: ${result.stderr}`);
+		return result;
+	};
+	git(['init', '-b', 'main', repo], tmpdir());
+	writeFileSync(join(repo, 'version.txt'), 'main\n');
+	git(['add', '-A'], repo);
+	git(['commit', '-m', 'base'], repo);
+	git(['checkout', '-b', 'parent-head'], repo);
+	writeFileSync(join(repo, 'version.txt'), 'parent\n');
+	git(['add', '-A'], repo);
+	git(['commit', '-m', 'parent'], repo);
+
+	const seam = {git: realGit, fs: {mkdir: (target) => mkdirSync(target, {recursive: true})}};
+	const fresh = createJobWorktree(seam, {cwd: repo, path: join(dir, 'worktrees', 'unchanged')});
+	assert.equal(fresh.ok, true, JSON.stringify(fresh));
+	assert.equal(fresh.base, 'main', 'a repository without origin/HEAD resolves main');
+	assert.equal(
+		readFileSync(join(fresh.path, 'version.txt'), 'utf8'),
+		'main\n',
+		'the worktree is the default branch, not the parent HEAD',
+	);
+	const removedReal = finalizeWorktree(seam, {worktree: fresh.path, worktreeRepo: repo});
+	assert.deepEqual(removedReal, {kept: false, path: fresh.path}, 'a real unchanged worktree is removed');
+	assert.equal(existsSync(fresh.path), false, 'the unchanged worktree directory is gone');
+
+	const changedReal = createJobWorktree(seam, {cwd: repo, path: join(dir, 'worktrees', 'changed')});
+	assert.equal(changedReal.ok, true, JSON.stringify(changedReal));
+	writeFileSync(join(changedReal.path, 'changed.txt'), 'kept\n');
+	const keptReal = finalizeWorktree(seam, {worktree: changedReal.path, worktreeRepo: repo});
+	assert.equal(keptReal.kept, true, 'a real changed worktree is kept');
+	assert.equal(existsSync(join(changedReal.path, 'changed.txt')), true, 'the change survives');
+	rmSync(keptReal.path, {recursive: true, force: true});
+	rmSync(repo, {recursive: true, force: true});
+	ok(`real worktree: branched from ${fresh.base}, removed unchanged, kept changed at ${keptReal.path}`);
 
 	// 2. a real ACP agent job ------------------------------------------------
 	const agentSpawned = await toolOf(api, 'subagent_spawn').run({

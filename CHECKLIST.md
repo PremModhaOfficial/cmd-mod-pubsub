@@ -116,9 +116,9 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [ ] Fail the 21st spawn with `Concurrent subagent limit reached`.
 - [ ] Add the nesting depth limit. Default 3.
 - [ ] Add `BETTER_SUBAGENTS_MAX_DEPTH`.
-- [ ] Add `isolation: worktree` with `git worktree`.
-- [ ] Remove an unchanged worktree.
-- [ ] Keep and report a changed worktree.
+- [x] Add `isolation: worktree` with `git worktree`.
+- [x] Remove an unchanged worktree.
+- [x] Keep and report a changed worktree.
 - [ ] Add `BETTER_SUBAGENTS_DISABLE_BACKGROUND=1`.
 - Gate: the concurrency, nesting, and worktree tests pass.
 
