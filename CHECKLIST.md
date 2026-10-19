@@ -4,7 +4,9 @@ One spec. One checklist. The phases below are tickets, not separate specs.
 ADRs are added only for a decision that is hard to reverse, surprising, and a real trade-off.
 A glossary is added only if a new term is settled.
 
-Verification command: `node test/smoke.mjs`
+Verification commands: `node test/smoke.mjs` (CI) and `node test/e2e.mjs` (needs credentials/network).
+
+Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity contract. Phases 0-10 are the original build plan; phases 11-16 close the gaps found in the 2026-10-19 validation. A phase is not done until its SPEC.md acceptance tests pass.
 
 ## Phase 0: Baseline
 
@@ -154,3 +156,78 @@ Verification command: `node test/smoke.mjs`
 - [ ] Repository is renamed.
 - [ ] Tag `v2.0.0` only after every box is checked.
 - Gate: release tag after all boxes and all tests pass.
+
+## Phase 11: Parity ledger and naming
+
+- [ ] Adopt the `SPEC.md` parity ledger as the completion checklist; no silent omissions.
+- [ ] Rename the spawn type argument to `subagent_type`; accept `agent_type` as a deprecated alias.
+- [ ] Make `subagent_send` live messaging. Keep `pubsub_send` as the legacy note tool only.
+- [ ] Add `subagent_agents` and `/agents`.
+- [ ] Accept the Claude Code environment aliases alongside `BETTER_SUBAGENTS_*`.
+- [ ] Write the ADR for the live-messaging, fork, and permission-prompt transport before Phase 15.
+- Gate: the naming table matches `SPEC.md`; every old alias has a deprecation test.
+
+## Phase 12: Scopes, discovery, and built-ins
+
+- [ ] Managed, CLI, project, user, and plugin scopes with the documented precedence.
+- [ ] `--agents` JSON and JSON-file form; interactive refuses a file path.
+- [ ] Project walk-up, nested closest wins, `--add-dir`, recursive scanning.
+- [ ] Plugin scoped names; plugin ignores `hooks`, `mcpServers`, `permissionMode`.
+- [ ] Name rules; same-directory duplicates by read order; `/doctor` reports them.
+- [ ] Invalid-file skip rules and debug log; a plugin file with no name loads under its filename.
+- [ ] Built-ins: Explore, Plan, general-purpose, claude, statusline-setup, claude-code-guide.
+- [ ] Explore and Plan are read-only, one-shot, no agent id; Explore thoroughness; both skip CLAUDE.md and git status.
+- [ ] Disable controls: `permissions.deny`, `CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS`, `CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS`.
+- [ ] The 15,000-token description-budget warning.
+- Gate: precedence, invalid-file, built-in, and description-budget tests pass.
+
+## Phase 13: Frontmatter and resolution
+
+- [ ] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure.
+- [ ] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility.
+- [ ] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance.
+- [ ] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual.
+- [ ] `skills` full-content preload; unlisted skills still invocable.
+- [ ] `mcpServers` inline and referenced; trust; plugin ignored.
+- [ ] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
+- [ ] `memory` scopes, `MEMORY.md` 200 lines or 25KB, automatic Read/Write/Edit.
+- [ ] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
+- [ ] Unknown fields ignored without error.
+- [ ] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form.
+- Gate: every field and resolution rule has a behavioral test.
+
+## Phase 14: Context and persistence
+
+- [ ] Startup loads: system prompt, task message, CLAUDE.md hierarchy, git status, skills, roster, output style, no parent auto memory, model-sized context window.
+- [ ] Explore/Plan skip CLAUDE.md and git status; `omitClaudeMd`; subdirectory CLAUDE.md still loads.
+- [ ] Resume by agent id; Explore/Plan return no id; `maxTurns` partial; per-invocation model and effort survive resume.
+- [ ] Main compaction leaves subagent transcripts untouched; transcripts persist; retention sweeps records, logs, transcripts; running jobs are never swept.
+- [ ] Auto-compaction and the `compact_boundary` event.
+- [ ] Prompt-cache split for fork and non-fork; `cacheTtl`.
+- Gate: startup-context, resume, compaction, retention, and cache tests pass.
+
+## Phase 15: Live messaging, teams, forks, permissions
+
+- [ ] Named agents, sibling roster at startup, `subagent_send` queue/start/resume.
+- [ ] `ListAgents` foreground/background visibility; `SubagentHandback`.
+- [ ] Agent teams: teammates keep task and cron tools; teammate runs foreground; refuse `background: true` and `run_in_background: true`.
+- [ ] Forks: full history, same prompt/tools/model/permissions/prompt cache; `fork` type; `/subtask`.
+- [ ] Observe and steer: Enter, `x`, Esc; confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork.
+- [ ] Fork-mode defaults and controls; `run_in_background` removed where fork mode is on.
+- [ ] Permission prompts: foreground inline; background surfaced in the main session naming the agent; Esc denies one call without stopping it.
+- [ ] `waiting-input` carries the question or approval request and does not hang.
+- [ ] The transport ADR is accepted.
+- Gate: live-message, fork, team, and permission tests pass; ADR accepted.
+
+## Phase 16: Surfaces, parity, and release
+
+- [ ] `subagent_spawn` accepts `subagent_type`, `description`, `prompt`, `name`, `team_name`, `mode`, `model`, `effort`, `run_in_background`, `resume`, `isolation`, `max_turns`, `tools`, `disallowed_tools`, `permission_mode`, `mcp_servers`, `skills`.
+- [ ] `/subagents`, `/agents`, `/tasks`, `/doctor`, and plugin validation.
+- [ ] Pane, footer count, 30-second task-row lifecycle, transcript open, @mention typeahead.
+- [ ] Claude Code environment aliases accepted.
+- [ ] README and the parity matrix updated.
+- [ ] Every `SPEC.md` acceptance test passes.
+- [ ] Two-session isolation, no foreign delivery, no untagged inbox, no duplicate after restart.
+- [ ] Version 2.0.0.
+- [ ] Repository rename and tag after the human release gate.
+- Gate: the parity ledger is green; release only after human approval.
