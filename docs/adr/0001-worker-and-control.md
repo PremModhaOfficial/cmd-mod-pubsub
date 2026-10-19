@@ -17,7 +17,7 @@ ACP has no fork method. This ADR records the transport that does.
 
 Use ACP for non-fork subagents. Run one detached adapter per job. The adapter owns one `cmd acp` child, writes the job log, writes one spool signal, and reads a control file for send and cancel.
 
-Use the CLI fork path for forks. Run one `cmd --fork-session --resume <main> -n <name> -p <prompt>` turn to create the fork. Then use ACP `session/load` on the fork id for follow-ups.
+Use the CLI fork path for forks. Run one `cmd --fork-session --resume <main> -n <name> -p <prompt>` turn to create the fork. Then use `cmd --resume <fork> -p` for each follow-up. Do not use ACP `session/load` for follow-ups. It replays history, but a follow-up prompt did not complete in the probe.
 
 Keep the existing spool as the result channel and the existing owner token as the delivery boundary.
 
@@ -27,7 +27,7 @@ Keep the existing spool as the result channel and the existing owner token as th
 - Isolation. One ACP server per job gives one session, one log, and one signal. A malformed job cannot corrupt another.
 - Least new state. The spool, owner token, and job record remain. The adapter replaces the `cmd -p` argv builder.
 - Native permissions. `session/request_permission` replaces the waiting-input heuristic. The adapter bridges the request to the parent and returns the decision.
-- Fork parity. ACP cannot fork, but the CLI fork copies the session, the only path that can share its prompt cache. ACP `session/load` continues that fork.
+- Fork parity. ACP cannot fork, but the CLI fork copies the session, the only path that can share its prompt cache. A one-shot `cmd --resume -p` continues that fork. ACP `session/load` replays history but did not complete a follow-up prompt in the probe.
 
 ## Topology
 
@@ -56,11 +56,17 @@ ACP alone cannot fork. `cmd --fork-session --resume <main> acp` starts, but `ses
 
 The CLI fork works. `cmd --fork-session --resume <main> -n <name> -p "<prompt>"` answered `ORANGE` from the main session. Verified on 2026-10-20.
 
-The fork session is found with `session/list` by the `-n` name. `session/load` restores it. A follow-up prompt answered `ORANGE` again. Verified on 2026-10-20.
+The fork session is found with `session/list` by the `-n` name.
+
+`session/load` restores its history. A `session/prompt` on the loaded session streamed `ORANGE`, but no JSON-RPC completion arrived in a 180-second probe or a 300-second probe. Do not use ACP `session/load` for live fork follow-ups.
+
+Use `cmd --resume <fork> -p "<message>"` for each follow-up. Verified on 2026-10-20: a resume of the source session answered `ORANGE`. The fork is a normal session, and T10 tests the fork id.
+
+A follow-up cannot arrive while a `-p` turn runs. Queue it and start the next `-p` turn after the current process exits. That is the next safe point. A running fork shows its log and can be stopped by killing the process. Mid-turn steering is a Phase 15 gap.
 
 The first fork turn runs through `cmd -p`. It uses the main session's system prompt, tools, model, and permissions. The host fork path is the only one that can share the main session's prompt cache. T10 measures the cache reuse. The mod must set `BETTER_SUBAGENTS_FORK=1` and skip the definition's system prompt and tool filter for that turn.
 
-The first fork turn is not streamed. The task view sees the result at the end. Follow-ups on the loaded session stream normally. Record this as a Phase 15 gap.
+The first fork turn is not streamed. The task view sees the result at the end. Follow-ups are also one-shot, so the task view sees each result at the end. Record this as a Phase 15 gap.
 
 ## ACP method map
 
@@ -92,13 +98,13 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 - `--agents` and `--append-subagent-system-prompt` are not host flags. Use `--mod` and the mod hooks.
 - Host file agents default `tools` to none. The spec inherits. The mod fills the default.
 - `cmd.addAgent` skips a duplicate name, so a project definition cannot shadow a user definition. Record the precedence gap.
-- ACP has no fork method. The CLI fork plus `session/load` is the accepted path.
-- The first fork turn is not streamed.
+- ACP has no fork method. The CLI fork plus one-shot `cmd --resume -p` follow-ups is the accepted path. ACP `session/load` is a host risk for prompt completion.
+- The first fork turn is not streamed, and fork follow-ups are one-shot. Mid-turn steering is a Phase 15 gap.
 
 ## Verification
 
 - ACP handshake, `session/new`, modes, and config options: verified 2026-10-20.
-- Fork history through the CLI and load through ACP: verified 2026-10-20. Prompt-cache reuse: T10 measures it.
+- Fork creation through the CLI: verified 2026-10-20. ACP `session/load` replay: verified, but a follow-up prompt did not complete in 180 or 300 seconds. `cmd --resume -p` follow-up: verified 2026-10-20. Prompt-cache reuse: T10 measures it.
 - Adapter queue: design requirement. ACP rejects a concurrent prompt, verified 2026-10-20. T1 tests the queue.
 - `appendSystemPrompt` and `beforeToolCall` inside the ACP server: T1 tests these.
 - `session/load` after an adapter restart: T1 tests this.
@@ -109,5 +115,5 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 - T3 uses `session/set_config_option` for model and effort.
 - T4 uses the prompt result for foreground and the detached adapter for background.
 - T5 uses `session/set_mode` and `session/request_permission`.
-- T10 implements the CLI fork and the ACP load.
+- T10 implements the CLI fork, the one-shot `cmd --resume -p` follow-up, and the fork task view. ACP `session/load` is a host risk.
 - T13 uses `session/load` and `session/resume` for resume.
