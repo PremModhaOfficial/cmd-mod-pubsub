@@ -546,38 +546,67 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// Bound once the harness binds. Diagnostic only; routing is by owner token.
 	let sessionId: string | undefined;
 
-	// Per-session ownership. Restored from the transcript so resume and hot reload keep
-	// the same token; generated and appended once when the session has no token yet.
+	// ------------------------------------------------------------------ owner
+	//
+	// The spool is shared, so every job and signal carries an owner token. The token
+	// is minted once per session and persisted in the transcript, so a resume or a hot
+	// reload keeps the same identity. id() resolves it, verdict() decides what a
+	// signal's owner means, and there is deliberately no process-<pid> fallback: an
+	// invented identity is one the session can never recognise again, which is how a
+	// session's own result used to turn into a foreign signal.
+
 	let ownerToken: string | undefined;
-	function ensureOwner(): string | undefined {
-		if (ownerToken !== undefined) return ownerToken;
-		const session = cmd.session;
-		if (session === undefined) return undefined;
+	let ownerSaved = false;
+
+	function saveOwner(token: string): void {
+		if (ownerSaved || cmd.session === undefined) return;
 		try {
-			const entries = session.getCustomEntries({customType: OWNER_TYPE}) as
+			cmd.session.appendCustomEntry({customType: OWNER_TYPE, data: {token}});
+			ownerSaved = true;
+		} catch {
+			// Retried on the next id() call. The token still identifies this process, so
+			// its own results stay collectable in the meantime.
+		}
+	}
+
+	function ownerId(): string | undefined {
+		if (ownerToken !== undefined) {
+			saveOwner(ownerToken);
+			return ownerToken;
+		}
+		// No session, no identity. A token minted here could never be read back, and a
+		// token that cannot be read back is exactly how a session's own result turns into
+		// a foreign signal. The caller treats this as 'pending' and waits.
+		if (cmd.session === undefined) return undefined;
+		try {
+			const entries = cmd.session.getCustomEntries({customType: OWNER_TYPE}) as
 				| {data?: {token?: unknown}}[]
 				| undefined;
 			for (let index = (entries?.length ?? 0) - 1; index >= 0; index -= 1) {
 				const token = entries?.[index]?.data?.token;
 				if (typeof token === 'string' && token.length > 0) {
 					ownerToken = token;
+					ownerSaved = true;
 					return ownerToken;
 				}
 			}
 		} catch {
 			/* fall through and mint one */
 		}
-		const token = `owner-${randomUUID()}`;
-		try {
-			session.appendCustomEntry({customType: OWNER_TYPE, data: {token}});
-			ownerToken = token;
-			return ownerToken;
-		} catch {
-			return undefined;
-		}
+		ownerToken = `owner-${randomUUID()}`;
+		saveOwner(ownerToken);
+		return ownerToken;
 	}
-	function requireOwner(): string {
-		return ensureOwner() ?? `process-${runtime.pid}`;
+
+	// mine: deliver. foreign: another session's, leave it. orphan: untagged legacy data,
+	// quarantine it. pending: this session does not know its identity yet - a real
+	// state, so the signal waits instead of being dropped or delivered on a guess.
+	function ownerVerdict(signalOwner: unknown): Ownership {
+		if (ownerToken === undefined) return 'pending';
+		if (typeof signalOwner === 'string' && signalOwner.length > 0) {
+			return signalOwner === ownerToken ? 'mine' : 'foreign';
+		}
+		return workerMode ? 'foreign' : 'orphan';
 	}
 
 	// A renderer so a signal shows up as a real feed row rather than raw JSON.
@@ -714,16 +743,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
-	// mine: deliver. foreign: leave it for another session. orphan: untagged legacy
-	// data, quarantine it. pending: ownership is not known yet (pre-bind), wait.
-	function classify(message: Signal): 'mine' | 'foreign' | 'orphan' | 'pending' {
-		if (ownerToken === undefined) return 'pending';
-		if (typeof message.owner === 'string' && message.owner.length > 0) {
-			return message.owner === ownerToken ? 'mine' : 'foreign';
-		}
-		return workerMode ? 'foreign' : 'orphan';
-	}
-
 	function markDelivered(id: string): void {
 		const job = readJob(id);
 		if (job === undefined) return;
@@ -788,7 +807,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				settle(claim, 'accepted');
 				continue;
 			}
-			const owner = classify(signal);
+			const owner = ownerVerdict(signal.owner);
 			if (owner === 'orphan') {
 				settle(claim, 'quarantined');
 				continue;
@@ -1075,7 +1094,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const signal = signalOf(
 			{
 				...job,
-				owner: typeof job.owner === 'string' && job.owner.length > 0 ? job.owner : requireOwner(),
+				owner: typeof job.owner === 'string' && job.owner.length > 0 ? job.owner : ownerId(),
 				startedAt,
 			},
 			{state: 'canceled', exitCode: null, finishedAt: now, durationMs: Math.max(0, now - startedAt), body: 'canceled by request'},
@@ -1139,7 +1158,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
-		const owner = requireOwner();
+		const owner = ownerId();
 		const record: JobRecord = {
 			id,
 			owner,
@@ -1355,7 +1374,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			const title = typeof input.title === 'string' ? input.title : '';
 			if (title.length === 0) return {ok: false, error: 'title is required'};
 			const body = typeof input.body === 'string' ? input.body : '';
-			const owner = requireOwner();
+			const owner = ownerId();
 			const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 			enqueueSignal({
 				id,
@@ -1437,7 +1456,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				sessionId = info.sessionId;
 			}
 			// Restore (or mint) the owner token before any drain runs.
-			ensureOwner();
+			ownerId();
 			sweepClaimed();
 			sweepOrphaned();
 			reconcileJobs();
@@ -1466,7 +1485,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	cmd.on('run_start', (event: {sessionId?: string}) => {
 		if (typeof event?.sessionId === 'string' && event.sessionId.length > 0) {
 			sessionId = event.sessionId;
-			ensureOwner();
+			ownerId();
 			safeDrain();
 		}
 	});
@@ -1475,7 +1494,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	cmd.clock.every(REFRESH_INTERVAL_MS, refreshJobs);
 
 	// Seed the dashboard and reconcile anything a previous process left behind.
-	ensureOwner();
+	ownerId();
 	reconcileJobs();
 	refreshJobs();
 }

@@ -54,6 +54,24 @@ function makeSession() {
 	};
 }
 
+// A session whose transcript refuses the first append (read-only transcript, a racing
+// writer). The mod must still know its own identity.
+function makeFlakySession(failures = 1) {
+	const inner = makeSession();
+	let attempts = 0;
+	return {
+		entries: inner.entries,
+		appendCustomEntry(entry) {
+			attempts += 1;
+			if (attempts <= failures) throw new Error('EACCES');
+			return inner.appendCustomEntry(entry);
+		},
+		getCustomEntries(query) {
+			return inner.getCustomEntries(query);
+		},
+	};
+}
+
 // The OS seam. The mod takes a runtime object as the second factory argument:
 // spawn, kill, the clock and the spool filesystem. Production fills it from the
 // OS; here it is a fake, so a spawn failure or a cancel escalation is a function
@@ -636,6 +654,73 @@ try {
 		assert.equal(delivered.length, 1, `${mode.name}: exactly one failed signal is delivered`);
 	}
 	ok('every spawn failure goes through one choke point and emits one signal');
+
+
+	// 16. owner identity ----------------------------------------------------
+	// A session that cannot persist its token on the first try still owns its jobs. The
+	// old process-<pid> fallback stamped a token the session could never match, so its
+	// own result became foreign and was never delivered.
+	const ownerDir = mkdtempSync(join(tmpdir(), 'pubsub-owner-'));
+	// The transcript refuses every append made before the job is fired, and recovers
+	// afterwards - the exact window the old code filled with process-<pid>.
+	const flaky = makeFlakySession(2);
+	const ownerRuntime = makeRuntime({now: () => fixedNow});
+	const o = makeApi({spoolDir: ownerDir, session: flaky, runtime: ownerRuntime.runtime});
+	mod(o.api, o.runtime);
+	assert.equal(ownerEntries(flaky).length, 0, 'the transcript refuses appends for now');
+	const ownerFire = o.toolDefs.find((def) => def.schema.name === 'pubsub_fire');
+	assert.equal((await ownerFire.run({input: {label: 'orphan-proof', command: 'true'}})).ok, true);
+	const ownerSpec = JSON.parse(ownerRuntime.spawnCalls[0].options.env.PUBSUB_SPEC);
+	assert.ok(ownerSpec.owner, 'the job carries an owner even while the transcript refuses it');
+	assert.ok(!ownerSpec.owner.startsWith('process-'), 'there is no process-<pid> fallback identity');
+
+	// The transcript recovers. The persisted identity must be the one the job carries.
+	o.registeredHooks.onSessionStart({source: 'resume', sessionId: 'owner'});
+	assert.deepEqual(ownerEntries(flaky), [ownerSpec.owner], 'the retried token is the token the job carries');
+
+	writeFileSync(
+		join(ownerDir, 'inbox', `${Date.now()}-owner-proof.json`),
+		JSON.stringify({
+			id: 'owner-proof',
+			owner: ownerSpec.owner,
+			label: 'owner proof',
+			kind: 'command',
+			state: 'done',
+			title: 'owner proof',
+			body: 'ok',
+		}),
+	);
+	o.listeners.get('run_start')[0]({sessionId: 'owner'});
+	assert.equal(
+		o.userMessages.filter((message) => message.text.includes('owner proof')).length,
+		1,
+		'a session collects a signal stamped with its own retried token',
+	);
+	ok('owner identity: persisted, retried, never a process-pid fallback');
+
+	// An unresolved identity is a state: the signal waits, it is not guessed at.
+	const pendingDir = mkdtempSync(join(tmpdir(), 'pubsub-pending-'));
+	const pendingApi = makeApi({spoolDir: pendingDir, session: undefined, runtime: makeRuntime().runtime});
+	mod(pendingApi.api, pendingApi.runtime);
+	writeFileSync(
+		join(pendingDir, 'inbox', `${Date.now()}-pending-1.json`),
+		JSON.stringify({
+			id: 'pending-1',
+			owner: 'owner-somebody-else',
+			label: 'pending',
+			kind: 'command',
+			state: 'done',
+			title: 'pending',
+			body: 'x',
+		}),
+	);
+	pendingApi.everyTicks.find((tick) => tick.ms === 400).fn();
+	assert.ok(
+		readdirSync(join(pendingDir, 'inbox')).some((name) => name.includes('pending-1')),
+		'pending ownership holds the signal in inbox/',
+	);
+	assert.equal(pendingApi.userMessages.length, 0, 'nothing is delivered on an unknown identity');
+	ok('an unresolved owner is pending, not foreign and not a delivery guess');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
