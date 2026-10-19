@@ -4573,6 +4573,410 @@ process.stdin.on('data', (data) => {
 	);
 	ok('session agent, initialPrompt only as main, append prompt (flag/file/env), compact window, cache TTL');
 
+	{
+	// 74. fork mode: defaults, controls, and removed knob --------------------
+	// Fork mode is on for a human, off for a non-interactive/SDK run, and the
+	// user/env override wins either way. The model-facing spawn schema drops
+	// `run_in_background` while it is on.
+	const resolveForkMode = modExports.resolveForkMode;
+	assert.equal(typeof resolveForkMode, 'function', 'resolveForkMode is exported');
+	assert.equal(resolveForkMode({interactive: true, env: {}}), 'on', 'interactive defaults on');
+	assert.equal(resolveForkMode({interactive: false, env: {}}), 'off', 'non-interactive defaults off');
+	assert.equal(resolveForkMode({interactive: true, sdk: true, env: {}}), 'off', 'the Agent SDK defaults off');
+	assert.equal(resolveForkMode({interactive: false, env: {BETTER_SUBAGENTS_FORK_MODE: 'on'}}), 'on', 'the env turns it on');
+	assert.equal(resolveForkMode({interactive: true, env: {CLAUDE_CODE_FORK_MODE: 'off'}}), 'off', 'the Claude Code alias turns it off');
+	assert.equal(
+		resolveForkMode({interactive: false, env: {BETTER_SUBAGENTS_FORK_MODE: 'on'}, flag: 'off'}),
+		'off',
+		'the explicit flag wins over the environment',
+	);
+	ok('resolveForkMode: interactive on, SDK/non-interactive off, env and flag control it');
+
+	// 75. a fork inherits the main session and removes run_in_background -----
+	const forkDir = mkdtempSync(join(tmpdir(), 'subagent-fork-'));
+	const forkSession = makeSession();
+	const forkRuntime = makeRuntime({interactive: true, env: {}, now: () => 90000});
+	const forkBundle = makeApi({spoolDir: forkDir, session: forkSession, runtime: forkRuntime.runtime});
+	mod(forkBundle.api, forkBundle.runtime);
+	forkBundle.registeredHooks.onSessionStart({sessionId: 'main-session-1'});
+	const forkSpawn = toolOf(forkBundle, 'subagent_spawn');
+	assert.ok(
+		!Object.hasOwn(forkSpawn.schema.input_schema.properties, 'run_in_background'),
+		'fork mode on removes run_in_background from the model-facing schema',
+	);
+	const forkSpawned = await forkSpawn.run({
+		input: {description: 'fork it', prompt: 'remember ORANGE', subagent_type: 'fork', name: 'forky', run_in_background: false},
+	});
+	assert.equal(forkSpawned.ok, true, JSON.stringify(forkSpawned));
+	const forkId = forkSpawned.content[0].text.match(/spawned (\S+)/)[1];
+	const forkRecord = JSON.parse(readFileSync(join(forkDir, 'jobs', `${forkId}.json`), 'utf8'));
+	assert.equal(forkRecord.fork, true, 'the record says this job is a fork');
+	assert.equal(forkRecord.agentType, 'fork', 'the fork type is resolved from the built-in definition');
+	assert.equal(forkRecord.promptCache, 'shared', 'a fork shares the main prompt cache');
+	assert.equal(forkRecord.background, true, 'fork mode forces the background even when the caller asks for the foreground');
+	const forkSpec = JSON.parse(forkRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(forkSpec.kind, 'fork', 'the worker uses the CLI fork path');
+	assert.equal(forkSpec.fork, true);
+	assert.equal(forkSpec.mainSessionId, 'main-session-1', 'the fork resumes the main session');
+	assert.equal(forkSpec.prompt, 'remember ORANGE');
+	assert.equal(forkSpec.systemPrompt, undefined, 'a fork does not take the definition body');
+	assert.equal(forkSpec.startup, undefined, 'a fork does not take a fresh startup bundle');
+	assert.equal(forkSpec.tools, undefined, 'a fork does not get a filtered tool list');
+	assert.equal(forkSpec.model, undefined, 'a fork inherits the main model');
+	assert.deepEqual(forkSpec.args.slice(0, 4), ['--fork-session', '--resume', 'main-session-1', '-n']);
+	assert.ok(forkSpec.args.includes('-p') && forkSpec.args.includes('remember ORANGE'), 'the task is the -p prompt');
+	assert.ok(forkSpec.args.includes('--output-format'), 'the session id is readable from the JSON result line');
+
+	const forkOffRuntime = makeRuntime({interactive: false, env: {}, now: () => 90000});
+	const forkOffBundle = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-forkoff-')),
+		session: makeSession(),
+		runtime: forkOffRuntime.runtime,
+	});
+	mod(forkOffBundle.api, forkOffBundle.runtime);
+	assert.ok(
+		Object.hasOwn(toolOf(forkOffBundle, 'subagent_spawn').schema.input_schema.properties, 'run_in_background'),
+		'fork mode off keeps run_in_background',
+	);
+	ok('fork spawn: inherits the main prompt/tools/model/history, background forced');
+
+	// 76. a running fork is opened, steered, and stopped ---------------------
+	const forkOwner = ownerEntries(forkSession)[0];
+	writeFileSync(join(forkDir, 'logs', `${forkId}.log`), 'ORANGE is the secret\n');
+	const finishedFork = {
+		...forkRecord,
+		state: 'done',
+		workerPid: undefined,
+		forkSessionId: 'fork-session-9',
+		finishedAt: 90001,
+		durationMs: 1,
+	};
+	writeFileSync(join(forkDir, 'jobs', `${forkId}.json`), JSON.stringify(finishedFork, null, 2));
+	const forkedSend = await toolOf(forkBundle, 'subagent_send').run({
+		input: {to: forkRecord.name, message: 'what was the secret?'},
+	});
+	assert.equal(forkedSend.ok, true, JSON.stringify(forkedSend));
+	const followUpSpec = JSON.parse(forkRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(followUpSpec.kind, 'fork');
+	assert.deepEqual(followUpSpec.args.slice(0, 3), ['--resume', 'fork-session-9', '-p'], 'the follow-up resumes the fork session');
+	assert.ok(!followUpSpec.args.includes('--fork-session'), 'a follow-up does not fork again');
+	assert.equal(followUpSpec.prompt, 'what was the secret?');
+	assert.equal(followUpSpec.systemPrompt, undefined, 'a follow-up keeps the main prompt');
+	const tasksCommand = forkBundle.commandDefs.find((def) => def.name === 'tasks');
+	assert.ok(tasksCommand, '/tasks is registered');
+	const openedFork = await tasksCommand.handler({args: `open ${forkId}`});
+	assert.match(String(openedFork.message), /ORANGE/, 'the task view opens the fork transcript');
+	const sendsBeforeView = forkRuntime.spawnCalls.length;
+	const viewSend = await tasksCommand.handler({args: `send ${forkId} steer from the panel`});
+	assert.match(String(viewSend.message), /resumed/i, '/tasks send resumes the fork');
+	assert.equal(forkRuntime.spawnCalls.length, sendsBeforeView + 1, 'the task view starts the follow-up');
+	const viewSendSpec = JSON.parse(forkRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(viewSendSpec.prompt, 'steer from the panel', 'the panel message is the follow-up turn');
+
+	// Stop: a running fork becomes canceled and emits exactly one signal.
+	writeFileSync(
+		join(forkDir, 'jobs', `${forkId}.json`),
+		JSON.stringify({...finishedFork, state: 'running', forkSessionId: undefined, pid: 646464, workerPid: undefined}, null, 2),
+	);
+	const stoppedFork = await tasksCommand.handler({args: `stop ${forkId}`});
+	assert.match(String(stoppedFork.message), /canceled/i, '/tasks stop cancels the fork');
+	const stoppedRecord = JSON.parse(readFileSync(join(forkDir, 'jobs', `${forkId}.json`), 'utf8'));
+	assert.equal(stoppedRecord.state, 'canceled', 'x/stop cancels the fork');
+	assert.equal(stoppedRecord.owner ?? forkOwner, forkOwner, 'the canceled record keeps its owner');
+	assert.ok(
+		forkBundle.userMessages.some((message) => /canceled/i.test(String(message.text))),
+		'the stop emits one canceled result',
+	);
+	ok('fork steering: /tasks opens, a follow-up resumes the fork, x stops it');
+
+	// 77. the fork worker: one CLI turn, then a live resume ------------------
+	// The fake CLI speaks the real `--output-format json` contract: event lines and
+	// one result line carrying sessionId and finalText. A first turn creates the
+	// fork session; a later message resumes it without --fork-session.
+	const forkWorkerDir = mkdtempSync(join(tmpdir(), 'subagent-fork-worker-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(forkWorkerDir, dir), {recursive: true});
+	const forkFakeCmd = join(forkWorkerDir, 'cmd.mjs');
+	writeFileSync(
+		forkFakeCmd,
+		`#!/usr/bin/env node
+const args = process.argv.slice(2);
+const promptIndex = args.indexOf('-p');
+const prompt = promptIndex >= 0 ? args[promptIndex + 1] : '';
+const resumed = args.includes('--resume') && !args.includes('--fork-session');
+process.stdout.write(JSON.stringify({type: 'event', event: {type: 'tool_running', name: 'Read'}}) + '\\n');
+process.stdout.write(JSON.stringify({
+  type: 'result', subtype: 'success', sessionId: 'fork-session-42', stopReason: 'end_turn',
+  usage: {inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0},
+  durationMs: 1, finalText: (resumed ? 'REPLY ' : 'FIRST ') + prompt
+}) + '\\n');
+`,
+	);
+	chmodSync(forkFakeCmd, 0o755);
+	const forkWorkerId = 'fork-w1';
+	const forkWorkerSpec = modExports.buildSpec(
+		{
+			id: forkWorkerId,
+			label: 'fork worker',
+			kind: 'fork',
+			owner: 'owner-fork',
+			cwd: forkWorkerDir,
+			logPath: join(forkWorkerDir, 'logs', `${forkWorkerId}.log`),
+			inboxDir: join(forkWorkerDir, 'inbox'),
+			jobsDir: join(forkWorkerDir, 'jobs'),
+			startedAt: 1000,
+			tailMax: 8000,
+			bin: forkFakeCmd,
+			prompt: 'remember ORANGE',
+			fork: true,
+			mainSessionId: 'main-session-1',
+			sessionName: 'subagent-fork-w1',
+			live: true,
+			idleMs: 400,
+			controlPollMs: 20,
+			controlDir: join(forkWorkerDir, 'control', forkWorkerId),
+		},
+		'/mod.ts',
+	);
+	writeFileSync(join(forkWorkerDir, 'jobs', `${forkWorkerId}.json`), JSON.stringify({id: forkWorkerId, state: 'queued'}));
+	mkdirSync(join(forkWorkerDir, 'control', forkWorkerId), {recursive: true});
+	const forkWorker = spawn(process.execPath, ['-e', workerText], {
+		cwd: forkWorkerDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(forkWorkerSpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	const forkWorkerExit = new Promise((resolve) => forkWorker.on('exit', resolve));
+	const forkWorkerLog = () => {
+		try {
+			return readFileSync(join(forkWorkerDir, 'logs', `${forkWorkerId}.log`), 'utf8');
+		} catch {
+			return '';
+		}
+	};
+	await waitUntil(() => (/FIRST remember ORANGE/.test(forkWorkerLog()) ? true : undefined), 'the first fork turn');
+	await waitUntil(() => {
+		try {
+			return JSON.parse(readFileSync(join(forkWorkerDir, 'control', forkWorkerId, 'state.json'), 'utf8')).busy === false;
+		} catch {
+			return false;
+		}
+	}, 'the fork idle state');
+	const firstForkRecord = JSON.parse(readFileSync(join(forkWorkerDir, 'jobs', `${forkWorkerId}.json`), 'utf8'));
+	assert.equal(firstForkRecord.forkSessionId, 'fork-session-42', 'the result sessionId is recorded for follow-ups');
+	assert.match(forkWorkerLog(), /\[tool\] Read/, 'the fork transcript keeps tool progress');
+	appendLine(join(forkWorkerDir, 'control', forkWorkerId, 'send.jsonl'), {from: 'main', message: 'and again', at: Date.now()});
+	await waitUntil(() => (/REPLY and again/.test(forkWorkerLog()) ? true : undefined), 'the resumed fork turn');
+	await forkWorkerExit;
+	const forkWorkerSignals = readdirSync(join(forkWorkerDir, 'inbox')).map((name) =>
+		JSON.parse(readFileSync(join(forkWorkerDir, 'inbox', name), 'utf8')),
+	);
+	assert.ok(
+		forkWorkerSignals.some((signal) => signal.kind === 'fork' && /ORANGE/.test(String(signal.body))),
+		'the first turn signals its result',
+	);
+	assert.ok(
+		forkWorkerSignals.some((signal) => signal.kind === 'message' && /REPLY and again/.test(String(signal.body))),
+		'a live follow-up signals its reply',
+	);
+	assert.match(
+		forkWorkerLog(),
+		/REPLY and again/,
+		'a message during the live window resumes the fork instead of forking again',
+	);
+	ok('fork worker: CLI fork creates the session, a message resumes it and signals the reply');
+
+	// 78. teammates: foreground, no background definition, task/cron tools ---
+	const teamDir = mkdtempSync(join(tmpdir(), 'subagent-team-'));
+	const teamAgents = join(teamDir, '.commandcode', 'agents');
+	writeAgent(teamAgents, 'pinned.md', 'pinned', 'pinned agent', 'body', {background: 'true'});
+	writeAgent(teamAgents, 'peon.md', 'peon', 'team peon', 'body', {tools: 'Read', disallowedTools: 'TaskCreate'});
+	const teamSpawn = (interactive, env) => {
+		const spawnCalls = [];
+		const runtime = makeRuntime({
+			interactive,
+			env,
+			cwd: teamDir,
+			now: () => 95000,
+			spawn(command, args, options) {
+				const child = makeChild();
+				spawnCalls.push({command, args, options, child});
+				const spec = JSON.parse(options.env.SUBAGENT_SPEC);
+				const recordFile = join(spec.jobsDir, `${spec.id}.json`);
+				const record = JSON.parse(readFileSync(recordFile, 'utf8'));
+				writeFileSync(recordFile, JSON.stringify({...record, state: 'done', finishedAt: 95001, durationMs: 1}));
+				return child;
+			},
+		});
+		const bundle = makeApi({spoolDir: mkdtempSync(join(tmpdir(), 'subagent-team-spool-')), session: makeSession(), runtime: runtime.runtime});
+		mod(bundle.api, bundle.runtime);
+		return {bundle, runtime, spawnCalls};
+	};
+	const teamOff = teamSpawn(false, {});
+	const pinned = await toolOf(teamOff.bundle, 'subagent_spawn').run({
+		input: {description: 'pinned teammate', prompt: 'work', subagent_type: 'pinned', team_name: 'alpha'},
+	});
+	assert.equal(pinned.ok, false, 'a teammate with a background:true definition is refused');
+	assert.match(pinned.error, /teammate/i, 'the error says teammate');
+	assert.match(pinned.error, /background/i, 'the error names the definition field');
+	const refusedForeground = await toolOf(teamOff.bundle, 'subagent_spawn').run({
+		input: {description: 'bg teammate', prompt: 'work', subagent_type: 'peon', team_name: 'alpha', run_in_background: true},
+	});
+	assert.equal(refusedForeground.ok, false, 'fork mode off refuses run_in_background:true for a teammate');
+	assert.match(refusedForeground.error, /run_in_background/i, 'the error names the parameter');
+
+	const teamOn = teamSpawn(true, {});
+	const teammate = await toolOf(teamOn.bundle, 'subagent_spawn').run({
+		input: {description: 'teammate', prompt: 'work', subagent_type: 'peon', team_name: 'alpha', run_in_background: true},
+	});
+	assert.equal(teammate.ok, true, JSON.stringify(teammate));
+	const teammateSpec = JSON.parse(teamOn.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	const teammateId = teammateSpec.id;
+	const teammateRecord = JSON.parse(readFileSync(join(teamOn.bundle.api.getFlag('subagent_dir'), 'jobs', `${teammateId}.json`), 'utf8'));
+	assert.equal(teammateRecord.teamName, 'alpha', 'the record carries the team');
+	assert.equal(teammateRecord.background, false, 'a teammate always runs in the foreground');
+	assert.equal(teammateSpec.background, false, 'the worker is a foreground run');
+	assert.equal(teammateSpec.interactive, true, 'a foreground teammate answers permission prompts inline');
+	for (const tool of ['TaskCreate', 'TaskGet', 'TaskList', 'TaskUpdate', 'CronCreate', 'CronDelete', 'CronList', 'Read']) {
+		assert.ok(teammateSpec.tools.includes(tool), `a teammate keeps ${tool}`);
+	}
+	assert.ok(!teammateSpec.tools.includes('Bash'), 'a teammate does not inherit past its tools list');
+	const teamFilter = modExports.filterTools({team: true, tools: ['Read'], disallowedTools: ['TaskCreate']});
+	assert.equal(teamFilter.ok, true);
+	assert.ok(teamFilter.tools.includes('TaskCreate'), 'the team tools win over disallowedTools');
+	assert.ok(teamFilter.tools.includes('CronCreate'), 'the cron tools are kept');
+	const solo = await toolOf(teamOn.bundle, 'subagent_spawn').run({input: {description: 'solo', prompt: 'x', subagent_type: 'peon'}});
+	assert.equal(solo.ok, true, JSON.stringify(solo));
+	const soloId = solo.content[0].text.match(/spawned (\S+)/)[1];
+	const soloRecord = JSON.parse(readFileSync(join(teamOn.bundle.api.getFlag('subagent_dir'), 'jobs', `${soloId}.json`), 'utf8'));
+	assert.equal(soloRecord.background, true, 'fork mode still backgrounds a non-teammate agent');
+	ok('teammates: foreground, refuse background, keep the task and cron tools');
+
+	// 79. the agent panel: row lifecycle, /tasks, Ctrl+B, @mention -----------
+	const TASK_GRACE = 30 * 1000;
+	const panelNow = 200000;
+	assert.equal(
+		modExports.taskRowVisible({id: 'd', state: 'done', finishedAt: panelNow - 1}, {now: panelNow}),
+		false,
+		'a successful row disappears immediately',
+	);
+	assert.equal(
+		modExports.taskRowVisible({id: 'f', state: 'failed', finishedAt: panelNow - 1000}, {now: panelNow}),
+		true,
+		'a failed row stays for 30 seconds',
+	);
+	assert.equal(
+		modExports.taskRowVisible({id: 'f', state: 'failed', finishedAt: panelNow - TASK_GRACE - 1}, {now: panelNow}),
+		false,
+		'past 30 seconds the failed row is gone',
+	);
+	assert.equal(
+		modExports.taskRowVisible({id: 'f', state: 'failed', finishedAt: panelNow - 1000}, {now: panelNow, dismissed: new Set(['f'])}),
+		false,
+		'x dismisses a failed row',
+	);
+	assert.equal(modExports.taskRowVisible({id: 'r', state: 'running', startedAt: panelNow}, {now: panelNow}), true, 'a running row stays');
+
+	const panelDir = mkdtempSync(join(tmpdir(), 'subagent-panel-'));
+	const panelRuntime = makeRuntime({interactive: true, env: {}, now: () => panelNow, alive: (pid) => pid === 737373});
+	const panelBundle = makeApi({spoolDir: panelDir, session: makeSession(), runtime: panelRuntime.runtime});
+	mod(panelBundle.api, panelBundle.runtime);
+	const panelOwner = ownerEntries(panelBundle.api.session)[0];
+	const writePanelJob = (record) => writeFileSync(join(panelDir, 'jobs', `${record.id}.json`), JSON.stringify(record, null, 2));
+	writePanelJob({id: 'a-done', owner: panelOwner, label: 'done row', kind: 'agent', state: 'done', startedAt: panelNow - 1000, finishedAt: panelNow - 1000});
+	writePanelJob({id: 'b-fail', owner: panelOwner, label: 'failed row', kind: 'agent', state: 'failed', startedAt: panelNow - 2000, finishedAt: panelNow - 500, failureReason: 'boom'});
+	writePanelJob({id: 'c-old', owner: panelOwner, label: 'old failure', kind: 'agent', state: 'failed', startedAt: panelNow - 90000, finishedAt: panelNow - 80000});
+	writePanelJob({id: 'd-run', owner: panelOwner, label: 'running row', kind: 'agent', state: 'running', background: false, startedAt: panelNow - 100, pid: 737373});
+	writeFileSync(join(panelDir, 'logs', 'b-fail.log'), 'the failure output\n');
+	writeFileSync(join(panelDir, 'logs', 'a-done.log'), 'the success output\n');
+	const panelRefresh = panelBundle.everyTicks.find((tick) => tick.ms === 1000);
+	panelRefresh.fn();
+	const panelPane = panelBundle.paneDefs.find((pane) => pane.id === 'jobs');
+	const rendered = JSON.stringify(panelPane.render());
+	assert.ok(!/a-done/.test(rendered), 'a successful row is not in the panel');
+	assert.match(rendered, /b-fail/, 'a recent failed row is in the panel');
+	assert.ok(!/c-old/.test(rendered), 'an expired failed row is not in the panel');
+	assert.match(rendered, /d-run/, 'a running row is in the panel');
+	assert.ok(panelBundle.statusCalls.some((text) => typeof text === 'string' && /\/tasks/.test(text)), 'the footer keeps a tasks hint after success');
+
+	// Move, open, dismiss through /tasks.
+	const panelTasks = panelBundle.commandDefs.find((def) => def.name === 'tasks');
+	assert.ok(panelTasks, '/tasks is registered');
+	const nextRow = await panelTasks.handler({args: 'next'});
+	assert.match(String(nextRow.message), /d-run/, 'next selects the first visible row');
+	const openedRow = await panelTasks.handler({args: 'enter'});
+	assert.match(String(openedRow.message), /running row/, 'enter opens the selected transcript');
+	const dismissed = await panelTasks.handler({args: 'x b-fail'});
+	assert.match(String(dismissed.message), /dismissed/i, 'x dismisses a failed row');
+	const afterDismiss = JSON.stringify(panelPane.render());
+	assert.ok(!/b-fail/.test(afterDismiss), 'the dismissed row is gone');
+	assert.deepEqual(
+		modExports.mentionCandidates(
+			[
+				{name: 'explore', source: 'builtin', valid: true},
+				{name: 'reviewer', source: 'project', valid: true},
+				{name: 'my-plugin:review:security', source: 'plugin', valid: true},
+				{name: '', source: 'project', valid: false},
+			],
+			['Scout'],
+		),
+		['Scout', 'explore', 'my-plugin:review:security', 'reviewer'],
+		'the @mention typeahead lists custom, built-in, plugin-scoped, and named agents',
+	);
+
+	// Ctrl+B moves a running foreground row to the background.
+	const backgroundShortcut = panelBundle.shortcutDefs.find((shortcut) => shortcut.keys === 'ctrl+b');
+	assert.ok(backgroundShortcut, 'ctrl+b is registered');
+	backgroundShortcut.handler();
+	const backgroundedRow = JSON.parse(readFileSync(join(panelDir, 'jobs', 'd-run.json'), 'utf8'));
+	assert.equal(backgroundedRow.background, true, 'ctrl+b backgrounds the foreground row');
+	assert.ok(panelBundle.notifyCalls.some((call) => /background/i.test(String(call.message))), 'the user is told it moved');
+
+	// The foreground tool call stops waiting too: its next poll sees the id and
+	// returns control to the model while the worker keeps running.
+	const fgDir = mkdtempSync(join(tmpdir(), 'subagent-foreground-'));
+	const fgRuntime = makeRuntime({
+		interactive: false,
+		env: {},
+		now: () => panelNow,
+		sleep() {
+			const {promise, resolve} = Promise.withResolvers();
+			setImmediate(resolve);
+			return promise;
+		},
+	});
+	const fgBundle = makeApi({spoolDir: fgDir, session: makeSession(), runtime: fgRuntime.runtime});
+	mod(fgBundle.api, fgBundle.runtime);
+	const pendingForeground = toolOf(fgBundle, 'subagent_spawn').run({
+		input: {description: 'waiting run', prompt: 'work', run_in_background: false},
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	fgBundle.shortcutDefs.find((shortcut) => shortcut.keys === 'ctrl+b').handler();
+	const foregroundResult = await pendingForeground;
+	assert.equal(foregroundResult.ok, true, JSON.stringify(foregroundResult));
+	assert.match(String(foregroundResult.content[0].text), /background/i, 'ctrl+b releases the foreground tool call');
+	const fgId = JSON.parse(fgRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC).id;
+	const fgRecord = JSON.parse(readFileSync(join(fgDir, 'jobs', `${fgId}.json`), 'utf8'));
+	assert.equal(fgRecord.background, true, 'the run is a background job after ctrl+b');
+	ok('agent panel: 30s rows, /tasks open/next/x, ctrl+b, and @mention candidates');
+
+	// 80. /subtask starts a fork when agent view is closed -------------------
+	const subtaskSpawn = modExports;
+	assert.ok(commandNames(forkBundle).includes('subtask'), '/subtask is registered');
+	assert.ok(!commandNames(forkBundle).includes('fork'), '/fork stays host-owned');
+	const subtaskCommand = forkBundle.commandDefs.find((def) => def.name === 'subtask');
+	const spawnsBeforeSubtask = forkRuntime.spawnCalls.length;
+	const subtask = await subtaskCommand.handler({args: 'remember ORANGE'});
+	assert.match(String(subtask.message), /subtask/i, 'the command reports the fork');
+	assert.equal(forkRuntime.spawnCalls.length, spawnsBeforeSubtask + 1, '/subtask starts a fork when agent view is off');
+	const subtaskSpec = JSON.parse(forkRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(subtaskSpec.kind, 'fork', 'the subtask is a fork');
+	assert.equal(subtaskSpec.mainSessionId, 'main-session-1', 'the subtask forks the main session');
+	// Agent view on: no second fork.
+	await tasksCommand.handler({args: ''});
+	const beforeOpenView = forkRuntime.spawnCalls.length;
+	const subtaskOnView = await subtaskCommand.handler({args: 'again'});
+	assert.match(String(subtaskOnView.message), /agent view/i, 'with agent view on, /subtask does not start a second fork');
+	assert.equal(forkRuntime.spawnCalls.length, beforeOpenView, 'no fork starts while the agent view is open');
+	ok('/subtask forks the main conversation when the agent view is off');
+	}
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);

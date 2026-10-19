@@ -129,6 +129,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 	const toolDefs = [];
 	const commandDefs = [];
 	const rendererDefs = [];
+	const shortcutDefs = [];
 	const flagDefs = new Map();
 	const flagOverrides = new Map();
 	if (spoolDir !== undefined) flagOverrides.set(dirFlag, spoolDir);
@@ -141,6 +142,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 	const statusCalls = [];
 	const shownEntries = [];
 	const userMessages = [];
+	const notifyCalls = [];
 	const promptSubmits = [];
 	const stateValues = new Map();
 
@@ -164,6 +166,10 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		},
 		addCommand(def) {
 			commandDefs.push(def);
+		},
+		addShortcut(keys, def) {
+			shortcutDefs.push({keys, ...def});
+			return {dispose() {}};
 		},
 		hooks(h) {
 			Object.assign(registeredHooks, h);
@@ -226,6 +232,9 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 				openPaneCalls.push(id);
 				return true;
 			},
+			notify(message, level) {
+				notifyCalls.push({message, level});
+			},
 			refreshWidgets() {},
 			setStatus(text) {
 				statusCalls.push(text);
@@ -243,6 +252,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		toolDefs,
 		commandDefs,
 		rendererDefs,
+		shortcutDefs,
 		flagDefs,
 		registeredHooks,
 		listeners,
@@ -253,6 +263,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		statusCalls,
 		shownEntries,
 		userMessages,
+		notifyCalls,
 		promptSubmits,
 	};
 }

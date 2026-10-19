@@ -200,6 +200,13 @@ produced plus a cut-off note. With no agent text — nothing, or only tool calls
 error is marked `failed`, and its delivered message names the error and carries the last output. Partial
 work is never discarded.
 
+**Fork mode** is on by default in an interactive session and off in a non-interactive run or the Agent
+SDK (`CLAUDE_AGENT_SDK=1`). `--mod-option fork_mode=on|off` or `BETTER_SUBAGENTS_FORK_MODE` (alias
+`CLAUDE_CODE_FORK_MODE`) controls it in either direction. Where it is on, a model-spawned agent runs in
+the background and `run_in_background` is **removed from the tool schema**, so the model cannot ask for
+the foreground. Ctrl+B is still the user's escape hatch on a foreground run: the tool call returns and the
+worker keeps going, its result arriving as a normal signal.
+
 ### Live messaging
 
 A spawn with `name` is addressable. Sending to it is one tool call:
@@ -229,6 +236,30 @@ message from a worker to a peer is accepted only for a name in that roster.
 
 `SubagentHandback` is the explicit final-report path for an agent that reports through it: the report is
 delivered as one signal and the wrapper suppresses the duplicate end-of-turn result.
+
+### Forks and agent teams
+
+`subagent_type: "fork"` starts a fork instead of a fresh subagent. A fork inherits the main
+conversation's history, system prompt, tools, model, permissions, and prompt cache — it is not filtered
+and gets no fresh startup bundle. ACP has no fork primitive, so the first turn is the host CLI's
+`--fork-session --resume <main>` with `--output-format json`; the result line names the new session, which
+each follow-up resumes with `cmd --resume <fork> -p`. Follow-ups are one-shot turns: a message sent while a
+turn is running is queued as the next turn, not injected mid-turn.
+
+`/subtask <prompt>` starts a fork when the agent view is off; `/fork` stays the host's command. The
+`/tasks` view (and the jobs pane) moves between rows (`next`/`prev`), opens a transcript (`enter`/`open`),
+sends a follow-up (`send <id> <message>`), stops a live row or dismisses a finished one (`x`), and returns
+to the prompt (`esc`). A successful row disappears at once and leaves a `/tasks` footer hint for 30
+seconds; a failed or stopped row stays 30 seconds until `x` clears it.
+
+`team_name` on `subagent_spawn` makes the run a teammate. A teammate is always foreground: its definition
+may not set `background: true`, and `run_in_background: true` is refused while fork mode is off. Teammates
+keep `TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate` and `CronCreate`/`CronDelete`/`CronList` even when the
+definition's `tools` or `disallowedTools` would remove them.
+
+`/tasks mention <prefix>` lists the `@mention` candidates: every valid custom, built-in, and
+plugin-scoped definition plus every named agent in the session. The host owns the prompt's typeahead
+widget; the mod supplies the candidate list, not a replacement widget.
 ### Tool access, model, and effort
 
 `tools` and `disallowedTools` are comma strings or YAML lists, and the spawn arguments `tools` /
@@ -296,12 +327,17 @@ note into this session; `subagent_send` takes `to`/`message` and delivers a live
 /subagents jobs          # open the async-jobs dashboard pane
 /subagents cancel <id>   # cancel a queued/running job
 /subagents open <id>     # one job: state, exit code, duration, log
+/tasks                   # the agent panel: next, prev, enter, send, x, stop, esc, mention
+/subtask <prompt>        # start a fork of the main conversation when the agent view is off
 /agents [name|path]      # subagent definitions: scope, validity, source file
 /doctor [plugins]        # duplicate, invalid, and plugin-file problems, with the fix
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
-`✓` done, `✗` failed, `⊘` canceled) and has **Refresh** (`r`) / **Cancel newest** (`c`) buttons.
+`✓` done, `✗` failed, `⊘` canceled). A row can be selected (`↑`/`↓`), opened (`↵`), stopped or
+dismissed (`x`), and left (`esc`); **Refresh** (`r`) / **Cancel newest** (`c`) remain. Success rows
+vanish immediately, failed/stopped rows stay for 30 seconds, and Ctrl+B moves a running foreground task
+to the background. The footer keeps the running count and a `/tasks` hint for 30 seconds after a result.
 
 ## Flags
 
@@ -313,6 +349,7 @@ The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` runni
 | `agents` | empty | Session-only definitions as inline JSON, or a JSON file path in a non-interactive session (`--mod-option agents=...`). |
 | `add_dir` | empty | Comma-separated extra directories whose `.commandcode/agents/` is loaded (the host's `--add-dir`). |
 | `plugin_dir` | empty | Comma-separated plugin roots; every child directory with an `agents/` directory is a plugin. |
+| `fork_mode` | `auto` | `auto` = interactive on, non-interactive/SDK off; `on`/`off` override. Where it is on, model-spawned agents run in the background and `run_in_background` is removed. |
 | `agent` | empty | Run the whole session as this agent definition (`--agent` is not a host flag, so use the mod option or `BETTER_SUBAGENTS_AGENT`). Its body becomes the main system prompt and its `initialPrompt` is the first turn. |
 | `append_subagent_system_prompt` | empty | Text or `@path` appended to every subagent's system prompt (`BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT` is the environment form). |
 | `append_subagent_system_prompt_file` | empty | File whose text is appended to every subagent's system prompt. |

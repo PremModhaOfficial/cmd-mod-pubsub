@@ -579,8 +579,8 @@ Execution and lifecycle:
 - [ ] An untagged signal moves to `orphaned/`.
 - [x] A background spawn returns immediately; a foreground spawn waits and returns the result. (smoke 49, 50)
 - [ ] A background permission prompt surfaces in the main session, names the agent, and Esc denies one call without stopping it.
-- [ ] Ctrl+B backgrounds a running foreground task.
-- [ ] Task rows follow the success/failure lifecycle and the 30-second hint.
+- [x] Ctrl+B backgrounds a running foreground task. (smoke 79)
+- [x] Task rows follow the success/failure lifecycle and the 30-second hint. (smoke 79)
 - [ ] The 21st concurrent spawn fails with the exact message; spawning resumes below the limit.
 - [ ] Nesting stops at the configured depth; the `Agent` tool errors at the limit.
 - [ ] Cancel produces exactly one canceled signal and no later result.
@@ -602,11 +602,11 @@ Live messaging, forks, and teams:
 - [ ] An idle agent starts a turn; a finished agent resumes.
 - [ ] The sibling roster lists `main` and named agents at startup.
 - [ ] `ListAgents` is visible in the foreground and absent in the background.
-- [ ] A fork inherits history, prompt, tools, model, permissions, and prompt cache.
-- [ ] A running fork can be opened, sent a follow-up, and stopped from the task view.
-- [ ] `/subtask` starts a fork when agent view is off.
-- [ ] Fork mode runs model-spawned agents in the background and removes `run_in_background`.
-- [ ] A teammate subagent runs foreground and refuses `background: true`.
+- [x] A fork inherits history, prompt, tools, model, permissions, and prompt cache. (smoke 75, 77)
+- [x] A running fork can be opened, sent a follow-up, and stopped from the task view. (smoke 76, 79)
+- [x] `/subtask` starts a fork when agent view is off. (smoke 80)
+- [x] Fork mode runs model-spawned agents in the background and removes `run_in_background`. (smoke 74, 75)
+- [x] A teammate subagent runs foreground and refuses `background: true`. (smoke 78)
 
 ## Parity ledger
 
