@@ -13,3 +13,4 @@ On 2026-10-20 the run stops when all 14 tickets #4-#17 are merged into `better-s
 | 2026-10-20 | Append each ticket's new smoke checks after the current tip and renumber only that ticket's comments. | T2 42, T11 43-46, T3 47-48, T4 49-52, T5 53-59, T8 60-64, T9 65-69. |
 | 2026-10-20 | Run T12 and T10 in parallel; T13 waits for both. | Ticket graph: #16 blocked by #15 and #13. |
 | 2026-10-20 | T12 and T10 landed. | T12 `b1662aa` (checks 70-73); T10 `fcf787e` (checks 74-80); smoke 80 PASS. |
+| 2026-10-20 | T14 closes the release ledger without the human gates: all parity rows get a check, deviations stay as rows, and the repository rename/tag wait for the human. | `SPEC.md` ledger (33 rows), ADR 0001 deviations, smoke 88/88, e2e 10/10. |

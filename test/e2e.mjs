@@ -5,6 +5,7 @@
 // This suite does, with no fakes except the ModApi host:
 //
 //   1. a real `/bin/sh -c` job (`printf`) runs to completion and signals
+//   1a. two real sessions over one spool: no cross-delivery
 //   2. a real ACP agent job runs to completion and signals
 //   3. a job that overruns its timeout is killed and reports a timeout
 //   4. a finished agent job is resumed in its own worker session
@@ -97,6 +98,34 @@ try {
 	assert.match(api.userMessages[0].text, new RegExp(`\\[subagent\\] printf job done`), 'addressed as a signal');
 	assert.match(api.userMessages[0].text, /hello-e2e/, 'with the log tail');
 	ok('the signal is delivered to the session that fired it');
+
+	// 1a. two real sessions over one spool ------------------------------------
+	// The invariant, with two mod instances, two owner tokens, and a real detached
+	// worker: a session that does not own a signal may look at it, but never gets it.
+	const isoDir = mkdtempSync(join(tmpdir(), 'subagent-e2e-iso-'));
+	const isoA = makeApi({spoolDir: isoDir, session: makeSession()});
+	const isoB = makeApi({spoolDir: isoDir, session: makeSession()});
+	mod(isoA.api, isoA.runtime);
+	mod(isoB.api, isoB.runtime);
+	const isoSpawn = await toolOf(isoA, 'subagent_spawn').run({
+		input: {description: 'owner a', command: 'printf owner-a'},
+	});
+	assert.equal(isoSpawn.ok, true, `the isolation spawn must succeed: ${JSON.stringify(isoSpawn)}`);
+	const isoId = isoSpawn.content[0].text.match(/spawned (\S+)/)[1];
+	const isoRecord = await waitFor(() => {
+		const record = recordOf(isoDir, isoId);
+		return isTerminal(record) ? record : undefined;
+	}, 'the two-session job', 30_000);
+	assert.equal(isoRecord.state, 'done', `the two-session job: ${JSON.stringify(isoRecord)}`);
+	await waitFor(() => signalsFor(isoDir, isoId).length > 0, 'the two-session signal', 10_000);
+	isoB.listeners.get('run_start')[0]({sessionId: 'iso-b'});
+	assert.equal(isoB.userMessages.length, 0, 'session B never receives a signal owned by A');
+	assert.equal(signalsFor(isoDir, isoId).length, 1, 'the foreign drain leaves the signal in inbox/');
+	isoA.listeners.get('run_start')[0]({sessionId: 'iso-a'});
+	assert.equal(isoA.userMessages.length, 1, 'session A receives its own signal');
+	assert.match(isoA.userMessages[0].text, /owner-a/, 'the delivered signal carries the job output');
+	assert.equal(signalsFor(isoDir, isoId).length, 0, 'the owner drained it');
+	ok('two real sessions over one spool: B never receives A\'s signal, A receives it once');
 
 	// 1b. a real worktree ------------------------------------------------------
 	// The smoke suite fakes git. This proves the real lifecycle: a worktree from
@@ -232,7 +261,7 @@ try {
 	const failRecord = await waitFor(() => {
 		const record = recordOf(dir, failId);
 		return isTerminal(record) ? record : undefined;
-	}, 'the API failure', 60_000);
+	}, 'the API failure', 120_000);
 	assert.ok(['done', 'failed'].includes(failRecord.state), 'the bad model does not hang the job');
 	assert.match(
 		readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'),

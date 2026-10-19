@@ -5301,6 +5301,64 @@ process.stdin.on('data', (data) => {
 	assert.equal(partialSpec.prompt, 'continue', 'the new instruction is the resumed prompt');
 	ok('T13: a partial maxTurns job remains resumable');
 
+	// 86. built-ins: every documented agent, and the restricted ones stay restricted.
+	const builtins = modExports.BUILTIN_AGENT_DEFINITIONS;
+	const builtinNames = builtins.map((definition) => definition.name);
+	for (const name of ['explore', 'plan', 'general-purpose', 'claude', 'statusline-setup', 'claude-code-guide']) {
+		assert.ok(builtinNames.includes(name), `built-in ${name} must exist`);
+	}
+	const statusline = builtins.find((definition) => definition.name === 'statusline-setup');
+	assert.equal(statusline.model, 'sonnet', 'statusline-setup runs on sonnet');
+	assert.deepEqual(statusline.tools, ['Read', 'Edit'], 'statusline-setup is restricted to the settings files');
+	const guide = builtins.find((definition) => definition.name === 'claude-code-guide');
+	assert.equal(guide.model, 'haiku', 'claude-code-guide runs on haiku');
+	assert.ok(!guide.tools.includes('Bash'), 'claude-code-guide has no shell');
+	assert.equal(
+		modExports.builtinAgentDefinitions({CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1'}).filter((definition) => definition.name === 'explore' || definition.name === 'plan').length,
+		0,
+		'CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS removes both',
+	);
+	assert.equal(
+		modExports.builtinAgentDefinitions({CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS: '1'}).length,
+		0,
+		'CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS removes every built-in',
+	);
+	const builtinRoot = mkdtempSync(join(tmpdir(), 'subagent-builtins-'));
+	const builtinRuntime = makeRuntime({cwd: builtinRoot, home: mkdtempSync(join(tmpdir(), 'subagent-builtins-home-'))});
+	const builtinBundle = makeApi({spoolDir: join(builtinRoot, 'spool'), session: makeSession(), runtime: builtinRuntime.runtime});
+	mod(builtinBundle.api, builtinRuntime.runtime);
+	const statuslineSpawn = await toolOf(builtinBundle, 'subagent_spawn').run({
+		input: {description: 'statusline', prompt: 'set it up', subagent_type: 'statusline-setup'},
+	});
+	assert.equal(statuslineSpawn.ok, true, JSON.stringify(statuslineSpawn));
+	const statuslineSpec = JSON.parse(builtinRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(statuslineSpec.agentType, 'statusline-setup', 'the status-line built-in is spawnable by name');
+	assert.equal(statuslineSpec.model, 'sonnet', 'its model reaches the worker');
+	assert.deepEqual(statuslineSpec.tools, ['Read', 'Edit'], 'its restricted tools reach the worker');
+	ok('built-ins: all six documented agents exist, restricted tools hold, and both disable switches remove them');
+
+	// 87. the description limit warns at startup, built-ins excluded.
+	assert.deepEqual(
+		modExports.descriptionLimit([
+			{source: 'builtin', description: 'x'.repeat(100_000)},
+			{source: 'project', description: 'x'.repeat(60_004)},
+		]),
+		{tokens: 15001, maxTokens: 15000, over: true},
+		'the limit counts non-built-in descriptions at four characters per token',
+	);
+	assert.equal(modExports.descriptionLimit([{source: 'project', description: 'short'}]).over, false, 'a short set stays under');
+	const limitRoot = mkdtempSync(join(tmpdir(), 'subagent-limit-'));
+	writeAgent(join(limitRoot, '.commandcode', 'agents'), 'big.md', 'big', 'x'.repeat(60_004), 'BIG BODY');
+	const limitRuntime = makeRuntime({cwd: limitRoot, home: mkdtempSync(join(tmpdir(), 'subagent-limit-home-'))});
+	const limitBundle = makeApi({spoolDir: join(limitRoot, 'spool'), session: makeSession(), runtime: limitRuntime.runtime});
+	mod(limitBundle.api, limitRuntime.runtime);
+	limitBundle.registeredHooks.onSessionStart({source: 'startup', sessionId: 'limit'});
+	const warnings = limitBundle.notifyCalls.filter((call) => /description limit/.test(String(call.message)));
+	assert.equal(warnings.length, 1, 'startup warns once');
+	assert.match(warnings[0].message, /15001 tokens/, 'the warning carries the total');
+	assert.match(warnings[0].message, /15000-token/, 'and the threshold');
+	ok('description limit: startup warns with the total and excludes built-ins');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);
