@@ -95,8 +95,8 @@ const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
 
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
-// body is the worker's system prompt. Project discovery walks up from the working
-// directory, so the closest `.commandcode/agents/` wins, then user, then built-ins.
+// body is the worker's system prompt. Discovery follows the scope table: managed,
+// CLI, project (closest directory upward, then --add-dir), user, plugin, built-in.
 const AGENT_NAME_MAX = 256;
 const AGENT_SCAN_MAX = 1000;
 const AGENT_SCAN_DEPTH_MAX = 8;
@@ -623,25 +623,20 @@ function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
 // not the host's. Only `name` and `description` are required; every other T1 field
 // is parsed and carried on the definition even when a later phase applies it.
 //
-// Discovery order is precedence order: project directories from the working
-// directory upward (closest first), then the user directory, then built-ins. The
-// first definition of a name wins. Invalid files never fail the session: they are
-// recorded with a reason, written to agents.log, and reported by `/agents`.
+// Discovery order is precedence order: the managed settings directory, the CLI
+// definitions, project directories from the working directory upward (closest
+// first) and every --add-dir directory, the user directory, plugin roots, and
+// finally the built-ins. The first definition of a name wins. Invalid files never
+// fail the session: they are recorded with a reason, written to agents.log, and
+// reported by `/agents` and `/doctor`.
 // ---------------------------------------------------------------------------
 
-export type AgentScope = 'managed' | 'cli' | 'project' | 'user' | 'plugin' | 'builtin';
+// The scopes, highest priority first. The order is the precedence rule: managed
+// wins over CLI, CLI over project, project over user, user over plugin, and every
+// one over a built-in. It is also the display order in `/agents`.
+export const AGENT_SCOPES = ['managed', 'cli', 'project', 'user', 'plugin', 'builtin'] as const;
 
-// Highest priority first. `builtin` is last: a project or user definition MAY
-// override a built-in by name. A plugin identifier is scoped, so it collides with
-// a built-in only by construction, never by accident.
-const AGENT_SCOPE_PRIORITY: Readonly<Record<AgentScope, number>> = {
-	managed: 0,
-	cli: 1,
-	project: 2,
-	user: 3,
-	plugin: 4,
-	builtin: 5,
-};
+export type AgentScope = (typeof AGENT_SCOPES)[number];
 
 export type AgentEntryKind = 'valid' | 'invalid' | 'duplicate';
 
@@ -959,24 +954,23 @@ export function agentDefinitionFromSource(
 		};
 	}
 	const fields = frontmatter.fields;
+	const fallbackDefinition = (warning: string): AgentDefinitionResult => {
+		const definition = pluginFallbackDefinition(frontmatter.body, path, options);
+		// A usable description in an otherwise unusable file is still worth keeping.
+		const parsedDescription = stringField(fields.description);
+		if (parsedDescription !== undefined) definition.description = parsedDescription;
+		return {ok: true, definition, warning};
+	};
 
 	const rawName = stringField(fields.name) ?? '';
 	if (rawName.length === 0) {
 		if (options.plugin !== true) return {ok: false, reason: 'name: required'};
-		return {
-			ok: true,
-			definition: pluginFallbackDefinition(frontmatter.body, path, options),
-			warning: 'name: required; loaded under its filename',
-		};
+		return fallbackDefinition('name: required; loaded under its filename');
 	}
 	const nameError = validateAgentName(rawName);
 	if (nameError !== undefined) {
 		if (options.plugin !== true) return {ok: false, reason: nameError};
-		return {
-			ok: true,
-			definition: pluginFallbackDefinition(frontmatter.body, path, options),
-			warning: `${nameError}; loaded under its filename`,
-		};
+		return fallbackDefinition(`${nameError}; loaded under its filename`);
 	}
 	const name = options.scopedPrefix !== undefined ? `${options.scopedPrefix}${rawName}` : rawName;
 	const description = stringField(fields.description);
@@ -3217,8 +3211,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			counts[entry.source] = (counts[entry.source] ?? 0) + 1;
 		}
 		// Scope order, so the summary reads the way precedence does.
-		const summary = (Object.keys(AGENT_SCOPE_PRIORITY) as AgentScope[])
-			.filter(scope => (counts[scope] ?? 0) > 0)
+		const summary = AGENT_SCOPES.filter(scope => (counts[scope] ?? 0) > 0)
 			.map(scope => `${counts[scope]} ${scope === 'builtin' ? 'built-in' : scope}`)
 			.join(', ');
 		const lines = shown.map(entry => {
