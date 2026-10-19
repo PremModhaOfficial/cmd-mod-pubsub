@@ -92,6 +92,11 @@ const WAIT_MAX_MS = 60 * 1000;
 const WAIT_POLL_MS = 200;
 const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
+// Live messaging. A running agent polls its control/send.jsonl; an agent with no
+// message waits this long for a turn before it exits and a send resumes it.
+const LIVE_POLL_MS = 100;
+const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
+const ROSTER_MAIN = 'main';
 
 // Agent definitions. A definition is a Markdown file with YAML frontmatter; its
 // body is the worker's system prompt. Discovery follows the scope table: managed,
@@ -293,6 +298,19 @@ const settle = (state, detail, code, tail, extra) => {
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
+  // SubagentHandback already sent the report to the parent. Record the terminal
+  // state, but do not emit a second signal for the same run.
+  if (readRecord().handbackAt) {
+    writeRecord({
+      state: state,
+      exitCode: typeof code === 'number' ? code : undefined,
+      finishedAt: finishedAt,
+      durationMs: durationMs,
+      failureReason: failed ? detail : undefined,
+      awaitingInput: state === 'waiting-input' ? true : undefined
+    });
+    return;
+  }
   const payload = extra || {};
   // Scan is the last step before the text can reach the parent; the record and
   // the signal carry the same facts.
@@ -627,6 +645,190 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     bypassPermissions: 'bypass'
   };
 
+  // ---- live messaging ----
+  // One control directory per job: send.jsonl is appended by the sender, cancel is
+  // a marker, and state.json says whether a turn is active. Polling (not watch)
+  // keeps this portable; the send file is append-only and a byte offset means each
+  // line is read exactly once, even while a turn is running.
+  const controlDir = typeof spec.controlDir === 'string' ? spec.controlDir : '';
+  const sendPath = controlDir.length > 0 ? path.join(controlDir, 'send.jsonl') : '';
+  const cancelPath = controlDir.length > 0 ? path.join(controlDir, 'cancel') : '';
+  const statePath = controlDir.length > 0 ? path.join(controlDir, 'state.json') : '';
+  const queue = [];
+  let sendOffset = 0;
+  let sendPartial = '';
+  let canceled = false;
+  let cancelSent = false;
+  let activeSessionId;
+  let turnCount = 0;
+  let waiting = null;
+  let childGone = false;
+
+  const wake = () => {
+    const resolve = waiting;
+    waiting = null;
+    if (resolve) resolve();
+  };
+
+  // The parent reads this to tell "queued for the next safe point" from "starts a
+  // turn now". Atomic rename, so a reader never sees a half-written file.
+  const writeState = busy => {
+    if (statePath.length === 0) return;
+    try {
+      fs.mkdirSync(controlDir, {recursive: true});
+      const tmp = statePath + '.tmp-' + process.pid;
+      fs.writeFileSync(tmp, JSON.stringify({busy: !!busy, turns: turnCount, updatedAt: Date.now()}));
+      fs.renameSync(tmp, statePath);
+    } catch (e) {}
+  };
+
+  const readSend = () => {
+    if (sendPath.length === 0) return;
+    let size;
+    try { size = fs.statSync(sendPath).size; } catch (e) { return; }
+    if (size <= sendOffset) return;
+    let chunk = '';
+    try {
+      const fd = fs.openSync(sendPath, 'r');
+      const length = size - sendOffset;
+      const buffer = Buffer.alloc(length);
+      fs.readSync(fd, buffer, 0, length, sendOffset);
+      fs.closeSync(fd);
+      sendOffset = size;
+      chunk = buffer.toString('utf8');
+    } catch (e) { return; }
+    const lines = (sendPartial + chunk).split('\\n');
+    sendPartial = lines.pop() || '';
+    let added = false;
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        if (entry && typeof entry.message === 'string' && entry.message.length > 0) {
+          queue.push(entry);
+          added = true;
+        }
+      } catch (e) {}
+    }
+    if (added) wake();
+  };
+
+  const pollControl = () => {
+    if (cancelPath.length > 0 && !canceled) {
+      try {
+        if (fs.existsSync(cancelPath)) {
+          canceled = true;
+          logWrite('[live] cancel requested\\n');
+          wake();
+        }
+      } catch (e) {}
+    }
+    readSend();
+    if (canceled && !cancelSent && typeof activeSessionId === 'string') {
+      cancelSent = true;
+      sendMessage({id: nextId++, method: 'session/cancel', params: {sessionId: activeSessionId}});
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      childGone = true;
+      wake();
+    }
+  };
+  const pollMs = typeof spec.controlPollMs === 'number' && spec.controlPollMs > 0 ? spec.controlPollMs : 100;
+  const controlTimer = setInterval(pollControl, pollMs);
+  if (controlTimer.unref) controlTimer.unref();
+  pollControl();
+
+  // A turn's terminal reason, or undefined for a completed turn. The first turn
+  // settles the job (existing behavior); a live turn emits a message signal and
+  // leaves the session open.
+  const turnOutcome = result => {
+    clearTimers();
+    const stopReason = result && result.stopReason;
+    if (stopReason === 'end_turn') return undefined;
+    if (stopReason === 'cancelled') return 'cancelled';
+    if (stopReason === 'max_tokens') return 'max tokens reached; result is partial';
+    if (stopReason === 'max_turn_requests') return 'max turns reached; result is partial';
+    return 'ACP turn ended: ' + String(stopReason || 'unknown');
+  };
+
+  const emitTurn = (from, start, failure) => {
+    turnCount += 1;
+    let tail = '';
+    try { tail = fs.readFileSync(spec.logPath, 'utf8').slice(start); } catch (e) { tail = ''; }
+    const prefix = failure === undefined
+      ? 'reply to ' + String(from || 'main') + ':'
+      : failure + '\\nreply to ' + String(from || 'main') + ':';
+    const scan = scanOutput(prefix + '\\n' + tail);
+    emit(signalEnvelope({
+      id: spec.id + '-msg-' + turnCount,
+      label: spec.label + ' (message)',
+      kind: 'message',
+      owner: spec.owner,
+      startedAt: Date.now(),
+      logPath: spec.logPath,
+      sessionId: spec.sessionId
+    }, {
+      state: failure === undefined ? 'done' : 'failed',
+      exitCode: failure === undefined ? 0 : null,
+      finishedAt: Date.now(),
+      durationMs: 0,
+      title: (spec.name || spec.label) + (failure === undefined ? ' replied' : ' failed a live turn'),
+      body: scan.text,
+      scanned: true,
+      scanMatches: scan.matches
+    }));
+  };
+
+  // After the first turn: wait for a message, run it as its own prompt, and only
+  // exit once the idle window passes. A message that arrives mid-turn is queued by
+  // the poller and picked up here, so the running turn is never restarted.
+  const liveLoop = async () => {
+    if (spec.live !== true) return;
+    const idleMs = typeof spec.idleMs === 'number' && spec.idleMs >= 0 ? spec.idleMs : 30000;
+    writeState(false);
+    while (!canceled && !childGone) {
+      if (queue.length === 0) {
+        const {promise, resolve} = Promise.withResolvers();
+        waiting = resolve;
+        if (queue.length > 0 || canceled || childGone) {
+          waiting = null;
+          resolve();
+        }
+        const deadline = setTimeout(resolve, idleMs);
+        if (deadline.unref) deadline.unref();
+        await promise;
+        clearTimeout(deadline);
+        waiting = null;
+        if (queue.length === 0) {
+          if (!canceled && !childGone) logWrite('[live] idle window elapsed\\n');
+          return;
+        }
+      }
+      if (canceled || childGone) return;
+      const entry = queue.shift();
+      const from = typeof entry.from === 'string' ? entry.from : 'main';
+      const text = String(entry.message);
+      logWrite('\\n[live] message from ' + from + ': ' + text + '\\n');
+      writeState(true);
+      let start = 0;
+      try { start = fs.statSync(spec.logPath).size; } catch (e) { start = 0; }
+      let result;
+      try {
+        result = await request('session/prompt', {sessionId: activeSessionId, prompt: [{type: 'text', text: text}]});
+      } catch (error) {
+        logWrite('[live] turn failed: ' + String(error && error.message || error) + '\\n');
+        emitTurn(from, start, 'live turn failed: ' + String(error && error.message || error));
+        writeState(false);
+        continue;
+      }
+      const outcome = turnOutcome(result);
+      if (canceled && (outcome === 'cancelled' || outcome === undefined)) return;
+      emitTurn(from, start, outcome);
+      writeState(false);
+      if (outcome !== undefined) return;
+    }
+  };
+
   const runPrompt = async () => {
     await request('initialize', {
       protocolVersion: 1,
@@ -665,6 +867,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       configOptions = Array.isArray(session.configOptions) ? session.configOptions : [];
     }
     writeRecord({acpSessionId: sessionId});
+    activeSessionId = sessionId;
     logWrite('[acp] session ' + sessionId + ' cwd ' + spec.cwd + '\\n');
     if (typeof spec.permissionMode === 'string') {
       if (modeIds[spec.permissionMode]) {
@@ -741,13 +944,17 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
       logWrite('[acp] startup context ' + startupText.length + ' chars (hook ' + (hookReady ? 'live' : 'absent') + ')\\n');
     }
     const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
-    clearTimers();
-    const stopReason = result && result.stopReason;
-    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readReportTail());
-    else if (stopReason === 'cancelled') fail('cancelled', null);
-    else if (stopReason === 'max_tokens') fail('max tokens reached; result is partial', null);
-    else if (stopReason === 'max_turn_requests') fail('max turns reached; result is partial', null);
-    else fail('ACP turn ended: ' + String(stopReason || 'unknown'), null);
+    const outcome = turnOutcome(result);
+    if (outcome !== undefined) {
+      fail(outcome, null);
+      shutdown();
+      return;
+    }
+    // The first turn is the job's result, as before. With live messaging the
+    // session then stays open: the record is done, but the process (and its ACP
+    // session) keeps accepting messages until the idle window passes.
+    settle('done', 'exit 0', 0, readReportTail());
+    await liveLoop();
     shutdown();
   };
   runPrompt().catch(error => {
@@ -2597,6 +2804,50 @@ export function buildStartupBundle(options: StartupOptions): StartupBundle {
 // passed in the environment: no shell interpolation.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Live messaging: the roster
+//
+// A named spawn is addressable. Every agent that has the send tool starts with a
+// snapshot of its siblings, so it can message them without a discovery call. The
+// snapshot lists main and the OTHER named agents only: an unnamed job has no
+// address, and an agent is never its own peer. The newest record for a name wins,
+// so a resumed agent replaces the job it continued.
+// ---------------------------------------------------------------------------
+
+export interface RosterEntry {
+	name?: string;
+	state?: string;
+	jobId?: string;
+}
+
+export function buildRoster(entries: readonly RosterEntry[], selfName?: string): string {
+	const named = new Map<string, RosterEntry>();
+	for (const entry of entries) {
+		const name = typeof entry.name === 'string' ? entry.name.trim() : '';
+		if (name.length === 0 || name === selfName) continue;
+		if (!named.has(name)) named.set(name, entry);
+	}
+	if (named.size === 0) return '';
+	const lines = [
+		'SIBLING ROSTER (snapshot taken at start; address a peer with subagent_send({to, message}))',
+		`${ROSTER_MAIN} — the conversation that started you`,
+	];
+	for (const [name, entry] of named) {
+		const state = typeof entry.state === 'string' && entry.state.length > 0 ? ` (${entry.state})` : '';
+		const job = typeof entry.jobId === 'string' && entry.jobId.length > 0 ? ` job ${entry.jobId}` : '';
+		lines.push(`${name}${state}${job}`);
+	}
+	return lines.join('\n');
+}
+
+// ListAgents is a foreground tool: a foreground agent inherits it when cross-session
+// messaging is on; a background agent does not keep it. One pure predicate, so the
+// tool registration and the tests cannot disagree about visibility.
+export function listAgentsVisible(options: {background?: boolean; crossSessionMessaging?: boolean}): boolean {
+	if (options.crossSessionMessaging === false) return false;
+	return options.background !== true;
+}
+
 export interface WorkerSpecInput {
 	id: string;
 	label: string;
@@ -2644,6 +2895,18 @@ export interface WorkerSpecInput {
 	worktree?: string;
 	/** Checkout roots this job must never enter. */
 	mainCheckouts?: string[];
+	/** Addressable name (`subagent_spawn.name`); absent for an anonymous agent. */
+	name?: string;
+	/** Rendered sibling snapshot (main + other named agents), taken at spawn. */
+	roster?: string;
+	/** Roster names, for ListAgents and for validating a worker's `to`. */
+	rosterNames?: string[];
+	/** Accept live messages after the first turn instead of exiting. */
+	live?: boolean;
+	/** How long an idle live agent waits for a message before it exits. */
+	idleMs?: number;
+	/** Poll interval for the control channel. */
+	controlPollMs?: number;
 	/** The rendered startup bundle: CLAUDE.md, git status, skills, memory, roster. */
 	startup?: string;
 }
@@ -3626,6 +3889,11 @@ interface JobRecord extends JobIdentity {
 	depth?: number;
 	parentJobId?: string;
 	agentType?: string;
+	/** The addressable name from the spawn; absent for an anonymous agent. */
+	name?: string;
+	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
+	 *  own end-of-turn signal is suppressed. */
+	handbackAt?: number;
 	/** The resolved execution policy: false is a foreground run. */
 	background?: boolean;
 	model?: string;
@@ -4250,8 +4518,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const logsDir = join(root, 'logs');
 	const jobsDir = join(root, 'jobs');
 	const worktreesDir = join(root, 'worktrees');
+	const controlRoot = join(root, 'control');
 	const ledgerPath = join(root, 'delivered.jsonl');
-	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir]) {
+	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir, controlRoot]) {
 		spool.mkdir(dir);
 	}
 
@@ -4657,6 +4926,98 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			}
 		}
 		return jobs;
+	}
+
+	// ------------------------------------------------------------------ live
+	//
+	// One live-message queue per job. A sender appends a JSON line; the worker
+	// consumes it at the next safe point (see WORKER_SOURCE). A worker's state.json
+	// says whether a turn is active, so the tool can report "queued" vs "starts a
+	// turn" without guessing. Names resolve inside this session's jobs only: another
+	// session's roster is not this session's to message.
+
+	function rosterNames(): string[] {
+		if (workerMode) return Array.isArray(workerSpec?.rosterNames) ? workerSpec.rosterNames : [];
+		const own = ownerId();
+		const names: string[] = [];
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (typeof job.name !== 'string' || job.name.length === 0) continue;
+			if (own !== undefined && job.owner !== own) continue;
+			if (!names.includes(job.name)) names.push(job.name);
+		}
+		return names;
+	}
+
+	function namedJob(name: string): JobRecord | undefined {
+		const wanted = name.trim();
+		if (wanted.length === 0) return undefined;
+		const own = workerMode ? workerSpec?.owner : ownerId();
+		const allowed = workerMode ? rosterNames() : undefined;
+		let fallback: JobRecord | undefined;
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (job.name !== wanted) continue;
+			if (!workerMode && own !== undefined && job.owner !== undefined && job.owner !== own) continue;
+			if (allowed !== undefined && !allowed.includes(wanted)) continue;
+			// Prefer the record whose worker is still alive: a resumed job shares the
+			// name with the record it continued, and the live one is the address.
+			if (runtime.alive(job.workerPid) || runtime.alive(job.pid)) return job;
+			if (fallback === undefined) fallback = job;
+		}
+		return fallback;
+	}
+
+	// `alive` decides queue-vs-resume; `busy` decides the wording of a queue. No
+	// state file means the worker has not published yet, so a live worker is assumed
+	// to be in a turn.
+	function liveState(record: JobRecord): {alive: boolean; busy: boolean} {
+		const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
+		let busy = true;
+		try {
+			const state = JSON.parse(spool.readFile(join(controlRoot, record.id, 'state.json'))) as {busy?: unknown};
+			busy = state.busy !== false;
+		} catch {
+			/* no state file yet */
+		}
+		return {alive, busy};
+	}
+
+	function appendLive(id: string, from: string, message: string): boolean {
+		const dir = join(controlRoot, id);
+		try {
+			spool.mkdir(dir);
+			spool.appendFile(join(dir, 'send.jsonl'), `${JSON.stringify({from, message, at: runtime.now()})}\n`);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	// The snapshot a new agent receives: main plus every other named agent owned by
+	// this session, newest record per name. `rosterNames` is the same set as data, so
+	// the worker can validate a `to` without parsing the rendered text.
+	function rosterFor(selfName: string | undefined): {roster?: string; rosterNames: string[]} {
+		const own = workerMode ? workerSpec?.owner : ownerId();
+		const entries: RosterEntry[] = [];
+		const names: string[] = [];
+		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
+			if (typeof job.name !== 'string' || job.name.length === 0) continue;
+			if (job.name === selfName) continue;
+			if (own !== undefined && job.owner !== own) continue;
+			if (names.includes(job.name)) continue;
+			names.push(job.name);
+			entries.push({name: job.name, state: canonicalState(job.state), jobId: job.id});
+		}
+		// A nested agent inherits its parent's view of the team plus its parent itself.
+		if (workerMode) {
+			const inherited = [String(workerSpec?.name ?? ''), ...(Array.isArray(workerSpec?.rosterNames) ? workerSpec.rosterNames : [])];
+			for (const name of inherited) {
+				if (name.length === 0 || name === selfName || names.includes(name)) continue;
+				names.push(name);
+				entries.push({name});
+			}
+		}
+		const roster = buildRoster(entries, selfName);
+		return {...(roster.length > 0 ? {roster} : {}), rosterNames: names};
 	}
 
 	function enqueueSignal(message: Signal): void {
@@ -5108,7 +5469,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (job === undefined) return {ok: false, message: `subagent: no job ${id}`};
 		const state = normalizeState(job.state);
 		if (state !== undefined && isTerminal(state)) {
-			return {ok: false, message: `subagent: job ${id} is already ${state}`};
+			// A live agent's record is terminal after its first turn, but its worker is
+			// still addressable. Stopping it is a process stop, not a state change.
+			if (!liveState(job).alive) return {ok: false, message: `subagent: job ${id} is already ${state}`};
+			try {
+				spool.mkdir(join(controlRoot, id));
+				spool.writeFile(join(controlRoot, id, 'cancel'), '1');
+			} catch {
+				/* the kill below still stops it */
+			}
+			killPid(job.pid, 'SIGTERM');
+			killPid(job.workerPid, 'SIGTERM');
+			return {ok: true, message: `subagent: stopped live agent ${id} (${String(job.label ?? 'unlabelled')})`};
 		}
 
 		const now = runtime.now();
@@ -5188,6 +5560,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		/** resume this ACP session id first */
 		readonly resumeSession?: string;
 		readonly resumedFrom?: string;
+		/** addressable name; a named agent can be messaged after it finishes */
+		readonly name?: string;
+		/** override the owner (a worker resuming a session it did not create) */
+		readonly owner?: string;
+		/** keep the ACP session open for live messages after the first turn */
+		readonly live?: boolean;
 	}
 
 	type Launch =
@@ -5229,6 +5607,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			owner,
 			label: intent.label,
 			kind: intent.kind,
+			...(intent.name !== undefined ? {name: intent.name} : {}),
 			state: 'queued',
 			// The resolved policy, not the raw `run_in_background`: env and definition
 			// overrides are already applied by the caller.
@@ -5353,7 +5732,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			intent.isolation === 'worktree'
 				? createJobWorktree({git: git.git, fs: spool}, {cwd: intent.cwd, path: join(worktreesDir, id)})
 				: undefined;
-		const owner = ownerId();
+		const owner = intent.owner ?? ownerId();
 		const record = makeRecord(
 			{...intent, depth, ...(workerSpec?.id !== undefined ? {parentJobId: workerSpec.id} : {})},
 			id,
@@ -5382,6 +5761,20 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 
 		const isAgent = intent.prompt !== undefined;
+		const live = isAgent && intent.live !== false;
+		// The roster is for an agent that can actually message a peer. Host definitions
+		// name the tool SendMessage; the mod registers it as subagent_send.
+		const canSend =
+			intent.tools === undefined || intent.tools.includes('SendMessage') || intent.tools.includes('subagent_send');
+		const roster = isAgent && canSend ? rosterFor(intent.name) : {rosterNames: []};
+		const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
+		if (live) {
+			try {
+				spool.mkdir(join(controlRoot, id));
+			} catch {
+				/* the first send retries the mkdir */
+			}
+		}
 		const spec = buildSpec(
 			{
 				id,
@@ -5396,6 +5789,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				tailMax: LOG_TAIL_BYTES_MAX,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
+				...(intent.name !== undefined ? {name: intent.name} : {}),
 				background: intent.background !== false,
 				// A foreground caller answers permission prompts inline; a background run
 				// settles with the request instead of holding a worker that nobody watches.
@@ -5418,6 +5812,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
 				...(intent.resumeSession !== undefined ? {resumeSession: intent.resumeSession} : {}),
 				...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+				...(roster.roster !== undefined ? {roster: roster.roster} : {}),
+				...(roster.rosterNames.length > 0 ? {rosterNames: roster.rosterNames} : {}),
+				...(intent.background !== undefined ? {background: intent.background} : {}),
+				...(live ? {live: true, controlDir: join(controlRoot, id), ...(Number.isFinite(idleMs) && idleMs > 0 ? {idleMs} : {})} : {}),
 				...(isAgent ? {promptMarkerPath: join(logsDir, `${id}.mod`)} : {}),
 				...(isolation?.ok === true ? {worktree: isolation.path, mainCheckouts: isolation.mainCheckouts} : {}),
 			},
@@ -5529,7 +5927,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// for one release: an installed prompt, a script, or a habit that still calls the
 	// old name keeps working, and cannot drift from the new one because there is only
 	// one implementation.
-
 	type ToolResult = {ok: boolean; error?: string; content?: {type: string; text: string}[]};
 	const okText = (value: string): ToolResult => ({ok: true, content: [{type: 'text', text: value}]});
 	const badInput = (error: string): ToolResult => ({ok: false, error});
@@ -5579,6 +5976,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			return badInput('permission_mode applies to agent jobs; a shell command has no permission mode');
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
+		const name = typeof input.name === 'string' && input.name.trim().length > 0 ? input.name.trim() : undefined;
 		const requestedMaxTurns = Number(input.max_turns);
 		const timeoutMs = Number(input.timeout_ms);
 		// `subagent_type` is canonical; `agent_type` is the 1.x alias and must behave
@@ -5680,6 +6078,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			prompt,
 			background,
 			cwd: runCwd,
+			...(name !== undefined ? {name} : {}),
 			agentType: definition?.name,
 			systemPrompt: subagentSystemPrompt(definition?.systemPrompt),
 			startup: startupFor(definition, runCwd, prompt, launch.model),
@@ -5694,6 +6093,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			effort: prompt === undefined ? undefined : launch.effort,
 			permissionMode,
 			isolation: definition?.isolation,
+			...(prompt === undefined ? {} : {background}),
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
 		if (!launched.ok) return badInput(launched.error);
@@ -5817,6 +6217,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (record.prompt === undefined) {
 			return badInput(`subagent: job ${id} is a shell job; there is no agent session to resume`);
 		}
+		// A live worker already owns this session. Starting a second worker would race
+		// the first over it, so the live path is the message path.
+		if (liveState(record).alive) {
+			return badInput(
+				`subagent: job ${id} is still running; send it a live message with subagent_send` +
+					(record.name === undefined ? ' once it finishes, or wait for its result' : `({to: "${record.name}", message}) instead`),
+			);
+		}
 		// Resume the ACP session the first run created, so the new instruction continues
 		// with the context the worker already has. An older record without one starts a
 		// fresh session (the definition body still applies).
@@ -5871,6 +6279,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			timeoutMs: record.timeoutMs,
 			resumeSession: record.acpSessionId,
 			resumedFrom: id,
+			...(record.name !== undefined ? {name: record.name} : {}),
+			...(record.owner !== undefined ? {owner: record.owner} : {}),
 		});
 		if (!launched.ok) return badInput(launched.error);
 		if (launched.result !== undefined) {
@@ -5883,7 +6293,34 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		);
 	};
 
-	const sendRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+	// The read side of the team: definitions, addressable agents, and the agent's
+	// explicit final report. `ListAgents` is registered only where it belongs.
+	function agentsToolText(scope?: string): string {
+		registry.refresh();
+		const wanted = String(scope ?? '').trim().toLowerCase();
+		const entries = registry.entries().filter(entry => wanted.length === 0 || entry.source === wanted);
+		if (entries.length === 0) return `no${wanted.length > 0 ? ` ${wanted}` : ''} agent definitions`;
+		const lines = entries.map(entry => {
+			const state = entry.valid ? 'valid' : `invalid: ${entry.reason ?? 'unknown'}`;
+			const model = entry.definition?.model !== undefined ? ` model=${entry.definition.model}` : '';
+			const tools = entry.definition?.tools !== undefined ? ` tools=${entry.definition.tools.join(',')}` : '';
+			const source = entry.path.length > 0 ? ` · ${entry.path}` : '';
+			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'} · ${entry.source} · ${state}${model}${tools}${source}`;
+		});
+		return `${entries.length} definition(s)${wanted.length > 0 ? ` in ${wanted}` : ''}:\n${lines.join('\n')}`;
+	}
+
+	function listAgentsText(): string {
+		const lines = [`${ROSTER_MAIN} — this conversation`];
+		for (const name of rosterNames()) {
+			const record = namedJob(name);
+			if (record === undefined) continue;
+			lines.push(`${name} — ${canonicalState(record.state)} (job ${record.id})`);
+		}
+		return lines.join('\n');
+	}
+
+	const noteRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
 		const title = typeof input.title === 'string' ? input.title : '';
 		if (title.length === 0) return badInput('title is required');
 		const body = typeof input.body === 'string' ? input.body : '';
@@ -5905,6 +6342,87 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return okText(ledger.has(id) ? 'delivered' : 'queued for this session');
 	};
 
+	// Live messaging. The target is a name, never a pid: the record decides whether
+	// the message is queued to a live worker or starts a new turn in its finished
+	// session, so a resume keeps the session the agent already has.
+	const sendLiveRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const to = String(input.to ?? '').trim();
+		const message = typeof input.message === 'string' ? input.message : '';
+		if (to.length === 0) return badInput('to is required: a named agent or main');
+		if (message.trim().length === 0) return badInput('message is required and must not be empty');
+		const from = workerMode ? String(workerSpec?.name ?? 'worker') : ROSTER_MAIN;
+		if (to === ROSTER_MAIN) {
+			const id = `live-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+			const scan = scanOutput(message);
+			enqueueSignal({
+				id,
+				owner: workerMode ? workerSpec?.owner : ownerId(),
+				label: `message from ${from}`,
+				kind: 'message',
+				state: 'note',
+				exitCode: null,
+				title: `message from ${from}`,
+				body: scan.text,
+				sessionId: workerMode ? workerSpec?.sessionId : sessionId,
+				...(workerMode ? {scanned: true, scanMatches: scan.matches} : {}),
+			});
+			if (!workerMode) {
+				safeDrain();
+				refreshJobs();
+			}
+			return okText(`sent a message to ${ROSTER_MAIN} from ${from}`);
+		}
+		const record = namedJob(to);
+		if (record === undefined) {
+			const names = rosterNames();
+			return badInput(
+				`no agent named "${to}"${names.length > 0 ? `; addressable: ${names.join(', ')}` : '; no named agents in this session'}`,
+			);
+		}
+		const {alive, busy} = liveState(record);
+		if (alive) {
+			if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${to}: its control queue is not writable`);
+			return okText(
+				`${busy ? `queued for ${to}'s next safe point` : `sent to idle ${to}; it starts a turn`} (job ${record.id}).\n` +
+					`The reply arrives here as its own message signal.`,
+			);
+		}
+		if (record.acpSessionId === undefined) {
+			return badInput(`${to} has finished and has no resumable session; spawn it again`);
+		}
+		// A finished agent resumes the ACP session it already has, with the same
+		// definition, startup context, tools, model, effort and permissions. The
+		// message is the new turn.
+		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
+		const resumeCwd = String(record.cwd ?? cmd.cwd);
+		const launched = await fire({
+			label: `${String(record.label ?? record.id)} (message)`,
+			kind: 'agent',
+			prompt: message,
+			cwd: resumeCwd,
+			agentType: record.agentType,
+			systemPrompt: resumeDefinition?.systemPrompt,
+			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
+			model: record.model,
+			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.color !== undefined ? {color: record.color} : {}),
+			maxTurns: record.maxTurns,
+			effort: record.effort,
+			permissionMode: record.permissionMode,
+			timeoutMs: record.timeoutMs,
+			resumeSession: record.acpSessionId,
+			resumedFrom: record.id,
+			name: record.name,
+			owner: record.owner,
+		});
+		if (!launched.ok) return badInput(launched.error);
+		return okText(
+			`resumed ${to} as ${launched.id} "${String(record.label ?? record.id)} (message)", pid ${launched.pid}.\n` +
+				`The reply arrives here as its own signal.`,
+		);
+	};
+
 	addSurface(
 		'subagent_spawn',
 		'Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode.',
@@ -5913,6 +6431,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			properties: {
 				description: {type: 'string', description: 'Short name for this job, used in the signal title.'},
 				label: {type: 'string', description: 'Alias for description.'},
+				name: {type: 'string', description: 'Address this agent later with subagent_send. A named agent appears in its siblings\' roster.'},
 				prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
 				command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
 				agent_type: {type: 'string', description: "Deprecated alias for subagent_type. Use subagent_type."},
@@ -6005,8 +6524,90 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	);
 
 	addSurface(
+		'subagent_agents',
+		'List the available agent definitions: scope, model, tools, validity, and the file that provides each one. Pass `scope` to filter to project, user, or builtin.',
+		{
+			type: 'object',
+			properties: {
+				scope: {type: 'string', description: 'Only definitions from this scope (project, user, builtin).'},
+			},
+			required: [],
+		},
+		async ({input}: {input: Record<string, unknown>}) =>
+			okText(agentsToolText(typeof input.scope === 'string' ? input.scope : undefined)),
+		{readOnly: true},
+	);
+
+	const crossSessionMessaging = runtime.env.BETTER_SUBAGENTS_CROSS_SESSION !== '0';
+	if (listAgentsVisible({background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging})) {
+		addSurface(
+			'ListAgents',
+			'List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.',
+			{type: 'object', properties: {}, required: []},
+			async () => okText(listAgentsText()),
+			{readOnly: true},
+		);
+	}
+
+	if (workerSpec !== undefined) {
+		addSurface(
+			'SubagentHandback',
+			'Hand your final report back to the conversation that receives this run\'s result. The report is delivered as its own message; end the turn afterwards. The wrapper suppresses the duplicate end-of-turn result.',
+			{
+				type: 'object',
+				properties: {
+					report: {type: 'string', description: 'The final report for the parent conversation.'},
+				},
+				required: ['report'],
+			},
+			async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+				const report = String(input.report ?? '').trim();
+				if (report.length === 0) return badInput('report is required and must not be empty');
+				const id = String(workerSpec?.id ?? '');
+				const record = id.length === 0 ? undefined : readJob(id);
+				if (record === undefined) return badInput(`subagent: no job ${id || '(worker)'}`);
+				const now = runtime.now();
+				const scan = scanOutput(report);
+				record.handbackAt = now;
+				record.updatedAt = now;
+				writeJob(record);
+				enqueueSignal(
+					signalOf({...record, id: `${id}-handback-${now.toString(36)}`}, {
+						state: 'done',
+						finishedAt: now,
+						durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
+						body: scan.text,
+						scanned: true,
+						scanMatches: scan.matches,
+						title: `${String(record.label ?? id)} handback`,
+					}),
+				);
+				refreshJobs();
+				return okText(`handed the report back (job ${id}); it reaches the parent as one message`);
+			},
+		);
+	}
+
+	addSurface(
 		'subagent_send',
-		'Publish a signal into the agent loop of THIS session. This is the AGENT-TO-AGENT channel: worker and peer agents signal a session so neither side blocks on the other or polls for a result. It is delivered as a visible user turn in the session (echoed in the TUI), and it is durable if no session is bound yet. NEVER use it to notify the human - to reach the human, reply in the session.',
+		'Send a live message to a named agent (or "main"). A running agent queues it and answers at its next safe point; an idle agent starts a turn; a finished agent resumes its session with full context. The reply arrives later as its own message signal, so do not wait for it here.',
+		{
+			type: 'object',
+			properties: {
+				to: {type: 'string', description: 'A named agent, or "main" for this conversation.'},
+				message: {type: 'string', description: 'The message to deliver. The target acts on it in its own session.'},
+			},
+			required: ['to', 'message'],
+		},
+		sendLiveRun,
+	);
+
+	// The 0.1.0 note channel. It is NOT an alias of live messaging: it publishes a
+	// note into this session, while subagent_send delivers to another agent. It is
+	// removed one release after the rename.
+	addSurface(
+		'pubsub_send',
+		'[deprecated: live messaging moved to subagent_send] Publish a note into the agent loop of THIS session. It is delivered as a visible user turn. This is not live messaging to another agent.',
 		{
 			type: 'object',
 			properties: {
@@ -6015,8 +6616,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			},
 			required: ['title'],
 		},
-		sendRun,
-		{aliases: ['pubsub_send']},
+		noteRun,
 	);
 
 	// ------------------------------------------------------------------ command

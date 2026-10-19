@@ -14,6 +14,7 @@ Memory for the long-running parity goal. Sources are cited, not copied. Claims a
 
 ## Decisions
 
+- [Decision trail](decisions.md) — the exit condition and dated calls for the autonomous run, as of 2026-10-20.
 - [Transport](transport.md) — ACP for non-fork jobs and one-shot `cmd --resume -p` for forks, as of ADR 0001.
 
 ## Environment

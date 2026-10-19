@@ -236,8 +236,8 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 15: Live messaging, teams, forks, permissions
 
-- [ ] Named agents, sibling roster at startup, `subagent_send` queue/start/resume.
-- [ ] `ListAgents` foreground/background visibility; `SubagentHandback`.
+- [x] Named agents, sibling roster at startup, `subagent_send` queue/start/resume.
+- [x] `ListAgents` foreground/background visibility; `SubagentHandback`.
 - [ ] Agent teams: teammates keep task and cron tools; teammate runs foreground; refuse `background: true` and `run_in_background: true`.
 - [ ] Forks: full history, same prompt/tools/model/permissions/prompt cache; `fork` type; `/subtask`.
 - [ ] Observe and steer: Enter, `x`, Esc; confirmation for `/compact`, `/clear`, `/rewind`; `/model` and `/fast` do not act on the fork.
