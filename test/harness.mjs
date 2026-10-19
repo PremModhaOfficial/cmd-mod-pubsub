@@ -22,7 +22,9 @@ import {
 	statSync,
 	writeFileSync,
 } from 'node:fs';
+import * as nodeFs from 'node:fs';
 import {tmpdir} from 'node:os';
+import * as nodePath from 'node:path';
 import {join} from 'node:path';
 
 // ---------------------------------------------------------------- assertions
@@ -306,3 +308,60 @@ export const realFs = {
 const EMPTY_HOME = mkdtempSync(join(tmpdir(), 'subagent-empty-home-'));
 
 export const tempDir = (prefix) => mkdtempSync(join(tmpdir(), prefix));
+
+// Drive the detached worker's `finish` path in this process. The worker source is
+// evaluated with a fake child and a fake `process`, and the test fires the `exit`
+// listener itself: no real process, no wait. The spool files are real, so the
+// record and the signal are the same bytes a detached worker would write.
+//
+// Command jobs only: an agent job needs a JSON-RPC child on stdout.
+export function makeWorkerDriver(spec) {
+	const handlers = new Map();
+	const spawns = [];
+	const exitCodes = [];
+	const child = {
+		pid: 515151,
+		stdin: {end() {}},
+		on(event, handler) {
+			const list = handlers.get(event) ?? [];
+			list.push(handler);
+			handlers.set(event, list);
+		},
+		unref() {},
+		kill() {},
+	};
+	const fakeProcess = {
+		pid: 616161,
+		env: {SUBAGENT_SPEC: JSON.stringify(spec)},
+		on() {},
+		exit(code) {
+			exitCodes.push(code);
+		},
+	};
+	Function('require', 'process', 'setTimeout', 'clearTimeout', workerSource())(
+		(name) => {
+			if (name === 'node:child_process') {
+				return {
+					spawn(command, args, options) {
+						spawns.push({command, args, options});
+						return child;
+					},
+				};
+			}
+			if (name === 'node:fs') return nodeFs;
+			if (name === 'node:path') return nodePath;
+			throw new Error(`worker require(${name}) is not stubbed`);
+		},
+		fakeProcess,
+		// The driver is synchronous: a worker timer must not keep the suite alive.
+		() => 0,
+		() => {},
+	);
+	return {
+		spawns,
+		exitCodes,
+		emit(event, ...args) {
+			for (const handler of handlers.get(event) ?? []) handler(...args);
+		},
+	};
+}
