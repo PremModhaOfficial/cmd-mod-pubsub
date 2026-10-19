@@ -1622,6 +1622,7 @@ process.stdin.on('data', (data) => {
 		name: 'Tester',
 		label: 'tester',
 		kind: 'agent',
+		agentType: 'general-purpose',
 		state: 'running',
 		startedAt: 1,
 		workerPid: livePid,
@@ -1661,6 +1662,7 @@ process.stdin.on('data', (data) => {
 	assert.equal(liveResumeSpec.resumeSession, 'acp-old', 'the recorded ACP session is resumed');
 	assert.equal(liveResumeSpec.name, 'Tester', 'the resumed job keeps the addressable name');
 	assert.equal(liveResumeSpec.prompt, 'after finish', 'the live message is the resumed turn');
+	assert.equal(typeof liveResumeSpec.startup, 'string', 'the resumed turn gets its startup context');
 	assert.match(resumedLive.content[0].text, /resumed/i, 'the tool reports a resume');
 
 	const toMain = await sendTool.run({input: {to: 'main', message: 'note to self'}});

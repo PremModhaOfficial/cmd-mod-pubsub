@@ -182,8 +182,8 @@ try {
 	assert.ok(['done', 'failed'].includes(failRecord.state), 'the bad model does not hang the job');
 	assert.match(
 		readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'),
-		/model not set|unknown model/i,
-		'the model rejection is in the log',
+		/model not set|unknown model|not in the allowed catalog/i,
+		'the model rejection or documented fallback is in the log',
 	);
 	ok(`bad model reported and the job finished: jobs/${failId}.json (${failRecord.state})`);
 

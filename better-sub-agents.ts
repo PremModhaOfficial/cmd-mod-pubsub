@@ -4245,7 +4245,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 		const isAgent = intent.prompt !== undefined;
 		const live = isAgent && intent.live !== false;
-		const roster = isAgent ? rosterFor(intent.name) : {rosterNames: []};
+		// The roster is for an agent that can actually message a peer. Host definitions
+		// name the tool SendMessage; the mod registers it as subagent_send.
+		const canSend =
+			intent.tools === undefined || intent.tools.includes('SendMessage') || intent.tools.includes('subagent_send');
+		const roster = isAgent && canSend ? rosterFor(intent.name) : {rosterNames: []};
 		const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
 		if (live) {
 			try {
@@ -4284,6 +4288,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 				...(roster.roster !== undefined ? {roster: roster.roster} : {}),
 				...(roster.rosterNames.length > 0 ? {rosterNames: roster.rosterNames} : {}),
+				...(intent.background !== undefined ? {background: intent.background} : {}),
 				...(live ? {live: true, controlDir: join(controlRoot, id), ...(Number.isFinite(idleMs) && idleMs > 0 ? {idleMs} : {})} : {}),
 				...(isAgent ? {promptMarkerPath: join(logsDir, `${id}.mod`)} : {}),
 			},
@@ -4482,6 +4487,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			effort: prompt === undefined ? undefined : launch.effort,
 			permissionMode: definition?.permissionMode,
 			isolation: definition?.isolation,
+			...(prompt === undefined ? {} : {background: input.run_in_background !== false}),
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
 		if (!launched.ok) return badInput(launched.error);
@@ -4740,16 +4746,22 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			return badInput(`${to} has finished and has no resumable session; spawn it again`);
 		}
 		// A finished agent resumes the ACP session it already has, with the same
-		// definition, model, effort and permissions. The message is the new turn.
+		// definition, startup context, tools, model, effort and permissions. The
+		// message is the new turn.
 		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
+		const resumeDefinition = definition?.ok === true ? definition.definition : undefined;
+		const resumeCwd = String(record.cwd ?? cmd.cwd);
 		const launched = fire({
 			label: `${String(record.label ?? record.id)} (message)`,
 			kind: 'agent',
 			prompt: message,
-			cwd: String(record.cwd ?? cmd.cwd),
+			cwd: resumeCwd,
 			agentType: record.agentType,
-			systemPrompt: definition?.ok === true ? definition.definition.systemPrompt : undefined,
+			systemPrompt: resumeDefinition?.systemPrompt,
+			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
 			model: record.model,
+			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.color !== undefined ? {color: record.color} : {}),
 			maxTurns: record.maxTurns,
 			effort: record.effort,
 			permissionMode: record.permissionMode,
