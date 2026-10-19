@@ -639,37 +639,40 @@ try {
 	const recDir = mkdtempSync(join(tmpdir(), 'subagent-reconcile-'));
 	let recNow = fixedNow;
 	const recRuntime = makeRuntime({now: () => recNow, alive: (pid) => pid === 777});
-	const rec = makeApi({spoolDir: recDir, session: makeSession(), runtime: recRuntime.runtime});
+	const recSession = makeSession();
+	const rec = makeApi({spoolDir: recDir, session: recSession, runtime: recRuntime.runtime});
 	mod(rec.api, rec.runtime);
-	const writeStale = (id, state, startedAt, workerPid) =>
+	const recOwner = ownerEntries(recSession)[0];
+	const writeStale = (id, state, startedAt, workerPid, owner = recOwner) =>
 		writeFileSync(
 			join(recDir, 'jobs', `${id}.json`),
-			JSON.stringify({id, label: id, kind: 'command', state, startedAt, workerPid, owner: 'owner-x'}),
+			JSON.stringify({id, label: id, kind: 'command', state, startedAt, workerPid, owner}),
 		);
 	writeStale('lost-young', 'running', recNow - 10_000, 424242);
 	writeStale('lost-old', 'running', recNow - 31_000, 424242);
 	writeStale('never-started', 'queued', recNow - 40_000, undefined);
 	writeStale('still-alive', 'running', recNow - 40_000, 777);
+	writeStale('someone-elses', 'running', recNow - 60_000, 424242, 'owner-somebody-else');
 	rec.registeredHooks.onSessionStart({source: 'startup', sessionId: 'rec'});
 	const stateOf = (id) => JSON.parse(readFileSync(join(recDir, 'jobs', `${id}.json`), 'utf8')).state;
 	assert.equal(stateOf('lost-young'), 'running', 'inside the grace window the job is left alone');
 	assert.equal(stateOf('lost-old'), 'failed', 'a dead running job fails after 30s');
 	assert.equal(stateOf('never-started'), 'failed', 'a queued job whose worker never started fails');
 	assert.equal(stateOf('still-alive'), 'running', 'a live worker is never failed');
+	assert.equal(stateOf('someone-elses'), 'running', "another session's job is not reconciled (or signalled) here");
 	const lostReason = JSON.parse(readFileSync(join(recDir, 'jobs', 'lost-old.json'), 'utf8')).failureReason;
 	assert.equal(lostReason, 'lost (no live process)', 'the record says why');
-	const reconciled = readdirSync(join(recDir, 'inbox')).filter((name) => name.includes('lost-old'));
-	assert.equal(reconciled.length, 1, 'the owner is told once that the result is gone');
-	assert.equal(
-		JSON.parse(readFileSync(join(recDir, 'inbox', reconciled[0]), 'utf8')).state,
-		'failed',
-		'the reconciled signal is a failure',
-	);
+	const told = rec.userMessages.filter((message) => message.text.includes('lost-old'));
+	assert.equal(told.length, 1, 'the owner is told once that the result is gone');
+	assert.match(told[0].text, /lost \(no live process\)/, 'the message carries the reason');
+	assert.match(told[0].text, /failed/, 'the reconciled signal is a failure');
+	rec.userMessages.length = 0;
 	rec.registeredHooks.onSessionStart({source: 'startup', sessionId: 'rec'});
+	assert.equal(rec.userMessages.length, 0, 'a second reconcile does not emit a second signal');
 	assert.equal(
-		readdirSync(join(recDir, 'inbox')).filter((name) => name.includes('lost-old')).length,
-		1,
-		'a second reconcile does not emit a second signal',
+		rec.userMessages.filter((message) => message.text.includes('someone-elses')).length,
+		0,
+		"and no signal is emitted on another session's behalf",
 	);
 	ok('reconciliation: dead queued/running fails after 30s, once, and signals its owner');
 

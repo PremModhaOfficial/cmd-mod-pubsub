@@ -398,7 +398,6 @@ interface JobRecord extends JobIdentity {
 	timeoutMs?: number;
 	sessionName?: string;
 	resumedFrom?: string;
-	options?: Record<string, unknown>;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;
@@ -1168,6 +1167,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (workerMode) return;
 		const now = runtime.now();
 		for (const job of readRecentJobs(RECONCILE_SCAN_MAX)) {
+			// Another session's job is its own business: it reconciles and signals it.
+			// Touching it here would let one session write another's record and emit a
+			// signal on its behalf.
+			if (typeof job.owner === 'string' && job.owner.length > 0 && job.owner !== ownerToken) continue;
 			const state = normalizeState(job.state);
 			if (state === 'queued' || state === 'running') {
 				if (runtime.alive(job.pid) || runtime.alive(job.workerPid)) continue;
