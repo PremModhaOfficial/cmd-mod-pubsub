@@ -15,7 +15,8 @@
 //      factory argument, so the OS never runs during the suite
 
 import assert from 'node:assert/strict';
-import {existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {spawn} from 'node:child_process';
+import {chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
@@ -43,6 +44,17 @@ import {
 //
 // The fakes live in test/harness.mjs, shared with the end-to-end suite. This file
 // only asserts.
+
+// Write one definition file. `extra` becomes additional frontmatter lines.
+function writeAgent(dir, file, name, description, body, extra = {}) {
+	mkdirSync(dir, {recursive: true});
+	const lines = ['---'];
+	if (name !== undefined) lines.push(`name: ${name}`);
+	if (description !== undefined) lines.push(`description: ${description}`);
+	for (const [key, value] of Object.entries(extra)) lines.push(`${key}: ${value}`);
+	lines.push('---', '', body, '');
+	writeFileSync(join(dir, file), lines.join('\n'));
+}
 
 // --------------------------------------------------------------------- run
 
@@ -806,29 +818,36 @@ try {
 		'a shell job has no agent session to resume',
 	);
 
-	await toolOf(res, 'subagent_spawn').run({input: {description: 'agent', prompt: 'first', agent_type: 'explore'}});
+	await toolOf(res, 'subagent_spawn').run({input: {description: 'agent', prompt: 'first', subagent_type: 'explore'}});
 	const agentSpec = JSON.parse(resRuntime.spawnCalls[1].options.env.SUBAGENT_SPEC);
-	assert.equal(agentSpec.sessionName, `subagent-${agentSpec.id}`, 'an agent job pins a deterministic session name');
-	assert.deepEqual(
-		agentSpec.sessionName === undefined ? [] : [agentSpec.sessionName],
-		[`subagent-${agentSpec.id}`],
-		'the worker spec carries the session name',
-	);
+	assert.equal(agentSpec.agentType, 'explore', 'the resolved definition name is recorded');
+	assert.deepEqual(agentSpec.args.slice(0, 1), ['--mod'], 'an agent worker loads the mod');
+	assert.ok(agentSpec.args[1]?.endsWith('better-sub-agents.ts'), 'the mod file that defines the worker');
+	assert.equal(agentSpec.args[2], 'acp', 'the worker transport is ACP');
+	assert.match(agentSpec.systemPrompt, /read-only codebase explorer/, 'the definition body travels in the spec');
 	const running = await resume.run({input: {id: agentSpec.id, prompt: 'continue'}});
 	assert.equal(running.ok, false, 'a running job cannot be resumed');
 	assert.match(running.error, /still queued|still running/);
 
-	// The job is finished; resume continues its worker session.
+	// The job is finished; resume continues its ACP session.
 	const agentRecordPath = join(resDir, 'jobs', `${agentSpec.id}.json`);
 	writeFileSync(
 		agentRecordPath,
-		JSON.stringify({...JSON.parse(readFileSync(agentRecordPath, 'utf8')), state: 'done', exitCode: 0, finishedAt: fixedNow, durationMs: 10}),
+		JSON.stringify({
+			...JSON.parse(readFileSync(agentRecordPath, 'utf8')),
+			state: 'done',
+			exitCode: 0,
+			finishedAt: fixedNow,
+			durationMs: 10,
+			acpSessionId: 'acp-session-1',
+		}),
 	);
 	const resumed = await resume.run({input: {id: agentSpec.id, prompt: 'continue'}});
 	assert.equal(resumed.ok, true, `a finished agent job resumes: ${JSON.stringify(resumed)}`);
 	const resumedSpec = JSON.parse(resRuntime.spawnCalls[2].options.env.SUBAGENT_SPEC);
-	assert.equal(resumedSpec.resumeSession, `subagent-${agentSpec.id}`, 'the resume targets the worker session by name');
+	assert.equal(resumedSpec.resumeSession, 'acp-session-1', 'the resume targets the ACP session id');
 	assert.equal(resumedSpec.prompt, 'continue', 'the new instruction is the resumed prompt');
+	assert.match(resumedSpec.systemPrompt, /read-only codebase explorer/, 'the resumed worker keeps the definition body');
 	const resumedRecord = JSON.parse(readFileSync(join(resDir, 'jobs', `${resumedSpec.id}.json`), 'utf8'));
 	assert.equal(resumedRecord.resumedFrom, agentSpec.id, 'the new record says what it resumed');
 	assert.equal(resumedRecord.agentType, 'explore', 'the agent type carries over');
@@ -925,6 +944,472 @@ try {
 	assert.match(workerScript, /resumeSession|'-r'/, 'the worker can resume its own session');
 	assert.equal(typeof timeoutSpec.timeoutMs, 'number');
 	ok('the worker handles a timeout, a max-turns cap and a resume');
+
+	// 32. typed spawn: subagent_type, the deprecated alias, and the fallback ----
+	const typedDir = mkdtempSync(join(tmpdir(), 'subagent-typed-'));
+	const typedRuntime = makeRuntime({now: () => fixedNow});
+	const typed = makeApi({spoolDir: typedDir, session: makeSession(), runtime: typedRuntime.runtime});
+	mod(typed.api, typed.runtime);
+	const typedSpawn = toolOf(typed, 'subagent_spawn');
+	const spawnSpec = async (input) => {
+		const before = typedRuntime.spawnCalls.length;
+		const result = await typedSpawn.run({input});
+		const call = typedRuntime.spawnCalls[before];
+		return {result, spec: call === undefined ? undefined : JSON.parse(call.options.env.SUBAGENT_SPEC)};
+	};
+
+	const fallback = await spawnSpec({description: 'fallback', prompt: 'do it'});
+	assert.equal(fallback.result.ok, true, 'a prompt without a type spawns');
+	assert.equal(fallback.spec.agentType, 'general-purpose', 'an omitted type resolves to general-purpose');
+	assert.match(fallback.spec.systemPrompt, /general-purpose autonomous agent/, 'the fallback body reaches the worker');
+
+	const canonical = await spawnSpec({description: 'canonical', prompt: 'do it', subagent_type: 'explore'});
+	const aliased = await spawnSpec({description: 'aliased', prompt: 'do it', agent_type: 'explore'});
+	assert.equal(canonical.spec.agentType, 'explore', 'subagent_type selects the definition');
+	assert.equal(aliased.spec.agentType, canonical.spec.agentType, 'agent_type is the canonical type');
+	assert.equal(aliased.spec.systemPrompt, canonical.spec.systemPrompt, 'agent_type delivers the same body');
+	assert.equal(aliased.spec.model, canonical.spec.model, 'agent_type resolves the same model');
+	assert.equal(aliased.spec.permissionMode, canonical.spec.permissionMode, 'agent_type resolves the same mode');
+
+	// The body reaches the worker as its system prompt: the worker process loads this
+	// mod through `cmd --mod <file> acp`, and the mod registers appendSystemPrompt
+	// from the spec it was given.
+	const hookRuntime = makeRuntime({
+		env: {
+			...process.env,
+			BETTER_SUBAGENTS_WORKER: '1',
+			SUBAGENT_SPEC: JSON.stringify({systemPrompt: 'DEFINITION BODY'}),
+		},
+	});
+	const hook = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-hook-')),
+		session: makeSession(),
+		runtime: hookRuntime.runtime,
+	});
+	mod(hook.api, hookRuntime.runtime);
+	assert.equal(typeof hook.registeredHooks.appendSystemPrompt, 'function', 'the worker registers a system-prompt hook');
+	assert.equal(hook.registeredHooks.appendSystemPrompt(), 'DEFINITION BODY', 'the definition body is the worker system prompt');
+
+	const general = await spawnSpec({description: 'general', prompt: 'do it', subagent_type: 'general'});
+	assert.equal(general.spec.agentType, 'general-purpose', 'general is the host-reserved alias for general-purpose');
+
+	const unknown = await typedSpawn.run({input: {description: 'unknown', prompt: 'x', subagent_type: 'nope'}});
+	assert.equal(unknown.ok, false, 'an unknown type is rejected');
+	assert.match(unknown.error, /unknown subagent_type "nope"/, 'the error names the type');
+	const conflicting = await typedSpawn.run({
+		input: {description: 'conflict', prompt: 'x', subagent_type: 'explore', agent_type: 'plan'},
+	});
+	assert.equal(conflicting.ok, false, 'two different type spellings are ambiguous');
+
+	const typedList = await toolOf(typed, 'subagent_list').run({input: {}});
+	assert.match(typedList.content[0].text, /subagent_type=explore/, 'subagent_list shows the subagent_type');
+	assert.match(typedList.content[0].text, /canonical/, 'subagent_list shows the agent name');
+
+	const emptyCwd = mkdtempSync(join(tmpdir(), 'subagent-empty-cwd-'));
+	const emptyHome = mkdtempSync(join(tmpdir(), 'subagent-empty-user-'));
+	const noBuiltinsRuntime = makeRuntime({
+		env: {...process.env, CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS: '1'},
+		cwd: emptyCwd,
+		home: emptyHome,
+	});
+	const noBuiltins = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-no-builtins-')),
+		session: makeSession(),
+		runtime: noBuiltinsRuntime.runtime,
+	});
+	mod(noBuiltins.api, noBuiltinsRuntime.runtime);
+	const noFallback = await toolOf(noBuiltins, 'subagent_spawn').run({input: {description: 'none', prompt: 'x'}});
+	assert.equal(noFallback.ok, false, 'a prompt with no general-purpose agent fails');
+	assert.equal(noFallback.error, 'subagent_type is required', 'the exact documented error');
+
+	const noExploreRuntime = makeRuntime({
+		env: {...process.env, CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS: '1'},
+		cwd: emptyCwd,
+		home: emptyHome,
+	});
+	const noExplore = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-no-explore-')),
+		session: makeSession(),
+		runtime: noExploreRuntime.runtime,
+	});
+	mod(noExplore.api, noExploreRuntime.runtime);
+	assert.equal(
+		(await toolOf(noExplore, 'subagent_spawn').run({input: {description: 'x', prompt: 'x', subagent_type: 'explore'}})).ok,
+		false,
+		'CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS removes explore',
+	);
+	assert.equal(
+		(await toolOf(noExplore, 'subagent_spawn').run({input: {description: 'x', prompt: 'x', subagent_type: 'claude'}})).ok,
+		true,
+		'and leaves the other built-ins',
+	);
+	ok('typed spawn: subagent_type, the agent_type alias, the fallback, and the exact error');
+
+	// 33. definitions: discovery, precedence, validation, and fields ----------
+	const registryRoot = mkdtempSync(join(tmpdir(), 'subagent-registry-'));
+	const projectRoot = join(registryRoot, 'project');
+	const nestedRoot = join(projectRoot, 'packages', 'app');
+	const homeRoot = join(registryRoot, 'home');
+	const projectAgents = join(projectRoot, '.commandcode', 'agents');
+	const nestedAgents = join(nestedRoot, '.commandcode', 'agents');
+	const userAgents = join(homeRoot, '.commandcode', 'agents');
+
+	writeAgent(userAgents, 'shared.md', 'shared', 'user shared', 'USER SHARED BODY');
+	writeAgent(userAgents, 'user-only.md', 'user-only', 'user only', 'USER ONLY BODY');
+	writeAgent(projectAgents, 'shared.md', 'shared', 'project shared', 'PROJECT SHARED BODY');
+	writeAgent(projectAgents, 'explore.md', 'explore', 'project explore', 'PROJECT EXPLORE BODY', {model: 'custom-model'});
+	writeAgent(projectAgents, 'nested.md', 'nested', 'outer nested', 'OUTER NESTED BODY');
+	writeAgent(nestedAgents, 'nested.md', 'nested', 'inner nested', 'INNER NESTED BODY');
+	writeAgent(join(nestedAgents, 'deep'), 'reviewer.md', 'reviewer', 'deep reviewer', 'RECURSIVE REVIEWER BODY');
+	writeAgent(nestedAgents, 'dup-a.md', 'dup', 'dup a', 'DUP A BODY');
+	writeAgent(nestedAgents, 'dup-b.md', 'dup', 'dup b', 'DUP B BODY');
+	writeFileSync(
+		join(projectAgents, 'full.md'),
+		[
+			'---',
+			'name: full',
+			'description: "Full definition"',
+			'tools: Read, Grep',
+			'disallowedTools:',
+			'  - Bash',
+			'model: custom',
+			'permissionMode: acceptEdits',
+			'maxTurns: 7',
+			'skills: [one, two]',
+			'isolation: worktree',
+			'background: true',
+			'color: blue',
+			'omitClaudeMd: true',
+			'effort: high',
+			'---',
+			'',
+			'FULL BODY',
+			'',
+		].join('\n'),
+	);
+
+	// Every skip rule in SPEC "Invalid files".
+	writeFileSync(join(projectAgents, 'no-name.md'), '---\ndescription: no name\n---\nbody');
+	writeFileSync(join(projectAgents, 'no-description.md'), '---\nname: no-description\n---\nbody');
+	writeFileSync(join(projectAgents, 'bad-first.md'), '# heading\n---\nname: bad-first\ndescription: x\n---\nbody');
+	writeFileSync(join(projectAgents, 'bad-colon.md'), '---\nname: plugin:agent\ndescription: x\n---\nbody');
+	writeFileSync(join(projectAgents, 'too-long.md'), `---\nname: ${'a'.repeat(257)}\ndescription: x\n---\nbody`);
+	writeFileSync(join(projectAgents, 'dash-name.md'), '---\nname: -leading\ndescription: x\n---\nbody');
+	writeFileSync(join(projectAgents, 'bad-yaml.md'), '---\nname: [unclosed\ndescription: x\n---\nbody');
+	writeFileSync(join(projectAgents, 'tab-indent.md'), '---\nname: tab-indent\ndescription: x\n\tmodel: y\n---\nbody');
+
+	const registryRuntime = makeRuntime({now: () => fixedNow, cwd: nestedRoot, home: homeRoot});
+	const registrySpool = mkdtempSync(join(tmpdir(), 'subagent-registry-spool-'));
+	const registry = makeApi({spoolDir: registrySpool, session: makeSession(), runtime: registryRuntime.runtime});
+	mod(registry.api, registry.runtime);
+	const registrySpawn = toolOf(registry, 'subagent_spawn');
+	const spawnDefinition = async (type) => {
+		const before = registryRuntime.spawnCalls.length;
+		const result = await registrySpawn.run({input: {description: type, prompt: 'x', subagent_type: type}});
+		const call = registryRuntime.spawnCalls[before];
+		return {result, spec: call === undefined ? undefined : JSON.parse(call.options.env.SUBAGENT_SPEC)};
+	};
+
+	const inner = await spawnDefinition('nested');
+	assert.equal(inner.spec.systemPrompt, 'INNER NESTED BODY', 'the closest project directory wins');
+	const shared = await spawnDefinition('shared');
+	assert.equal(shared.spec.systemPrompt, 'PROJECT SHARED BODY', 'project scope overrides user scope');
+	const reviewer = await spawnDefinition('reviewer');
+	assert.equal(reviewer.spec.systemPrompt, 'RECURSIVE REVIEWER BODY', 'subdirectories are scanned recursively');
+	const override = await spawnDefinition('explore');
+	assert.equal(override.spec.systemPrompt, 'PROJECT EXPLORE BODY', 'a project definition overrides a built-in by name');
+	assert.equal(override.spec.model, 'custom-model', 'an overriding definition keeps its own model');
+	const userOnly = await spawnDefinition('user-only');
+	assert.equal(userOnly.spec.systemPrompt, 'USER ONLY BODY', 'user definitions load');
+	const duplicate = await spawnDefinition('dup');
+	assert.equal(duplicate.spec.systemPrompt, 'DUP A BODY', 'same-directory duplicates resolve by read order');
+
+	const full = await spawnDefinition('full');
+	assert.equal(full.spec.systemPrompt, 'FULL BODY', 'the body is the system prompt');
+	assert.equal(full.spec.model, 'custom', 'the definition model reaches the worker');
+	assert.equal(full.spec.maxTurns, 7, 'maxTurns reaches the worker');
+	assert.equal(full.spec.effort, 'high', 'effort reaches the worker');
+	assert.equal(full.spec.permissionMode, 'acceptEdits', 'permissionMode reaches the worker');
+	const fullRecord = JSON.parse(readFileSync(join(registrySpool, 'jobs', `${full.spec.id}.json`), 'utf8'));
+	assert.equal(fullRecord.isolation, 'worktree', 'isolation is recorded on the job');
+	assert.equal(fullRecord.effort, 'high', 'effort is recorded on the job');
+	assert.equal(fullRecord.permissionMode, 'acceptEdits', 'permissionMode is recorded on the job');
+
+	const overridden = await registrySpawn.run({
+		input: {description: 'override', prompt: 'x', subagent_type: 'full', model: 'call-model', max_turns: 3},
+	});
+	assert.equal(overridden.ok, true, 'an explicit model and turn cap are accepted');
+	const overriddenSpec = JSON.parse(registryRuntime.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(overriddenSpec.model, 'call-model', 'the call model wins over the definition');
+	assert.equal(overriddenSpec.maxTurns, 3, 'the call turn cap wins over the definition');
+
+	for (const name of ['no-name', 'no-description', 'bad-first', 'bad-yaml', 'tab-indent']) {
+		const skipped = await registrySpawn.run({input: {description: name, prompt: 'x', subagent_type: name}});
+		assert.equal(skipped.ok, false, `${name} is skipped, never spawned`);
+		assert.match(skipped.error, /unknown subagent_type/, `${name} never reaches the registry`);
+	}
+
+	const agentsCommand = registry.commandDefs.find((def) => def.name === 'agents');
+	assert.ok(agentsCommand !== undefined, '/agents must be registered');
+	const listing = agentsCommand.handler({args: ''}).message;
+	assert.match(listing, /valid definition\(s\)/, '/agents summarises validity');
+	assert.match(listing, /nested {2}project {2}valid/, 'a project definition is listed');
+	assert.match(listing, /reviewer {2}project {2}valid/, 'a nested definition is listed');
+	assert.match(listing, /user-only {2}user {2}valid/, 'a user definition is listed');
+	assert.match(listing, /explore {2}project {2}valid/, 'the project override is listed');
+	assert.match(listing, /duplicate name "dup"/, 'a same-directory duplicate is reported');
+	assert.match(listing, /invalid: name: required/, 'a missing name is reported');
+	assert.match(listing, /invalid: description: required/, 'a missing description is reported');
+	assert.match(listing, /invalid: frontmatter must start with --- on the first line/, 'a bad first line is reported');
+	assert.match(listing, /invalid: name: must not contain ":"/, 'a colon name is reported');
+	assert.match(listing, /invalid: name: must be at most 256 characters/, 'an overlong name is reported');
+	assert.match(listing, /invalid: name: must not start with "-"/, 'a leading-dash name is reported');
+	assert.match(listing, /invalid: unclosed flow sequence/, 'bad YAML is reported');
+	assert.match(listing, /invalid: tab indentation/, 'a tab-indented frontmatter is reported');
+	assert.match(listing, /read-only/, '/agents marks read-only definitions');
+	assert.match(listing, /one-shot/, '/agents marks one-shot definitions');
+
+	const filtered = agentsCommand.handler({args: 'nested'}).message;
+	assert.match(filtered, /nested/, '/agents <name> narrows the listing');
+	assert.ok(!filtered.includes('user-only'), 'the filter hides other definitions');
+
+	const agentLog = readFileSync(join(registrySpool, 'agents.log'), 'utf8');
+	assert.match(agentLog, /no-name\.md: name: required/, 'the missing name is debug-logged');
+	assert.match(agentLog, /no-description\.md: description: required/, 'the missing description is debug-logged');
+	assert.match(agentLog, /bad-first\.md: frontmatter must start with --- on the first line/, 'the bad first line is debug-logged');
+	assert.match(agentLog, /bad-colon\.md: name: must not contain ":"/, 'the colon name is debug-logged');
+	assert.match(agentLog, /too-long\.md: name: must be at most 256 characters/, 'the overlong name is debug-logged');
+	assert.match(agentLog, /dash-name\.md: name: must not start with "-"/, 'the leading-dash name is debug-logged');
+	assert.match(agentLog, /bad-yaml\.md: unclosed flow sequence/, 'bad YAML is debug-logged');
+	assert.match(agentLog, /tab-indent\.md: tab indentation/, 'the tab indentation is debug-logged');
+
+	const exports = await import('../better-sub-agents.ts');
+	assert.equal(typeof exports.agentDefinitionFromSource, 'function', 'the parser is exported for a focused check');
+	const parsedFull = exports.agentDefinitionFromSource(
+		readFileSync(join(projectAgents, 'full.md'), 'utf8'),
+		'full.md',
+		'project',
+	);
+	assert.equal(parsedFull.ok, true, 'the full definition parses');
+	if (parsedFull.ok) {
+		assert.deepEqual(parsedFull.definition.tools, ['Read', 'Grep'], 'a comma string parses as a tool list');
+		assert.deepEqual(parsedFull.definition.disallowedTools, ['Bash'], 'a block list parses as disallowed tools');
+		assert.deepEqual(parsedFull.definition.skills, ['one', 'two'], 'an inline list parses as skills');
+		assert.equal(parsedFull.definition.isolation, 'worktree', 'isolation parses');
+		assert.equal(parsedFull.definition.background, true, 'background parses as a boolean');
+		assert.equal(parsedFull.definition.color, 'blue', 'color parses');
+		assert.equal(parsedFull.definition.omitClaudeMd, true, 'omitClaudeMd parses as a boolean');
+	}
+	assert.equal(exports.parseFrontmatter('name: x\n---\n').ok, false, 'a missing opening --- is rejected');
+	assert.equal(exports.parseFrontmatter('---\nname: [x\ndescription: y\n---\n').ok, false, 'an unclosed flow sequence is rejected');
+	ok('definitions: walk-up, closest-wins, recursive, precedence, validation, /agents, and agents.log');
+
+	// 34. the WorkerSpec / buildArgs seam and one shared envelope -------------
+	const seam = await import('../better-sub-agents.ts');
+	assert.equal(typeof seam.buildSpec, 'function', 'buildSpec is the one spec constructor');
+	assert.equal(typeof seam.buildArgs, 'function', 'buildArgs is the one argv builder');
+	assert.equal(typeof seam.signalEnvelope, 'function', 'the envelope is shared with the worker');
+
+	const commandSpec = seam.buildSpec(
+		{
+			id: 'c',
+			label: 'c',
+			kind: 'command',
+			command: 'printf hi',
+			cwd: '/tmp',
+			logPath: '/tmp/c.log',
+			inboxDir: '/tmp/inbox',
+			jobsDir: '/tmp/jobs',
+			startedAt: 1,
+			tailMax: 100,
+			bin: '/bin/sh',
+		},
+		'/mod.ts',
+	);
+	assert.deepEqual(commandSpec.args, ['-c', 'printf hi'], 'a shell job keeps the /bin/sh argv');
+	const agentSeamSpec = seam.buildSpec(
+		{
+			id: 'a',
+			label: 'a',
+			kind: 'agent',
+			prompt: 'x',
+			cwd: '/tmp',
+			logPath: '/tmp/a.log',
+			inboxDir: '/tmp/inbox',
+			jobsDir: '/tmp/jobs',
+			startedAt: 1,
+			tailMax: 100,
+			bin: 'cmd',
+		},
+		'/mod.ts',
+	);
+	assert.deepEqual(agentSeamSpec.args, ['--mod', '/mod.ts', 'acp'], 'an agent job runs cmd --mod <file> acp');
+
+	const envelope = seam.signalEnvelope(
+		{id: 'e', label: 'envelope', kind: 'agent', owner: 'o', startedAt: 10, logPath: '/l', sessionId: 's'},
+		{state: 'done', exitCode: 0, finishedAt: 20, durationMs: 10, body: 'ok'},
+	);
+	assert.deepEqual(
+		envelope,
+		{
+			id: 'e',
+			owner: 'o',
+			label: 'envelope',
+			kind: 'agent',
+			state: 'done',
+			exitCode: 0,
+			startedAt: 10,
+			finishedAt: 20,
+			durationMs: 10,
+			logPath: '/l',
+			sessionId: 's',
+			title: 'envelope done',
+			body: 'ok',
+		},
+		'the envelope has one field list',
+	);
+
+	const workerText = workerSource();
+	assert.match(workerText, /const signalEnvelope = function signalEnvelope/, 'the worker embeds the shared envelope');
+	assert.match(workerText, /session\/new/, 'the ACP session is created');
+	assert.match(workerText, /session\/prompt/, 'the ACP prompt runs the turn');
+	assert.match(workerText, /session\/set_mode/, 'the permission mode is applied over ACP');
+	assert.match(workerText, /session\/set_config_option/, 'model and effort are applied over ACP');
+	assert.ok(!workerText.includes('childArgs'), 'the cmd -p argv builder is gone');
+	assert.ok(!workerText.includes("args.push('-p'"), 'no -p prompt argv remains');
+	ok('WorkerSpec, buildSpec, buildArgs, and one shared signal envelope; cmd -p argv is gone');
+
+	// 35. the ACP worker end to end, against a fake ACP server ----------------
+	// A real child process speaks line-delimited JSON-RPC: initialize, session/new,
+	// set_mode, set_config_option, session/prompt. It proves the adapter order, the
+	// session id capture, and that streamed text reaches the job log.
+	const acpDir = mkdtempSync(join(tmpdir(), 'subagent-acp-'));
+	for (const dir of ['logs', 'inbox', 'jobs']) mkdirSync(join(acpDir, dir), {recursive: true});
+	const fakeCmd = join(acpDir, 'fake-cmd.mjs');
+	writeFileSync(
+		fakeCmd,
+		`#!/usr/bin/env node
+let buffer = '';
+let next = 1;
+const send = (message) => process.stdout.write(JSON.stringify({jsonrpc: '2.0', ...message}) + '\\n');
+const chunk = (text) => send({
+  method: 'session/update',
+  params: {sessionId: 'acp-1', update: {sessionUpdate: 'agent_message_chunk', content: {type: 'text', text}}}
+});
+chunk('ARGS ' + JSON.stringify(process.argv.slice(2)) + '\\n');
+process.stdin.on('data', (data) => {
+  buffer += data.toString();
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const line = buffer.slice(0, index);
+    buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.method === 'initialize') {
+      send({id: message.id, result: {protocolVersion: 1}});
+    } else if (message.method === 'session/new') {
+      chunk('SESSION_NEW ' + JSON.stringify(message.params) + '\\n');
+      send({id: message.id, result: {sessionId: 'acp-1', modes: {currentModeId: 'default', availableModes: []}, configOptions: []}});
+    } else if (message.method === 'session/set_mode') {
+      chunk('SET_MODE ' + message.params.modeId + '\\n');
+      send({id: message.id, result: {}});
+    } else if (message.method === 'session/set_config_option') {
+      chunk('SET_CONFIG ' + message.params.configId + '=' + message.params.value + '\\n');
+      send({id: message.id, result: {}});
+    } else if (message.method === 'session/resume') {
+      chunk('RESUME ' + message.params.sessionId + '\\n');
+      send({id: message.id, result: {modes: {currentModeId: 'default', availableModes: []}, configOptions: []}});
+    } else if (message.method === 'session/prompt') {
+      chunk('PROMPT ' + JSON.stringify(message.params.prompt?.[0]?.text ?? '') + '\\n');
+      chunk('worker says hello');
+      send({id: message.id, result: {stopReason: 'end_turn'}});
+      setTimeout(() => process.exit(0), 20);
+    }
+  }
+});
+`,
+	);
+	chmodSync(fakeCmd, 0o755);
+
+	const runAcpJob = async (id, markerPath, resumeSession) => {
+		const spec = seam.buildSpec(
+			{
+				id,
+				label: id,
+				kind: 'agent',
+				owner: 'owner-test',
+				cwd: acpDir,
+				logPath: join(acpDir, 'logs', `${id}.log`),
+				inboxDir: join(acpDir, 'inbox'),
+				jobsDir: join(acpDir, 'jobs'),
+				startedAt: Date.now(),
+				tailMax: 8000,
+				bin: fakeCmd,
+				prompt: 'do the thing',
+				agentType: 'general-purpose',
+				systemPrompt: 'You are the test worker.',
+				model: 'test-model',
+				effort: 'low',
+				permissionMode: 'acceptEdits',
+				promptMarkerPath: markerPath,
+				...(resumeSession === undefined ? {} : {resumeSession}),
+			},
+			'/mod.ts',
+		);
+		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued'}));
+		const child = spawn(process.execPath, ['-e', workerText], {
+			cwd: acpDir,
+			env: {...process.env, SUBAGENT_SPEC: JSON.stringify(spec), BETTER_SUBAGENTS_WORKER: '1'},
+		});
+		const {promise, resolve} = Promise.withResolvers();
+		child.on('exit', resolve);
+		await promise;
+		return {
+			spec,
+			log: readFileSync(join(acpDir, 'logs', `${id}.log`), 'utf8'),
+			record: JSON.parse(readFileSync(join(acpDir, 'jobs', `${id}.json`), 'utf8')),
+			signals: readdirSync(join(acpDir, 'inbox'))
+				.filter((name) => name.includes(id))
+				.map((name) => JSON.parse(readFileSync(join(acpDir, 'inbox', name), 'utf8'))),
+		};
+	};
+
+	// No marker: the ACP child did not load the mod, so the body must travel in the
+	// prompt rather than disappear.
+	const acp = await runAcpJob('acp-job', join(acpDir, 'logs', 'acp-job.mod'));
+	assert.match(acp.log, /ARGS \["--mod","\/mod\.ts","acp"\]/, 'the worker starts cmd --mod <file> acp');
+	assert.match(acp.log, /SESSION_NEW .*"cwd"/, 'session/new carries the cwd');
+	assert.match(acp.log, /SESSION_NEW .*"mcpServers":\[\]/, 'session/new carries mcpServers');
+	assert.match(acp.log, /SET_MODE auto-accept/, 'acceptEdits maps to the ACP auto-accept mode');
+	assert.match(acp.log, /SET_CONFIG model=test-model/, 'the definition model is applied over ACP');
+	assert.match(acp.log, /SET_CONFIG effort=low/, 'the definition effort is applied over ACP');
+	assert.match(acp.log, /PROMPT "AGENT DEFINITION/, 'the body is carried when the prompt hook is absent');
+	assert.match(acp.log, /You are the test worker/, 'the exact body reaches the worker');
+	assert.match(acp.log, /TASK:/, 'the task still follows the definition');
+	assert.match(acp.log, /mod not loaded in the ACP child/, 'the fallback is visible in the log');
+	assert.match(acp.log, /worker says hello/, 'streamed text reaches the job log');
+	assert.equal(acp.record.acpSessionId, 'acp-1', 'the session id is recorded for a later resume');
+	assert.equal(acp.record.state, 'done', 'the prompt result settles the job');
+	assert.equal(acp.signals.length, 1, 'one signal for the finished ACP job');
+	assert.equal(acp.signals[0].state, 'done', 'the signal is a success');
+	assert.match(acp.signals[0].body, /exit 0/, 'the signal carries the result');
+
+	// Marker present: the ACP child loaded the mod, so appendSystemPrompt is live and
+	// the body must not be duplicated into the prompt.
+	const markerPath = join(acpDir, 'logs', 'acp-hooked.mod');
+	writeFileSync(markerPath, '1');
+	const hooked = await runAcpJob('acp-hooked', markerPath);
+	assert.match(hooked.log, /PROMPT "do the thing"/, 'with the hook live the prompt is the task only');
+	assert.ok(!hooked.log.includes('AGENT DEFINITION'), 'the body is not duplicated');
+
+	// session/resume returns modes/config, not a sessionId. The worker must keep the
+	// id it resumed, or a follow-up run would silently start a fresh session.
+	const acpResumed = await runAcpJob('acp-resumed', markerPath, 'acp-old');
+	assert.match(acpResumed.log, /RESUME acp-old/, 'the worker resumes the recorded session');
+	assert.ok(!acpResumed.log.includes('SESSION_NEW'), 'resume does not fall back to a new session');
+	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
+	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
+	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

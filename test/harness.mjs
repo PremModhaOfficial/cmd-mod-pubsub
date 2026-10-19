@@ -10,6 +10,7 @@
 // crash or a wait.
 
 import assert from 'node:assert/strict';
+import * as modExports from '../better-sub-agents.ts';
 import {
 	appendFileSync,
 	mkdirSync,
@@ -99,6 +100,7 @@ export function makeRuntime(overrides = {}) {
 	const spawnCalls = [];
 	const kills = [];
 	const runtime = {
+		home: EMPTY_HOME,
 		spawn(command, args, options) {
 			const child = makeChild();
 			spawnCalls.push({command, args, options, child});
@@ -252,9 +254,12 @@ export function ownerEntries(session, customType = 'subagent/owner') {
 		.filter((token) => typeof token === 'string' && token.length > 0);
 }
 
-// The detached worker is a string in the mod, so a syntax error in it would only
-// surface inside a process nobody is watching. Compile it here instead.
+// The detached worker is a string in the mod. Exporting the built string means a
+// syntax error surfaces here, and the envelope injection is already resolved. The
+// literal-extraction fallback keeps the suite runnable against the pre-T1 source
+// (used to demonstrate the new checks failing before the change).
 export function workerSource() {
+	if (typeof modExports.WORKER_SOURCE === 'string') return modExports.WORKER_SOURCE;
 	const source = readFileSync(new URL('../better-sub-agents.ts', import.meta.url), 'utf8');
 	const start = source.indexOf('const WORKER_SOURCE = `');
 	const end = source.indexOf('\n`;', start);
@@ -281,6 +286,18 @@ export const realFs = {
 		const stats = statSync(file);
 		return {size: stats.size, mtimeMs: stats.mtimeMs};
 	},
+	exists: (file) => {
+		try {
+			return statSync(file).isDirectory();
+		} catch {
+			return false;
+		}
+	},
 };
+
+// Every fake runtime gets an empty home, so a developer's real
+// ~/.commandcode/agents can never change what the suite asserts. A test that
+// exercises discovery overrides it.
+const EMPTY_HOME = mkdtempSync(join(tmpdir(), 'subagent-empty-home-'));
 
 export const tempDir = (prefix) => mkdtempSync(join(tmpdir(), prefix));

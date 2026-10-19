@@ -1,11 +1,11 @@
-// End-to-end: the real OS, the real detached worker, a real `cmd -p`.
+// End-to-end: the real OS, the real detached worker, a real ACP session (`cmd acp`).
 //
 // The smoke test fakes the runtime, so it cannot prove that a worker process
 // actually launches, writes `logs/<id>.log`, and drops one signal in `inbox/`.
 // This suite does, with no fakes except the ModApi host:
 //
 //   1. a real `/bin/sh -c` job (`printf`) runs to completion and signals
-//   2. a real `cmd -p` agent job runs to completion and signals
+//   2. a real ACP agent job runs to completion and signals
 //   3. a job that overruns its timeout is killed and reports a timeout
 //   4. a finished agent job is resumed in its own worker session
 //
@@ -92,12 +92,12 @@ try {
 	assert.match(api.userMessages[0].text, /hello-e2e/, 'with the log tail');
 	ok('the signal is delivered to the session that fired it');
 
-	// 2. a real cmd -p agent job --------------------------------------------
+	// 2. a real ACP agent job ------------------------------------------------
 	const agentSpawned = await toolOf(api, 'subagent_spawn').run({
 		input: {
-			description: 'cmd -p job',
+			description: 'acp job',
 			prompt: 'Reply with exactly the word pong and nothing else.',
-			agent_type: 'general-purpose',
+			subagent_type: 'general-purpose',
 		},
 	});
 	assert.equal(agentSpawned.ok, true, `agent spawn must succeed: ${JSON.stringify(agentSpawned)}`);
@@ -105,18 +105,18 @@ try {
 	const agentRecord = await waitFor(() => {
 		const record = recordOf(dir, agentId);
 		return isTerminal(record) ? record : undefined;
-	}, 'the cmd -p job to finish', 240_000);
+	}, 'the ACP job to finish', 240_000);
 	const agentLog = readFileSync(join(dir, 'logs', `${agentId}.log`), 'utf8');
-	assert.equal(agentRecord.state, 'done', `cmd -p state ${agentRecord.state}: ${agentLog.slice(-800)}`);
+	assert.equal(agentRecord.state, 'done', `ACP state ${agentRecord.state}: ${agentLog.slice(-800)}`);
 	assert.match(agentLog, /pong/i, 'the real agent answered in its log');
 	const [agentSignal] = await waitFor(() => {
 		const signals = signalsFor(dir, agentId);
 		return signals.length > 0 ? signals : undefined;
-	}, 'the cmd -p signal', 10_000);
+	}, 'the ACP signal', 10_000);
 	assert.equal(agentSignal.kind, 'agent');
 	assert.equal(agentSignal.state, 'done');
 	assert.equal(agentSignal.owner, agentRecord.owner);
-	ok(`cmd -p job completed: jobs/${agentId}.json, logs/${agentId}.log, inbox/ signal`);
+	ok(`ACP job completed: jobs/${agentId}.json, logs/${agentId}.log, inbox/ signal`);
 
 	// 3. a real timeout -----------------------------------------------------
 	const slow = await toolOf(api, 'subagent_spawn').run({
@@ -132,10 +132,9 @@ try {
 	assert.match(String(slowRecord.failureReason), /timed out after/, `reason: ${slowRecord.failureReason}`);
 	ok(`timeout job killed and reported: jobs/${slowId}.json (${slowRecord.failureReason})`);
 
-	// 3b. an API/CLI failure is a failure, not a hang -----------------------
-	// An unknown model is rejected by the CLI on exit 1. The worker must turn that into
-	// one failed signal with the CLI's own message in the tail, not leave the job
-	// queued forever and not swallow the reason.
+	// 3b. a rejected model is reported, not a hang --------------------------
+	// ACP applies the model with session/set_config_option. A rejection must be
+	// logged and must not leave the job queued forever.
 	const apiFail = await toolOf(api, 'subagent_spawn').run({
 		input: {description: 'api failure', prompt: 'hi', model: 'definitely-not-a-model-xyz'},
 	});
@@ -145,10 +144,13 @@ try {
 		const record = recordOf(dir, failId);
 		return isTerminal(record) ? record : undefined;
 	}, 'the API failure', 60_000);
-	assert.equal(failRecord.state, 'failed', 'an API failure is a failed job');
-	assert.equal(failRecord.exitCode, 1, 'the CLI exit code is kept');
-	assert.match(readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'), /unknown model/, 'the CLI error is in the log');
-	ok(`API failure reported as one failed signal: jobs/${failId}.json (${failRecord.failureReason})`);
+	assert.ok(['done', 'failed'].includes(failRecord.state), 'the bad model does not hang the job');
+	assert.match(
+		readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'),
+		/model not set|unknown model/i,
+		'the model rejection is in the log',
+	);
+	ok(`bad model reported and the job finished: jobs/${failId}.json (${failRecord.state})`);
 
 	// 4. a real resume ------------------------------------------------------
 	const resumed = await toolOf(api, 'subagent_resume').run({
