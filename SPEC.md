@@ -577,7 +577,7 @@ Execution and lifecycle:
 - [ ] Resume and hot reload restore the same owner token.
 - [ ] A foreign signal stays in `inbox/` and is delivered when its owner drains.
 - [ ] An untagged signal moves to `orphaned/`.
-- [ ] A background spawn returns immediately; a foreground spawn waits and returns the result.
+- [x] A background spawn returns immediately; a foreground spawn waits and returns the result. (smoke 49, 50)
 - [ ] A background permission prompt surfaces in the main session, names the agent, and Esc denies one call without stopping it.
 - [ ] Ctrl+B backgrounds a running foreground task.
 - [ ] Task rows follow the success/failure lifecycle and the 30-second hint.
@@ -585,8 +585,8 @@ Execution and lifecycle:
 - [ ] Nesting stops at the configured depth; the `Agent` tool errors at the limit.
 - [ ] Cancel produces exactly one canceled signal and no later result.
 - [ ] Restart reconciliation marks a dead job failed after 30 seconds.
-- [ ] A foreground API error returns partial output with a cut-off note; no output fails with the documented error.
-- [ ] A background API error marks the job failed and delivers the last output.
+- [x] A foreground API error returns partial output with a cut-off note; no output fails with the documented error. (smoke 51)
+- [x] A background API error marks the job failed and delivers the last output. (smoke 51)
 - [ ] The delivered ledger prevents replay after restart.
 - [ ] A worktree with no changes is removed; a changed worktree is kept and reported.
 - [ ] A command resolving to the main checkout fails inside a worktree.
