@@ -1433,6 +1433,11 @@ process.stdin.on('data', (data) => {
 	);
 	const planTools = access.filterTools({available: ['ExitPlanMode'], permissionMode: 'plan'});
 	assert.deepEqual(planTools.tools, ['ExitPlanMode'], 'plan mode keeps ExitPlanMode');
+	assert.deepEqual(
+		access.filterTools({available: ['Read', 'AskUserQuestion'], tools: ['Read', 'AskUserQuestion']}).tools,
+		['Read'],
+		'a listed AskUserQuestion is removed while the rest of the list survives',
+	);
 
 	// A list keeps only what it names; a deny list removes from the inherited set;
 	// when both are set, disallowedTools wins.
@@ -1631,6 +1636,11 @@ process.stdin.on('data', (data) => {
 	assert.deepEqual(denied.spec.tools, ['Read'], 'disallowedTools is applied at spawn');
 	const deep = await spawnAccess({description: 'deep', prompt: 'x', subagent_type: 'deep'});
 	assert.deepEqual(deep.spec.tools, ['mcp__deepwiki__*'], 'an MCP wildcard resolves against configured servers');
+	assert.deepEqual(
+		access.mcpServerNames(realFs, [accessHome]),
+		['deepwiki'],
+		'an MCP server disabled in the config contributes no tools',
+	);
 	const bgtools = await spawnAccess({description: 'bgtools', prompt: 'x', subagent_type: 'bgtools'});
 	assert.deepEqual(
 		bgtools.spec.tools,
