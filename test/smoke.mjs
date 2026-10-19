@@ -21,7 +21,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
 
-import mod, {jobStates, ledgerFactory} from '../better-sub-agents.ts';
+import mod, {AGENT_API_ERROR, foregroundOutcome, hasAgentOutput, jobStates, ledgerFactory, resolveExecutionPolicy} from '../better-sub-agents.ts';
 import {
 	fail,
 	makeApi,
@@ -1410,6 +1410,266 @@ process.stdin.on('data', (data) => {
 	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
+
+	// 36. foreground and background execution -------------------------------
+	// Policy: the disable env wins over the definition, a definition's
+	// `background: true` wins over the caller, and the default is background. The
+	// fake runtime's spawn is the seam: a fake worker that settles the record during
+	// spawn proves a foreground run waits; one that never exits proves a background
+	// run does not.
+	const MODE_NOW = 1_700_000_000_000;
+	const API_ERROR = 'Agent terminated early due to an API error';
+
+	const modeCase = (dir, overrides = {}) => {
+		const rt = makeRuntime({now: () => MODE_NOW, ...overrides});
+		const session = makeSession();
+		const bundle = makeApi({spoolDir: dir, session, runtime: rt.runtime});
+		mod(bundle.api, bundle.runtime);
+		return {dir, rt, session, bundle};
+	};
+	const recordedSpecs = (rt) => rt.spawnCalls.map((call) => JSON.parse(call.options.env.SUBAGENT_SPEC));
+	const specOf = (rt, index = 0) => recordedSpecs(rt)[index];
+	const recordOf = (dir, spec) => JSON.parse(readFileSync(join(dir, 'jobs', `${spec.id}.json`), 'utf8'));
+
+	// What the detached worker does when it settles: write the log, then the record,
+	// then its signal. The test performs the same three writes, so the parent sees the
+	// real contract rather than a hand-crafted tool result.
+	const settleJob = (dir, spec, {state = 'done', reason, log = ''} = {}) => {
+		writeFileSync(join(dir, 'logs', `${spec.id}.log`), log);
+		const file = join(dir, 'jobs', `${spec.id}.json`);
+		const record = JSON.parse(readFileSync(file, 'utf8'));
+		writeFileSync(
+			file,
+			JSON.stringify({
+				...record,
+				state,
+				finishedAt: MODE_NOW + 10,
+				durationMs: 10,
+				...(reason === undefined ? {} : {failureReason: reason}),
+			}),
+		);
+		writeFileSync(
+			join(dir, 'inbox', `${MODE_NOW}-${spec.id}-test.json`),
+			JSON.stringify({
+				id: spec.id,
+				owner: spec.owner,
+				label: spec.label,
+				kind: spec.kind,
+				state,
+				exitCode: state === 'done' ? 0 : null,
+				startedAt: spec.startedAt,
+				finishedAt: MODE_NOW + 10,
+				durationMs: 10,
+				logPath: spec.logPath,
+				sessionId: spec.sessionId,
+				title: `${spec.label} ${state}`,
+				body: reason,
+			}),
+		);
+	};
+	// A fake worker that exits during spawn. `specs` is the spawn record the default
+	// fake keeps, so a test can read the spec the mod built.
+	const autoSettle = (dir, outcome) => {
+		const specs = [];
+		return {
+			specs,
+			spawn(_command, _args, options) {
+				const spec = JSON.parse(options.env.SUBAGENT_SPEC);
+				specs.push(spec);
+				settleJob(dir, spec, outcome);
+				return makeChild();
+			},
+		};
+	};
+
+	// Background is the default, and it returns before the worker exits.
+	const bgDir = mkdtempSync(join(tmpdir(), 'subagent-bg-'));
+	const bgCase = modeCase(bgDir);
+	const bgOut = await toolOf(bgCase.bundle, 'subagent_spawn').run({input: {description: 'bg default', prompt: 'work'}});
+	assert.equal(bgOut.ok, true, `a background spawn must succeed: ${JSON.stringify(bgOut)}`);
+	assert.equal(recordOf(bgDir, specOf(bgCase.rt)).background, true, 'the default run is background');
+	assert.equal(recordOf(bgDir, specOf(bgCase.rt)).state, 'queued', 'background returns before the worker exits');
+
+	const explicitOut = await toolOf(bgCase.bundle, 'subagent_spawn').run({
+		input: {description: 'bg explicit', prompt: 'work', run_in_background: true},
+	});
+	assert.equal(explicitOut.ok, true, `run_in_background: true must be accepted: ${JSON.stringify(explicitOut)}`);
+	assert.equal(recordOf(bgDir, specOf(bgCase.rt, 1)).background, true, 'run_in_background: true keeps the background');
+
+	// A definition that pins background: true wins over a foreground request.
+	const projectDir = mkdtempSync(join(tmpdir(), 'subagent-project-'));
+	writeAgent(join(projectDir, '.commandcode', 'agents'), 'pinned.md', 'pinned', 'pinned worker', 'body', {background: true});
+	const pinnedDir = mkdtempSync(join(tmpdir(), 'subagent-pinned-'));
+	const pinnedCase = modeCase(pinnedDir, {cwd: projectDir});
+	const pinnedOut = await toolOf(pinnedCase.bundle, 'subagent_spawn').run({
+		input: {description: 'pinned', prompt: 'work', subagent_type: 'pinned', run_in_background: false},
+	});
+	assert.equal(pinnedOut.ok, true, `a pinned background agent must spawn: ${JSON.stringify(pinnedOut)}`);
+	assert.match(pinnedOut.content[0].text, /spawned/, 'the pinned run is a spawn, not an inline result');
+	assert.equal(
+		recordOf(pinnedDir, specOf(pinnedCase.rt)).background,
+		true,
+		'definition background: true beats the foreground request',
+	);
+
+	// Both disable envs force every run into the foreground, even a pinned one.
+	const envDir = mkdtempSync(join(tmpdir(), 'subagent-envfg-'));
+	const envAuto = autoSettle(envDir, {state: 'done', log: 'ENV FORCED'});
+	const envCase = modeCase(envDir, {
+		cwd: projectDir,
+		env: {BETTER_SUBAGENTS_DISABLE_BACKGROUND: '1'},
+		spawn: envAuto.spawn,
+	});
+	const envOut = await toolOf(envCase.bundle, 'subagent_spawn').run({
+		input: {description: 'env', prompt: 'work', subagent_type: 'pinned', run_in_background: true},
+	});
+	assert.equal(envOut.ok, true, `the disable env run must succeed: ${JSON.stringify(envOut)}`);
+	assert.match(envOut.content[0].text, /ENV FORCED/, 'the disable env returns the result inline');
+	assert.equal(
+		recordOf(envDir, envAuto.specs[0]).background,
+		false,
+		'BETTER_SUBAGENTS_DISABLE_BACKGROUND forces the foreground',
+	);
+
+	const aliasEnvDir = mkdtempSync(join(tmpdir(), 'subagent-alias-'));
+	const aliasAuto = autoSettle(aliasEnvDir, {state: 'done', log: 'SHELL ENV'});
+	const aliasCase = modeCase(aliasEnvDir, {
+		env: {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'},
+		spawn: aliasAuto.spawn,
+	});
+	const aliasOut = await toolOf(aliasCase.bundle, 'subagent_spawn').run({input: {description: 'alias', command: 'printf hi'}});
+	assert.equal(aliasOut.ok, true, `the alias env shell run must succeed: ${JSON.stringify(aliasOut)}`);
+	assert.match(aliasOut.content[0].text, /SHELL ENV/, 'the alias returns the result inline');
+	assert.equal(
+		recordOf(aliasEnvDir, aliasAuto.specs[0]).background,
+		false,
+		'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS forces the foreground',
+	);
+	ok('execution mode: background default, pinned background, and both disable envs');
+
+	// Foreground returns the result, and that result is not also delivered as a
+	// background message.
+	const fgDir = mkdtempSync(join(tmpdir(), 'subagent-fg-'));
+	const fgAuto = autoSettle(fgDir, {state: 'done', log: 'FOREGROUND RESULT'});
+	const fgCase = modeCase(fgDir, {spawn: fgAuto.spawn});
+	const fgOut = await toolOf(fgCase.bundle, 'subagent_spawn').run({
+		input: {description: 'fg', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(fgOut.ok, true, `a foreground run must return the result: ${JSON.stringify(fgOut)}`);
+	assert.match(fgOut.content[0].text, /FOREGROUND RESULT/, 'the foreground result is in the tool result');
+	assert.equal(recordOf(fgDir, fgAuto.specs[0]).background, false, 'the record carries the foreground mode');
+	fgCase.bundle.everyTicks.find((tick) => tick.ms === 400).fn();
+	assert.ok(
+		!fgCase.bundle.userMessages.some((message) => message.text.includes('FOREGROUND RESULT')),
+		'a foreground result is not also delivered as a background message',
+	);
+	// Past the bound a foreground wait must give up without losing the run: the
+	// worker is still alive, so the job is demoted and its result arrives as a signal.
+	const hangDir = mkdtempSync(join(tmpdir(), 'subagent-hang-'));
+	const hangCase = modeCase(hangDir);
+	const hangOut = await toolOf(hangCase.bundle, 'subagent_spawn').run({
+		input: {description: 'hang', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(hangOut.ok, false, 'a foreground run past its bound fails instead of hanging');
+	assert.match(hangOut.error, /continues in the background/, 'the error says the run is not lost');
+	assert.equal(recordOf(hangDir, specOf(hangCase.rt)).background, true, 'the bounded run is demoted to background');
+	ok('foreground blocks on the signal and returns the result inline');
+
+	// API errors: partial work survives, nothing is invented, and a background
+	// failure names the error and carries the last output.
+	const cutDir = mkdtempSync(join(tmpdir(), 'subagent-cut-'));
+	const cutReason = `${API_ERROR}: rate limit exceeded`;
+	const cutAuto = autoSettle(cutDir, {state: 'failed', reason: cutReason, log: 'partial thought\n[tool] Bash\n'});
+	const cutCase = modeCase(cutDir, {spawn: cutAuto.spawn});
+	const cutOut = await toolOf(cutCase.bundle, 'subagent_spawn').run({
+		input: {description: 'cut', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(cutOut.ok, true, `a cut-off run with text must return it: ${JSON.stringify(cutOut)}`);
+	assert.match(cutOut.content[0].text, /partial thought/, 'the partial output is not discarded');
+	assert.match(cutOut.content[0].text, /cut off/, 'the partial output carries a cut-off note');
+	assert.match(cutOut.content[0].text, /rate limit exceeded/, 'the note names the API error');
+
+	const emptyDir = mkdtempSync(join(tmpdir(), 'subagent-empty-'));
+	const emptyAuto = autoSettle(emptyDir, {
+		state: 'failed',
+		reason: `${API_ERROR}: overloaded`,
+		log: '[acp] session acp-1\n[tool] Bash\n',
+	});
+	const emptyCase = modeCase(emptyDir, {spawn: emptyAuto.spawn});
+	const emptyOut = await toolOf(emptyCase.bundle, 'subagent_spawn').run({
+		input: {description: 'empty', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(emptyOut.ok, false, 'a run with no text and no result must fail');
+	assert.ok(emptyOut.error.startsWith(API_ERROR), `the exact API error must lead: ${String(emptyOut.error)}`);
+	assert.match(emptyOut.error, /overloaded/, 'the API error detail is kept');
+
+	const bgErrDir = mkdtempSync(join(tmpdir(), 'subagent-bgerr-'));
+	const bgErrCase = modeCase(bgErrDir);
+	const bgErrOut = await toolOf(bgErrCase.bundle, 'subagent_spawn').run({input: {description: 'api', prompt: 'work'}});
+	assert.equal(bgErrOut.ok, true, `a background run must start: ${JSON.stringify(bgErrOut)}`);
+	const bgErrSpec = specOf(bgErrCase.rt);
+	settleJob(bgErrDir, bgErrSpec, {state: 'failed', reason: `${API_ERROR}: overloaded\n\nlast words`, log: 'last words'});
+	bgErrCase.bundle.everyTicks.find((tick) => tick.ms === 400).fn();
+	assert.equal(recordOf(bgErrDir, bgErrSpec).state, 'failed', 'a background API error marks the job failed');
+	assert.ok(
+		bgErrCase.bundle.userMessages.some(
+			(message) => message.text.includes(API_ERROR) && message.text.includes('last words'),
+		),
+		'the delivered message names the API error and carries the last output',
+	);
+	ok('API errors: partial output survives a cut-off, empty fails with the exact error, background delivers the last output');
+
+	// 39. the policy table and the result shaping are pure, so every forced-mode
+	// combination is asserted directly instead of being inferred from a spawn.
+	const policy = (requested, definitionBackground, env) =>
+		resolveExecutionPolicy({requested, definitionBackground, env});
+	assert.equal(policy(undefined, undefined, {}), 'background', 'no request and no pin is background');
+	assert.equal(policy(true, undefined, {}), 'background', 'the caller can ask for background');
+	assert.equal(policy(false, undefined, {}), 'foreground', 'the caller can ask for foreground');
+	assert.equal(policy(true, true, {}), 'background', 'caller and definition agree on background');
+	assert.equal(policy(false, true, {}), 'background', 'the definition pin beats the caller');
+	assert.equal(
+		policy(false, undefined, {BETTER_SUBAGENTS_DISABLE_BACKGROUND: '1'}),
+		'foreground',
+		'the disable env beats the caller',
+	);
+	assert.equal(
+		policy(true, true, {BETTER_SUBAGENTS_DISABLE_BACKGROUND: '1'}),
+		'foreground',
+		'the disable env beats the caller and the definition pin',
+	);
+	assert.equal(
+		policy(true, true, {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'}),
+		'foreground',
+		'the Claude Code alias also wins',
+	);
+	assert.equal(policy(true, true, {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '0'}), 'background', '0 does not enable the env');
+	assert.equal(policy(undefined, undefined, {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: ''}), 'background', 'empty does not enable the env');
+	assert.equal(
+		policy(undefined, undefined, {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: 'false'}),
+		'background',
+		'false does not enable the env',
+	);
+
+	assert.deepEqual(foregroundOutcome({state: 'done'}, ' answer \n'), {ok: true, partial: false, text: 'answer'});
+	assert.equal(hasAgentOutput('[acp] session s\n[tool] Bash\n[permission] x\n'), false, 'plumbing is not output');
+	assert.equal(hasAgentOutput('[tool] Bash\nreal text\n'), true, 'agent text is output');
+	assert.deepEqual(
+		foregroundOutcome({state: 'failed', failureReason: AGENT_API_ERROR}, ''),
+		{ok: false, error: AGENT_API_ERROR},
+		'an empty API cut-off fails with the exact error',
+	);
+	assert.equal(
+		foregroundOutcome({state: 'failed', failureReason: `${AGENT_API_ERROR}: 529`}, 'text\n').partial,
+		true,
+		'a cut-off with agent text is partial, not a failure',
+	);
+	assert.equal(
+		foregroundOutcome({state: 'failed', failureReason: 'timed out after 1s'}, 'text\n').ok,
+		false,
+		'a non-API failure stays a failure even with output',
+	);
+	ok('policy precedence and foreground result shaping, asserted as a table');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
