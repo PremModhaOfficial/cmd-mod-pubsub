@@ -96,6 +96,14 @@ The adapter writes `permission.json` with the request id, the tool call, and the
 
 - `cacheTtl` and `autoCompactWindow` are not ACP config options. Use host defaults. Record the lost per-subagent control in the parity ledger.
 - `--agents` and `--append-subagent-system-prompt` are not host flags. Use `--mod` and the mod hooks.
+  T12 spells them `agents`, `agent`, `append_subagent_system_prompt`, and
+  `append_subagent_system_prompt_file`. The environment aliases (`BETTER_SUBAGENTS_AGENT`,
+  `BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT`, and the `CLAUDE_CODE_*` forms) carry the same values into a
+  nested worker. `initialPrompt` is submitted through `cmd.prompt.submit`, with `transformInput` as the
+  fallback when the host exposes no submit surface.
+- Definition `hooks` are host hooks (`beforeToolCall`, `afterToolCall`, `onStop` with `Stop` reported as
+  `SubagentStop`). The host has no project hook file, so `SubagentStart`/`SubagentStop` are read from
+  `.commandcode/hooks.json` and run by the mod, once per job.
 - Host file agents default `tools` to none. The spec inherits. The mod fills the default.
 - `cmd.addAgent` skips a duplicate name, so a project definition cannot shadow a user definition. Record the precedence gap.
 - ACP has no fork method. The CLI fork plus one-shot `cmd --resume -p` follow-ups is the accepted path. ACP `session/load` is a host risk for prompt completion.
