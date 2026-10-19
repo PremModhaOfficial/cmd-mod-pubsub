@@ -1,4 +1,4 @@
-// Mod: pubsub — fire-and-forget agents that signal back on their own.
+// Mod: better-sub-agents — async subagents that signal back on their own.
 //
 // The problem this solves: the `agent` tool is a fire-and-wait. A background worker
 // finishes and the parent has to ask for the result, poll for it, or hold a blocking
@@ -15,7 +15,7 @@
 //
 // OWNERSHIP. The spool is shared by every session on the machine, so every job and
 // signal carries an owner token. The token is persisted in the session transcript
-// (`appendCustomEntry({customType: 'pubsub/owner'})`) and read back with
+// (`appendCustomEntry({customType: 'subagent/owner'})`) and read back with
 // `getCustomEntries`, so it survives resume and hot reload. A drain delivers only
 // signals whose owner matches; another session's signal is left in the inbox for its
 // owner. Untagged signals from older versions are quarantined to `orphaned/` — never
@@ -25,12 +25,12 @@
 // no turns, whereas `cron_create` costs a full model turn per tick because a tick is a
 // prompt handed to the agent.
 //
-// Layout under PUBSUB_DIR (default ~/.commandcode/pubsub):
+// Layout under SUBAGENT_DIR (default ~/.commandcode/subagents):
 //   inbox/       workers drop `<timestamp>-<id>.json` here
 //   claimed/     rename-target during delivery, so two drains cannot deliver one signal twice
 //   orphaned/    untagged legacy signals, quarantined instead of leaked
 //   logs/        one log per fired job
-//   jobs/        one JSON record per fired job, for pubsub_list and the jobs pane
+//   jobs/        one JSON record per fired job, for subagent_list and the jobs pane
 //   delivered.jsonl   durable delivery ledger, so a restart cannot replay a signal
 //
 // Lifecycle (jobs/<id>.json .state):
@@ -69,6 +69,11 @@ const LOG_TAIL_BYTES_MAX = 4000;
 // drain (or left behind when the restore rename failed) is swept after this long.
 const CLAIMED_TTL_MS = 60 * 60 * 1000;
 const ORPHANED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// A finished job keeps its record and its log for this long, then is swept. Running
+// jobs are never swept, however old their record is.
+const RETENTION_DAYS_DEFAULT = 30;
+const RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+const RECORD_SWEEP_MAX = 500;
 // A queued/running record with no live pid is only declared lost after this grace,
 // so a worker that has been spawned but has not written its pid yet is not failed.
 const LOST_GRACE_MS = 30 * 1000;
@@ -80,7 +85,24 @@ const DELIVERED_LEDGER_KEEP = 2000;
 const LEDGER_COMPACT_BYTES = 512 * 1024;
 const PANE_ROWS_MAX = 12;
 const PENDING_SCAN_MAX = 500;
-const OWNER_TYPE = 'pubsub/owner';
+// subagent_output's optional blocking read. Bounded, because a tool that waits is a
+// turn held open - the whole point of the mod is that you never have to.
+const WAIT_DEFAULT_MS = 10 * 1000;
+const WAIT_MAX_MS = 60 * 1000;
+const WAIT_POLL_MS = 200;
+const OUTPUT_MAX_CHARS_DEFAULT = 4000;
+const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
+
+const OWNER_TYPE = 'subagent/owner';
+// The 0.1.0 transcript entry. Read once so an installed session keeps its identity
+// across the rename; never written again.
+const OWNER_TYPE_LEGACY = 'pubsub/owner';
+const JOB_ENTRY_TYPE = 'subagent/job';
+const WORKER_ENV = 'BETTER_SUBAGENTS_WORKER';
+const WORKER_SPEC_ENV = 'SUBAGENT_SPEC';
+const RETENTION_ENV = 'BETTER_SUBAGENTS_RETENTION_DAYS';
+const SUBAGENT_DIR_DEFAULT = join(homedir(), '.commandcode', 'subagents');
+const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -89,7 +111,7 @@ const WORKER_SOURCE = `
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
-const spec = JSON.parse(process.env.PUBSUB_SPEC);
+const spec = JSON.parse(process.env.SUBAGENT_SPEC);
 const recordPath = path.join(spec.jobsDir, spec.id + '.json');
 
 const readRecord = () => {
@@ -152,6 +174,19 @@ const settle = (state, detail, code, tail) => {
 
 const fail = (reason, code) => settle('failed', reason, code, '');
 
+// The child's argv. An agent job resumes its own worker session when the parent
+// asked for a resume, and pins its session name so a later resume can find it.
+const childArgs = () => {
+  if (spec.prompt === undefined) return ['-c', spec.command];
+  const args = [];
+  if (typeof spec.resumeSession === 'string' && spec.resumeSession.length > 0) args.push('-r', spec.resumeSession);
+  args.push('-p', spec.prompt);
+  if (typeof spec.sessionName === 'string' && spec.sessionName.length > 0) args.push('-n', spec.sessionName);
+  if (typeof spec.model === 'string' && spec.model.length > 0) args.push('-m', spec.model);
+  if (typeof spec.maxTurns === 'number' && spec.maxTurns > 0) args.push('--max-turns', String(spec.maxTurns));
+  return args;
+};
+
 let out;
 try {
   out = fs.openSync(spec.logPath, 'w');
@@ -161,29 +196,57 @@ try {
 }
 
 const child = spec.prompt !== undefined
-  ? spawn(spec.bin, ['-p', spec.prompt], {cwd: spec.cwd, stdio: ['ignore', out, out]})
+  ? spawn(spec.bin, childArgs(), {cwd: spec.cwd, stdio: ['ignore', out, out]})
   : spawn('/bin/sh', ['-c', spec.command], {cwd: spec.cwd, stdio: ['ignore', out, out]});
 
 let settled = false;
+let timedOut = false;
+let killTimer;
+let hardTimer;
+
+// A timeout is still one result: SIGTERM, SIGKILL a second later, and a failed
+// signal that says why. Nothing is left running and nothing is left silent.
+if (typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0) {
+  killTimer = setTimeout(() => {
+    timedOut = true;
+    try { child.kill('SIGTERM'); } catch (e) {}
+    hardTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 1000);
+    if (hardTimer.unref) hardTimer.unref();
+  }, spec.timeoutMs);
+  if (killTimer.unref) killTimer.unref();
+}
+
+const clearTimers = () => {
+  if (killTimer) clearTimeout(killTimer);
+  if (hardTimer) clearTimeout(hardTimer);
+};
+
 const finish = (code, spawnError, signal) => {
   if (settled) return;
   settled = true;
+  clearTimers();
   try { fs.closeSync(out); } catch (e) {}
   const record = readRecord();
   // The cancel tool has already written the record and emitted its own signal.
   if (record.state === 'canceled') return;
 
   const tail = readTail();
-  const failed = spawnError !== undefined || code !== 0;
+  const spy = spec.prompt !== undefined;
   const lastLine = tail.trimEnd().split('\\n').filter(line => line.trim()).pop() || '';
-  const wantsInput = !failed && spec.prompt !== undefined && /\\?\\s*$/.test(lastLine);
-  const detail = spawnError !== undefined
-    ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
-    : typeof code === 'number' && code !== 0
-      ? 'exit ' + code
-      : signal
-        ? 'terminated by ' + signal
-        : 'exit 0';
+  const failed = timedOut || spawnError !== undefined || (code !== 0 && code !== null);
+  const wantsInput = !failed && spy && /\\?\\s*$/.test(lastLine);
+  const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
+  const detail = timedOut
+    ? 'timed out after ' + timeoutLabel
+    : spawnError !== undefined
+      ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
+      : code === 8 && spy
+        ? 'exit 8 (max turns reached; result is partial)'
+        : typeof code === 'number' && code !== 0
+          ? 'exit ' + code
+          : signal
+            ? 'terminated by ' + signal
+            : 'exit 0';
   settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
 };
 
@@ -240,6 +303,7 @@ export interface Runtime {
 	spawn(command: string, args: string[], options: SpawnOptions): ChildHandle;
 	kill(pid: number, signal: string): void;
 	alive(pid: unknown): boolean;
+	sleep(ms: number): Promise<void>;
 	readonly pid: number;
 	readonly execPath: string;
 	readonly env: Record<string, string | undefined>;
@@ -285,6 +349,8 @@ const OS_RUNTIME: Runtime = {
 			return (error as {code?: string}).code === 'EPERM';
 		}
 	},
+	// The only wait in the mod, used by subagent_output's opt-in blocking read.
+	sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
 	pid: process.pid,
 	execPath: process.execPath,
 	env: process.env,
@@ -326,6 +392,13 @@ interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
 	cwd?: string;
+	agentType?: string;
+	model?: string;
+	maxTurns?: number;
+	timeoutMs?: number;
+	sessionName?: string;
+	resumedFrom?: string;
+	options?: Record<string, unknown>;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;
@@ -358,7 +431,7 @@ interface JobPatch {
 const JOB_STATES = ['queued', 'running', 'waiting-input', 'done', 'failed', 'canceled'] as const;
 type JobState = (typeof JOB_STATES)[number];
 
-// A signal may also carry a note (pubsub_send), which is not a job state.
+// A signal may also carry a note (subagent_send), which is not a job state.
 type SignalState = JobState | 'note';
 
 // Legacy aliases, normalized in exactly one place.
@@ -614,34 +687,56 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
 	// Below this line the spool is touched only through the injected filesystem.
 	const spool = runtime.fs;
-	cmd.addFlag('pubsub_dir', {
+	cmd.addFlag('subagent_dir', {
 		type: 'string',
-		default: join(homedir(), '.commandcode', 'pubsub'),
+		default: SUBAGENT_DIR_DEFAULT,
 		description: 'Where the spool, logs and job records live.',
 	});
-	cmd.addFlag('pubsub_deliver', {
+	cmd.addFlag('subagent_deliver', {
 		type: 'string',
 		default: 'steer',
 		description: "How a signal reaches the session: 'steer' (after the current tool batch) or 'follow-up' (only when the run would stop).",
 	});
+	// 0.1.0 flag names. Recognized only when explicitly set to something other than
+	// their own default, so an upgraded machine keeps working for one release.
+	cmd.addFlag('pubsub_dir', {
+		type: 'string',
+		default: PUBSUB_DIR_DEFAULT,
+		description: 'Deprecated alias for subagent_dir.',
+	});
+	cmd.addFlag('pubsub_deliver', {
+		type: 'string',
+		default: 'steer',
+		description: 'Deprecated alias for subagent_deliver.',
+	});
 
-	const root = String(cmd.getFlag('pubsub_dir') ?? join(homedir(), '.commandcode', 'pubsub'));
+	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
+	// A flag still sitting on its default is not an override; anything else is.
+	const pick = (primary: string, primaryDefault: string, legacy: string, legacyDefault: string): string => {
+		const value = readFlag(primary);
+		if (value.length > 0 && value !== primaryDefault) return value;
+		const old = readFlag(legacy);
+		if (old.length > 0 && old !== legacyDefault) return old;
+		return value.length > 0 ? value : legacyDefault;
+	};
+	const root = pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT);
 	const inboxDir = join(root, 'inbox');
 	const claimedDir = join(root, 'claimed');
 	const orphanedDir = join(root, 'orphaned');
 	const logsDir = join(root, 'logs');
 	const jobsDir = join(root, 'jobs');
+	const worktreesDir = join(root, 'worktrees');
 	const ledgerPath = join(root, 'delivered.jsonl');
-	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir]) {
+	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, worktreesDir]) {
 		spool.mkdir(dir);
 	}
 
 	// A headless worker loads this mod too. It has its own owner token and must never
 	// steal an unaddressed signal from the session that fired it.
-	const workerMode = runtime.env.PUBSUB_WORKER === '1';
+	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
-		cmd.getFlag('pubsub_deliver') === 'follow-up' ? 'follow-up' : 'steer';
+		(pick('subagent_deliver', 'steer', 'pubsub_deliver', 'steer') === 'follow-up' ? 'follow-up' : 'steer');
 
 	// Bound once the harness binds. Diagnostic only; routing is by owner token.
 	let sessionId: string | undefined;
@@ -678,20 +773,24 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// token that cannot be read back is exactly how a session's own result turns into
 		// a foreign signal. The caller treats this as 'pending' and waits.
 		if (cmd.session === undefined) return undefined;
-		try {
-			const entries = cmd.session.getCustomEntries({customType: OWNER_TYPE}) as
-				| {data?: {token?: unknown}}[]
-				| undefined;
-			for (let index = (entries?.length ?? 0) - 1; index >= 0; index -= 1) {
-				const token = entries?.[index]?.data?.token;
-				if (typeof token === 'string' && token.length > 0) {
-					ownerToken = token;
-					ownerSaved = true;
-					return ownerToken;
+		// The current entry type first, then the 0.1.0 one: a session that was live
+		// across the rename keeps the identity its older jobs were stamped with.
+		for (const customType of [OWNER_TYPE, OWNER_TYPE_LEGACY]) {
+			try {
+				const entries = cmd.session.getCustomEntries({customType}) as
+					| {data?: {token?: unknown}}[]
+					| undefined;
+				for (let index = (entries?.length ?? 0) - 1; index >= 0; index -= 1) {
+					const token = entries?.[index]?.data?.token;
+					if (typeof token === 'string' && token.length > 0) {
+						ownerToken = token;
+						ownerSaved = true;
+						return ownerToken;
+					}
 				}
+			} catch {
+				/* fall through and mint one */
 			}
-		} catch {
-			/* fall through and mint one */
 		}
 		ownerToken = `owner-${randomUUID()}`;
 		saveOwner(ownerToken);
@@ -709,12 +808,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return workerMode ? 'foreign' : 'orphan';
 	}
 
-	// A renderer so a signal shows up as a real feed row rather than raw JSON.
-	cmd.addRenderer('pubsub', data => {
+	// A renderer so a signal shows up as a real feed row rather than raw JSON. The
+	// `pubsub` id stays registered for one release so entries written by 0.1.0 render.
+	const renderSignal = (data: unknown): string[] => {
 		const signal = data as Partial<Signal>;
 		const state = signal.state === undefined ? '' : ` · ${signal.state}`;
-		return [`◈ pubsub · ${String(signal.kind ?? 'signal')}${state} · ${String(signal.title ?? '(untitled)')}`];
-	});
+		return [`${stateMarker(signal.state)} subagent · ${String(signal.kind ?? 'signal')}${state} · ${String(signal.title ?? '(untitled)')}`];
+	};
+	cmd.addRenderer('subagent', renderSignal);
+	cmd.addRenderer('pubsub', renderSignal);
 
 	// One writer at a time. A tick that finds this flag set returns immediately rather
 	// than racing the previous tick over the same files.
@@ -753,7 +855,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					? 'The job was canceled; nothing else will arrive for it.'
 					: 'This result arrived automatically. Read it now and use it in your current work; ' +
 						'do not poll for it and do not wait for it.';
-		return `[pubsub] ${title}\n${facts}${log}` + (body.length > 0 ? `\n\n${body}` : '') + `\n\n${next}`;
+		return `[subagent] ${title}\n${facts}${log}` + (body.length > 0 ? `\n\n${body}` : '') + `\n\n${next}`;
 	}
 
 	function readJob(id: string): JobRecord | undefined {
@@ -833,7 +935,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// otherwise. This is the A2A delivery path.
 	function deliver(message: Signal): void {
 		cmd.sendUserMessage(formatSignal(message), {deliverAs: deliverAs()});
-		cmd.showEntry('pubsub', message);
+		cmd.showEntry('subagent', message);
 	}
 
 	// ------------------------------------------------------------------ spool
@@ -1018,6 +1120,36 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
+	// Retention. A finished job keeps its record and its log for RETENTION_DAYS_DEFAULT
+	// (or BETTER_SUBAGENTS_RETENTION_DAYS), so `subagent_output` still works on a job
+	// from last week. A running job is never swept, however old its record is.
+	function retentionMs(): number {
+		const days = Number(runtime.env[RETENTION_ENV]);
+		const value = Number.isFinite(days) && days > 0 ? days : RETENTION_DAYS_DEFAULT;
+		return value * 24 * 60 * 60 * 1000;
+	}
+
+	function sweepExpired(): void {
+		if (workerMode) return;
+		const cutoff = runtime.now() - retentionMs();
+		for (const job of readRecentJobs(RECORD_SWEEP_MAX)) {
+			const state = normalizeState(job.state);
+			if (state === undefined || !isTerminal(state)) continue;
+			const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
+			if (settledAt === 0 || settledAt > cutoff) continue;
+			try {
+				spool.remove(join(jobsDir, `${job.id}.json`));
+			} catch {
+				/* another process won it */
+			}
+			try {
+				spool.remove(join(logsDir, `${job.id}.log`));
+			} catch {
+				/* the log is already gone */
+			}
+		}
+	}
+
 	function hasPendingSignal(id: string): boolean {
 		try {
 			return (
@@ -1042,17 +1174,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				if (hasPendingSignal(job.id)) continue;
 				const startedAt = Number(job.startedAt ?? 0) || 0;
 				if (now - startedAt < LOST_GRACE_MS) continue;
-				applyPatch(
-					job.id,
-					{
-						state: 'failed',
-						failureReason: state === 'queued' ? 'worker never started' : 'lost (no live process)',
-						finishedAt: now,
-						durationMs: Math.max(0, now - startedAt),
-					},
-					job,
-					now,
-				);
+				// One record, one signal, one delivery - the same contract every other
+				// failure uses. A job already reconciled is terminal, so a second session
+				// start cannot replay it.
+				failJob(job, state === 'queued' ? 'worker never started' : 'lost (no live process)');
 			} else if (state !== undefined && state !== job.state) {
 				// A legacy alias is rewritten as its state, once.
 				applyPatch(job.id, {state}, job, now);
@@ -1125,26 +1250,39 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
-	function listText(): string {
-		const jobs = readRecentJobs(LIST_SCAN_MAX);
+	function listText(filter: {state?: string; limit?: number} = {}): string {
+		const all = readRecentJobs(LIST_SCAN_MAX);
+		const wanted = filter.state === undefined ? undefined : canonicalState(filter.state);
+		const matching = wanted === undefined ? all : all.filter(job => canonicalState(job.state) === wanted);
+		const shown = matching.slice(0, filter.limit ?? LIST_SCAN_MAX);
 		const counts: Record<string, number> = {};
-		for (const job of jobs) {
+		for (const job of all) {
 			const state = canonicalState(job.state);
 			counts[state] = (counts[state] ?? 0) + 1;
 		}
 		const summary = Object.entries(counts).map(([state, count]) => `${count} ${state}`).join(', ') || 'none';
 		const pending = countPending();
 		const orphaned = countOrphaned();
-		const lines = jobs.slice(0, 20).map(job => {
+		const lines = shown.map(job => {
 			const state = canonicalState(job.state);
 			const exit = typeof job.exitCode === 'number' ? ` exit ${job.exitCode}` : '';
-			const duration = typeof job.durationMs === 'number' ? ` ${(job.durationMs / 1000).toFixed(1)}s` : '';
+			const elapsed =
+				typeof job.durationMs === 'number'
+					? `${(job.durationMs / 1000).toFixed(1)}s`
+					: typeof job.startedAt === 'number'
+						? `${Math.max(0, Math.round((runtime.now() - job.startedAt) / 1000))}s…`
+						: '';
+			const duration = elapsed.length > 0 ? ` ${elapsed}` : '';
+			const model = typeof job.model === 'string' && job.model.length > 0 ? ` · ${job.model}` : '';
+			const owner = typeof job.owner === 'string' && job.owner.length > 0 ? ` · ${job.owner.slice(-6)}` : '';
 			const unread = isTerminalState(state) && job.deliveredAt === undefined ? ' · unread' : '';
-			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${unread}`;
+			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${model}${owner}${unread}`;
 		});
 		const orphanNote = orphaned > 0 ? ` ${orphaned} orphaned signal(s) quarantined.` : '';
+		const filterNote = wanted === undefined ? '' : ` matching ${wanted}`;
 		return (
-			`${jobs.length} recent job(s): ${summary}. ${pending} signal(s) waiting for this session.${orphanNote}\n` +
+			`${matching.length} job(s)${filterNote}, ${all.length} recent job(s): ${summary}. ` +
+			`${pending} signal(s) waiting for this session.${orphanNote}\n` +
 			(lines.length > 0 ? lines.join('\n') : '  (none)')
 		);
 	}
@@ -1158,11 +1296,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	}
 
-	function cancelJob(id: string): string {
+	function cancelJob(id: string): {ok: boolean; message: string} {
 		const job = readJob(id);
-		if (job === undefined) return `pubsub: no job ${id}`;
+		if (job === undefined) return {ok: false, message: `subagent: no job ${id}`};
 		const state = normalizeState(job.state);
-		if (state !== undefined && isTerminal(state)) return `pubsub: job ${id} is already ${state}`;
+		if (state !== undefined && isTerminal(state)) {
+			return {ok: false, message: `subagent: job ${id} is already ${state}`};
+		}
 
 		const now = runtime.now();
 		const startedAt = Number(job.startedAt ?? now) || now;
@@ -1176,7 +1316,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			{state: 'canceled', exitCode: null, finishedAt: now, durationMs: Math.max(0, now - startedAt), body: 'canceled by request'},
 		);
 		if (!applyPatch(id, {...patchOf(signal), canceledAt: now}, job, now)) {
-			return `pubsub: job ${id} is already ${canonicalState(job.state)}`;
+			return {ok: false, message: `subagent: job ${id} is already ${canonicalState(job.state)}`};
 		}
 
 		killPid(job.pid, 'SIGTERM');
@@ -1194,7 +1334,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		enqueueSignal(signal);
 		safeDrain();
 		refreshJobs();
-		return `pubsub: canceled ${id} (${String(job.label ?? 'unlabelled')})`;
+		return {ok: true, message: `subagent: canceled ${id} (${String(job.label ?? 'unlabelled')})`};
 	}
 
 	// ------------------------------------------------------------------ launch
@@ -1211,6 +1351,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly command?: string;
 		readonly prompt?: string;
 		readonly cwd: string;
+		/** agent jobs only; recorded now, used when the registry lands (phase 6) */
+		readonly agentType?: string;
+		readonly model?: string;
+		readonly maxTurns?: number;
+		/** SIGTERM then SIGKILL after this long; 0 or absent means no timeout */
+		readonly timeoutMs?: number;
+		/** resume this worker session first (`cmd -r <name> -p <prompt>`) */
+		readonly resumeSession?: string;
+		readonly resumedFrom?: string;
 	}
 
 	type Launch = {readonly ok: true; readonly id: string; readonly pid: number} | {readonly ok: false; readonly error: string};
@@ -1230,11 +1379,19 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		refreshJobs();
 	}
 
+	// The worker session name, deterministic from the job id: a resume can find the
+	// worker's own conversation by name without the parent having to parse it out of
+	// the worker's output.
+	function sessionNameOf(id: string): string {
+		return `subagent-${id}`;
+	}
+
 	function fire(intent: JobIntent): Launch {
 		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		const logPath = join(logsDir, `${id}.log`);
 		const startedAt = runtime.now();
 		const owner = ownerId();
+		const isAgent = intent.prompt !== undefined;
 		const record: JobRecord = {
 			id,
 			owner,
@@ -1246,12 +1403,22 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startedAt,
 			sessionId,
 			updatedAt: startedAt,
+			...(isAgent
+				? {
+						agentType: intent.agentType ?? 'general-purpose',
+						sessionName: sessionNameOf(id),
+						...(intent.resumeSession !== undefined ? {resumedFrom: intent.resumedFrom} : {}),
+					}
+				: {}),
+			...(intent.model !== undefined ? {model: intent.model} : {}),
+			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
+			...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
 			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 		};
 		writeJob(record);
 		try {
 			cmd.session?.appendCustomEntry({
-				customType: 'pubsub/job',
+				customType: JOB_ENTRY_TYPE,
 				data: {id, label: intent.label, kind: intent.kind, state: 'queued', owner, sessionId},
 			});
 		} catch {
@@ -1271,6 +1438,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			tailMax: LOG_TAIL_BYTES_MAX,
 			bin: runtime.env.COMMANDCODE_BIN ?? 'cmd',
 			sessionId,
+			sessionName: isAgent ? sessionNameOf(id) : undefined,
+			model: intent.model,
+			maxTurns: intent.maxTurns,
+			timeoutMs: intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? intent.timeoutMs : undefined,
+			resumeSession: intent.resumeSession,
 			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 		};
 
@@ -1280,7 +1452,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				cwd: intent.cwd,
 				detached: true,
 				stdio: 'ignore',
-				env: {...runtime.env, PUBSUB_SPEC: JSON.stringify(spec), PUBSUB_WORKER: '1'},
+				env: {...runtime.env, [WORKER_SPEC_ENV]: JSON.stringify(spec), [WORKER_ENV]: '1'},
 			});
 		} catch (error) {
 			const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
@@ -1315,14 +1487,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	cmd.ui.pane({
 		id: 'jobs',
-		title: 'Async jobs',
+		title: 'Async subagents',
 		render: () => {
 			try {
 				const nodes: unknown[] = [
 					{
 						type: 'row',
 						children: [
-							{type: 'text', text: '◈ pubsub', bold: true},
+							{type: 'text', text: '◈ subagents', bold: true},
 							{type: 'text', text: ` ${jobCache.length} recent · ${countPending()} waiting`, dim: true},
 						],
 					},
@@ -1347,7 +1519,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 							type: 'button',
 							label: 'Refresh',
 							hotkey: 'r',
-							key: 'pubsub-refresh',
+							key: 'subagent-refresh',
 							onPress: () => {
 								refreshJobs();
 								cmd.ui.refreshWidgets();
@@ -1357,7 +1529,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 							type: 'button',
 							label: 'Cancel newest',
 							hotkey: 'c',
-							key: 'pubsub-cancel',
+							key: 'subagent-cancel',
 							onPress: () => {
 								const active = jobCache.find(job => {
 									const state = canonicalState(job.state);
@@ -1372,156 +1544,360 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				});
 				return nodes as never;
 			} catch {
-				return ['pubsub: cannot render the jobs pane'] as never;
+				return ['subagent: cannot render the jobs pane'] as never;
 			}
 		},
 	});
 
 	// ------------------------------------------------------------------ tools
+	//
+	// `subagent_*` is the surface. `pubsub_*` is registered from the same run function
+	// for one release: an installed prompt, a script, or a habit that still calls the
+	// old name keeps working, and cannot drift from the new one because there is only
+	// one implementation.
+
+	type ToolResult = {ok: boolean; error?: string; content?: {type: string; text: string}[]};
+	const okText = (value: string): ToolResult => ({ok: true, content: [{type: 'text', text: value}]});
+	const badInput = (error: string): ToolResult => ({ok: false, error});
+
+	function addSurface(
+		name: string,
+		description: string,
+		inputSchema: Record<string, unknown>,
+		run: (args: {input: Record<string, unknown>}) => Promise<ToolResult>,
+		options: {readOnly?: boolean; aliases?: string[]} = {},
+	): void {
+		const readOnly = options.readOnly === true;
+		cmd.addTool({schema: {name, description, input_schema: inputSchema}, ...(readOnly ? {readOnly} : {}), run} as never);
+		for (const alias of options.aliases ?? []) {
+			cmd.addTool({
+				schema: {name: alias, description: `[deprecated: use ${name}] ${description}`, input_schema: inputSchema},
+				...(readOnly ? {readOnly} : {}),
+				run,
+			} as never);
+		}
+	}
 
 	// The fire-and-forget tool. Returns the moment the worker is detached; the result
 	// arrives later as a signal, never as a tool result.
-	cmd.addTool({
-		schema: {
-			name: 'pubsub_fire',
-			description:
-				'Start a background worker and return immediately. When it finishes, its result is delivered to this session as a separate message on its own - do not poll for it, and do not wait. Pass `command` for a shell command, or `prompt` for a headless Command Code agent to run that prompt. The result returns later as an agent-to-agent signal, so neither side blocks on the other; it is not this tool result.',
-			input_schema: {
-				type: 'object',
-				properties: {
-					label: {type: 'string', description: 'Short name for this job, used in the signal title.'},
-					command: {type: 'string', description: 'Shell command to run detached.'},
-					prompt: {type: 'string', description: 'Prompt for a detached headless Command Code run.'},
-					cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
-				},
-				required: ['label'],
-			},
-		},
-		run: async ({input}) => {
-			const label = typeof input.label === 'string' ? input.label.trim() : '';
-			if (label.length === 0) return {ok: false, error: 'label is required and must not be empty'};
-			const command = typeof input.command === 'string' && input.command.trim().length > 0 ? input.command : undefined;
-			const prompt = typeof input.prompt === 'string' && input.prompt.trim().length > 0 ? input.prompt : undefined;
-			if (command === undefined && prompt === undefined) {
-				return {ok: false, error: 'pass either command or prompt'};
+	const spawnRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const label = String(input.description ?? input.label ?? '').trim();
+		if (label.length === 0) return badInput('description is required and must not be empty');
+		const command = typeof input.command === 'string' && input.command.trim().length > 0 ? input.command : undefined;
+		const prompt = typeof input.prompt === 'string' && input.prompt.trim().length > 0 ? input.prompt : undefined;
+		if (command === undefined && prompt === undefined) {
+			return badInput('pass either prompt (a headless agent) or command (a shell command)');
+		}
+		if (command !== undefined && prompt !== undefined) return badInput('pass prompt or command, not both');
+		// Explicitly refused rather than silently ignored: a caller must not believe a
+		// foreground wait or an isolation mode happened when neither landed yet.
+		if (input.run_in_background === false) {
+			return badInput(
+				'foreground runs are not implemented in this release; omit run_in_background (background is the default)',
+			);
+		}
+		for (const unsupported of ['permission_mode', 'isolation', 'tools']) {
+			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
+		}
+		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
+		const maxTurns = Number(input.max_turns);
+		const timeoutMs = Number(input.timeout_ms);
+		const agentType =
+			typeof input.agent_type === 'string' && input.agent_type.trim().length > 0 ? input.agent_type.trim() : undefined;
+		const launched = fire({
+			label,
+			kind: prompt !== undefined ? 'agent' : 'command',
+			command,
+			prompt,
+			cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
+			agentType,
+			model: prompt === undefined ? undefined : model,
+			maxTurns: prompt === undefined || !Number.isFinite(maxTurns) || maxTurns <= 0 ? undefined : Math.round(maxTurns),
+			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
+		});
+		if (!launched.ok) return badInput(launched.error);
+		const kind = prompt !== undefined ? `agent (${agentType ?? 'general-purpose'})` : 'shell (/bin/sh -c)';
+		return okText(
+			`spawned ${launched.id} "${label}" as ${kind}, pid ${launched.pid}.\n` +
+				`log ${join(logsDir, `${launched.id}.log`)}\n` +
+				`The result arrives here as a signal when it exits - do not wait for it. ` +
+				`subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`,
+		);
+	};
+
+	const listRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		refreshJobs();
+		const limit = Number(input.limit);
+		return okText(
+			listText({
+				state: typeof input.state === 'string' && input.state.length > 0 ? input.state : undefined,
+				limit: Number.isFinite(limit) && limit > 0 ? Math.round(limit) : undefined,
+			}),
+		);
+	};
+
+	function readLog(file: string): string {
+		try {
+			return spool.readFile(file);
+		} catch {
+			return '';
+		}
+	}
+
+	// The transcript of one job: the record's facts, the log path, and a bounded slice
+	// of the log. `offset` is a character offset from the start; the default is the tail.
+	function outputText(id: string, input: Record<string, unknown>): ToolResult {
+		const record = readJob(id);
+		if (record === undefined) return badInput(`subagent: no job ${id}`);
+		const state = canonicalState(record.state);
+		const file = String(record.logPath ?? join(logsDir, `${id}.log`));
+		const log = readLog(file);
+		const requested = Number(input.max_chars);
+		const maxChars = Math.min(
+			OUTPUT_MAX_CHARS_CAP,
+			Number.isFinite(requested) && requested > 0 ? Math.max(200, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT,
+		);
+		const offset = Number(input.offset);
+		let body: string;
+		let note = '';
+		if (Number.isFinite(offset) && offset > 0) {
+			body = log.slice(offset, offset + maxChars);
+			note = `\n[chars ${offset}-${Math.min(log.length, offset + maxChars)} of ${log.length}]`;
+		} else if (log.length > maxChars) {
+			body = log.slice(-maxChars);
+			note = `\n[last ${maxChars} of ${log.length} chars]`;
+		} else {
+			body = log;
+		}
+		const facts = [
+			state,
+			typeof record.exitCode === 'number' ? `exit ${record.exitCode}` : '',
+			typeof record.durationMs === 'number' ? `${(record.durationMs / 1000).toFixed(1)}s` : '',
+			typeof record.model === 'string' && record.model.length > 0 ? record.model : '',
+			typeof record.agentType === 'string' ? record.agentType : '',
+			typeof record.owner === 'string' && record.owner.length > 0 ? `owner ${record.owner.slice(-6)}` : '',
+		].filter(Boolean).join(' · ');
+		const timing =
+			state === 'queued' || state === 'running'
+				? `\n(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1000))}s; the result will arrive as a signal)`
+				: '';
+		return okText(
+			`${stateMarker(record.state)} ${id} "${String(record.label ?? '(unlabelled)')}" · ${facts}\nlog ${file}${timing}\n\n` +
+				(body.length > 0 ? body : '(no output yet)') +
+				note,
+		);
+	}
+
+	const outputRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const id = String(input.id ?? '').trim();
+		if (id.length === 0) return badInput('id is required');
+		if (readJob(id) === undefined) return badInput(`subagent: no job ${id}`);
+		const waitMs = Number(input.wait_ms);
+		const wantsWait = input.wait === true || (Number.isFinite(waitMs) && waitMs > 0);
+		if (wantsWait) {
+			// Bounded on purpose: a tool that waits is a turn held open, so the default is
+			// short and the cap is hard. The loop is counted, not clock-only, so a frozen
+			// clock cannot spin it forever.
+			const budget = Math.min(WAIT_MAX_MS, Number.isFinite(waitMs) && waitMs > 0 ? waitMs : WAIT_DEFAULT_MS);
+			const rounds = Math.ceil(budget / WAIT_POLL_MS) + 1;
+			for (let round = 0; round < rounds; round += 1) {
+				const record = readJob(id);
+				if (record === undefined || isTerminalState(record.state)) break;
+				await runtime.sleep(WAIT_POLL_MS);
 			}
-			if (command !== undefined && prompt !== undefined) {
-				return {ok: false, error: 'pass command or prompt, not both'};
-			}
+		}
+		return outputText(id, input);
+	};
 
-			const launched = fire({
-				label,
-				kind: prompt !== undefined ? 'agent' : 'command',
-				command,
-				prompt,
-				cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
-			});
-			if (!launched.ok) return {ok: false, error: launched.error};
-			return {
-				ok: true,
-				content: [
-					{
-						type: 'text',
-						text:
-							`fired ${launched.id} (${label}), pid ${launched.pid}.\n` +
-							`It will report back here when it exits. Do not wait for it; carry on.`,
-					},
-				],
-			};
-		},
-	});
+	const cancelRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const id = String(input.id ?? '').trim();
+		if (id.length === 0) return badInput('id is required');
+		const result = cancelJob(id);
+		return result.ok ? okText(result.message) : badInput(result.message);
+	};
 
-	// Publish a signal directly, from the model or from any script that can write a file.
-	cmd.addTool({
-		schema: {
-			name: 'pubsub_send',
-			description:
-				'Publish a signal into the agent loop of THIS session. This is the AGENT-TO-AGENT channel: worker and peer agents signal a session so neither side blocks on the other or polls for a result. It is delivered as a visible user turn in the session (echoed in the TUI), and it is durable if no session is bound yet. NEVER use it to notify the human - to reach the human, reply in the session.',
-			input_schema: {
-				type: 'object',
-				properties: {
-					title: {type: 'string', description: 'One line, shown in the signal header.'},
-					body: {type: 'string', description: 'The detail.'},
-				},
-				required: ['title'],
+	const resumeRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const id = String(input.id ?? '').trim();
+		if (id.length === 0) return badInput('id is required');
+		const instruction = String(input.prompt ?? '').trim();
+		if (instruction.length === 0) return badInput('prompt is required: it is the instruction for the resumed run');
+		const record = readJob(id);
+		if (record === undefined) return badInput(`subagent: no job ${id}`);
+		const state = normalizeState(record.state);
+		if (state !== undefined && !isTerminal(state)) return badInput(`subagent: job ${id} is still ${state}`);
+		if (record.prompt === undefined) {
+			return badInput(`subagent: job ${id} is a shell job; there is no agent session to resume`);
+		}
+		// Resume the worker's OWN conversation by its deterministic session name, so the
+		// new instruction continues with the context the worker already has.
+		const launched = fire({
+			label: `${String(record.label ?? id)} (resume)`,
+			kind: 'agent',
+			prompt: instruction,
+			cwd: String(record.cwd ?? cmd.cwd),
+			agentType: record.agentType,
+			model: record.model,
+			maxTurns: record.maxTurns,
+			timeoutMs: record.timeoutMs,
+			resumeSession: record.sessionName ?? sessionNameOf(id),
+			resumedFrom: id,
+		});
+		if (!launched.ok) return badInput(launched.error);
+		return okText(
+			`resumed ${id} as ${launched.id} "${String(record.label ?? id)} (resume)", pid ${launched.pid}.\n` +
+				`log ${join(logsDir, `${launched.id}.log`)}\n` +
+				`The resumed run reports back here as its own signal.`,
+		);
+	};
+
+	const sendRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+		const title = typeof input.title === 'string' ? input.title : '';
+		if (title.length === 0) return badInput('title is required');
+		const body = typeof input.body === 'string' ? input.body : '';
+		const owner = ownerId();
+		const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		enqueueSignal({
+			id,
+			owner,
+			label: title,
+			kind: 'note',
+			state: 'note',
+			exitCode: null,
+			title,
+			body,
+			sessionId,
+		});
+		safeDrain();
+		refreshJobs();
+		return okText(ledger.has(id) ? 'delivered' : 'queued for this session');
+	};
+
+	addSurface(
+		'subagent_spawn',
+		'Start a background subagent and return immediately. When it finishes, its result is delivered to this session as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. The result returns later as an agent-to-agent signal, so neither side blocks on the other; it is not this tool result.',
+		{
+			type: 'object',
+			properties: {
+				description: {type: 'string', description: 'Short name for this job, used in the signal title.'},
+				label: {type: 'string', description: 'Alias for description.'},
+				prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
+				command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
+				agent_type: {type: 'string', description: "Agent type, recorded for the job (default 'general-purpose')."},
+				model: {type: 'string', description: 'Model for an agent job, passed to the worker as -m.'},
+				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
+				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
+				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
+				cwd: {type: 'string', description: 'Working directory. Defaults to the mod workspace root.'},
 			},
+			required: [],
 		},
-		run: async ({input}) => {
-			const title = typeof input.title === 'string' ? input.title : '';
-			if (title.length === 0) return {ok: false, error: 'title is required'};
-			const body = typeof input.body === 'string' ? input.body : '';
-			const owner = ownerId();
-			const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-			enqueueSignal({
-				id,
-				owner,
-				label: title,
-				kind: 'note',
-				state: 'note',
-				exitCode: null,
-				title,
-				body,
-				sessionId,
-			});
-			safeDrain();
-			refreshJobs();
-			return {
-				ok: true,
-				content: [{type: 'text', text: ledger.has(id) ? 'delivered' : 'queued for this session'}],
-			};
-		},
-	});
+		spawnRun,
+		{aliases: ['pubsub_fire']},
+	);
 
-	cmd.addTool({
-		schema: {
-			name: 'pubsub_list',
-			description: 'List fired jobs, their lifecycle states, and count signals still waiting for this session.',
-			input_schema: {type: 'object', properties: {}, required: []},
-		},
-		readOnly: true,
-		run: async () => {
-			refreshJobs();
-			return {ok: true, content: [{type: 'text', text: listText()}]};
-		},
-	});
-
-	cmd.addTool({
-		schema: {
-			name: 'pubsub_cancel',
-			description: 'Cancel a queued or running pubsub job by id. The firing session receives a canceled signal.',
-			input_schema: {
-				type: 'object',
-				properties: {id: {type: 'string', description: 'Job id from pubsub_list or pubsub_fire.'}},
-				required: ['id'],
+	addSurface(
+		'subagent_list',
+		'List spawned jobs with their lifecycle states, model, elapsed time and owner, and count the signals still waiting for this session.',
+		{
+			type: 'object',
+			properties: {
+				state: {type: 'string', description: 'Only jobs in this state (queued, running, waiting-input, done, failed, canceled).'},
+				limit: {type: 'number', description: 'Show at most this many jobs.'},
 			},
+			required: [],
 		},
-		run: async ({input}) => {
-			const id = typeof input.id === 'string' ? input.id.trim() : '';
-			if (id.length === 0) return {ok: false, error: 'id is required'};
-			const message = cancelJob(id);
-			return message.startsWith('pubsub: no job') || message.includes('already')
-				? {ok: false, error: message}
-				: {ok: true, content: [{type: 'text', text: message}]};
+		listRun,
+		{readOnly: true, aliases: ['pubsub_list']},
+	);
+
+	addSurface(
+		'subagent_output',
+		'Read one job: its state, exit code, duration and owner, plus a bounded slice of its log. By default the tail; `offset` reads from a character offset, `max_chars` bounds the slice.',
+		{
+			type: 'object',
+			properties: {
+				id: {type: 'string', description: 'Job id from subagent_spawn or subagent_list.'},
+				wait: {type: 'boolean', description: 'Block briefly until the job finishes (bounded, 10s by default).'},
+				wait_ms: {type: 'number', description: 'How long to wait, capped at 60s.'},
+				offset: {type: 'number', description: 'Character offset into the log.'},
+				max_chars: {type: 'number', description: 'Maximum characters to return.'},
+			},
+			required: ['id'],
 		},
-	});
+		outputRun,
+		{readOnly: true},
+	);
+
+	addSurface(
+		'subagent_cancel',
+		'Cancel a queued or running subagent job by id (SIGTERM, then SIGKILL after 1s). The firing session receives one canceled signal.',
+		{
+			type: 'object',
+			properties: {id: {type: 'string', description: 'Job id from subagent_list or subagent_spawn.'}},
+			required: ['id'],
+		},
+		cancelRun,
+		{aliases: ['pubsub_cancel']},
+	);
+
+	addSurface(
+		'subagent_resume',
+		"Resume a finished agent job in its own worker session and continue it with a new instruction. The resumed run is a new job with its own signal.",
+		{
+			type: 'object',
+			properties: {
+				id: {type: 'string', description: 'Job id of the finished agent job.'},
+				prompt: {type: 'string', description: 'The instruction for the resumed run.'},
+			},
+			required: ['id', 'prompt'],
+		},
+		resumeRun,
+	);
+
+	addSurface(
+		'subagent_send',
+		'Publish a signal into the agent loop of THIS session. This is the AGENT-TO-AGENT channel: worker and peer agents signal a session so neither side blocks on the other or polls for a result. It is delivered as a visible user turn in the session (echoed in the TUI), and it is durable if no session is bound yet. NEVER use it to notify the human - to reach the human, reply in the session.',
+		{
+			type: 'object',
+			properties: {
+				title: {type: 'string', description: 'One line, shown in the signal header.'},
+				body: {type: 'string', description: 'The detail.'},
+			},
+			required: ['title'],
+		},
+		sendRun,
+		{aliases: ['pubsub_send']},
+	);
 
 	// ------------------------------------------------------------------ command
 
+	function commandHandler({args}: {args?: string}): {message: string} {
+		const [sub, ...rest] = String(args ?? '').trim().split(/\s+/).filter(Boolean);
+		if (sub === 'list') return {message: listText()};
+		if (sub === 'cancel' && rest[0] !== undefined) return {message: cancelJob(rest[0]).message};
+		if (sub === 'open' && rest[0] !== undefined) {
+			const shown = outputText(rest[0], {});
+			return {message: shown.ok ? String(shown.content?.[0]?.text ?? '') : String(shown.error ?? '')};
+		}
+		try {
+			cmd.ui.openPane('jobs');
+		} catch {
+			/* headless */
+		}
+		return {message: 'subagents: opened the async subagents pane (list | jobs | cancel <id> | open <id>)'};
+	}
+
+	cmd.addCommand({
+		name: 'subagents',
+		description: 'Async subagents: list, jobs, cancel <id>, open <id>',
+		argumentHint: 'list|jobs|cancel <id>|open <id>',
+		handler: commandHandler,
+	});
 	cmd.addCommand({
 		name: 'pubsub',
-		description: 'Async jobs: list, cancel <id>, or open the dashboard',
-		argumentHint: 'list|cancel <id>|jobs',
-		handler: ({args}) => {
-			const [sub, ...rest] = String(args ?? '').trim().split(/\s+/).filter(Boolean);
-			if (sub === 'list') return {message: listText()};
-			if (sub === 'cancel' && rest[0] !== undefined) return {message: cancelJob(rest[0])};
-			try {
-				cmd.ui.openPane('jobs');
-			} catch {
-				/* headless */
-			}
-			return {message: 'pubsub: opened the async jobs pane (list | cancel <id>)'};
-		},
+		description: '[deprecated: use /subagents] Async subagents: list, jobs, cancel <id>, open <id>',
+		argumentHint: 'list|jobs|cancel <id>|open <id>',
+		handler: commandHandler,
 	});
 
 	// ------------------------------------------------------------------ lifecycle
@@ -1535,6 +1911,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			ownerId();
 			sweepClaimed();
 			sweepOrphaned();
+			sweepExpired();
 			reconcileJobs();
 			refreshJobs();
 			safeDrain();
@@ -1548,7 +1925,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			const pending = claimPending(5);
 			if (pending.length === 0) return undefined;
 			for (const claim of pending) {
-				cmd.showEntry('pubsub', claim.signal);
+				cmd.showEntry('subagent', claim.signal);
 				markDelivered(claim.signal.id);
 				settle(claim, 'accepted');
 			}
@@ -1568,6 +1945,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	cmd.clock.every(DRAIN_INTERVAL_MS, safeDrain);
 	cmd.clock.every(REFRESH_INTERVAL_MS, refreshJobs);
+	cmd.clock.every(RETENTION_SWEEP_INTERVAL_MS, sweepExpired);
 
 	// Seed the dashboard and reconcile anything a previous process left behind.
 	ownerId();
