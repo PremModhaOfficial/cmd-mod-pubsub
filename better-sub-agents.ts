@@ -2054,13 +2054,17 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (wanted.length === 0) return undefined;
 		const own = workerMode ? workerSpec?.owner : ownerId();
 		const allowed = workerMode ? rosterNames() : undefined;
+		let fallback: JobRecord | undefined;
 		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
 			if (job.name !== wanted) continue;
 			if (!workerMode && own !== undefined && job.owner !== undefined && job.owner !== own) continue;
 			if (allowed !== undefined && !allowed.includes(wanted)) continue;
-			return job;
+			// Prefer the record whose worker is still alive: a resumed job shares the
+			// name with the record it continued, and the live one is the address.
+			if (runtime.alive(job.workerPid) || runtime.alive(job.pid)) return job;
+			if (fallback === undefined) fallback = job;
 		}
-		return undefined;
+		return fallback;
 	}
 
 	// `alive` decides queue-vs-resume; `busy` decides the wording of a queue. No
@@ -2093,7 +2097,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// this session, newest record per name. `rosterNames` is the same set as data, so
 	// the worker can validate a `to` without parsing the rendered text.
 	function rosterFor(selfName: string | undefined): {roster?: string; rosterNames: string[]} {
-		const own = ownerId();
+		const own = workerMode ? workerSpec?.owner : ownerId();
 		const entries: RosterEntry[] = [];
 		const names: string[] = [];
 		for (const job of readRecentJobs(AGENT_SCAN_MAX)) {
@@ -2103,6 +2107,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (names.includes(job.name)) continue;
 			names.push(job.name);
 			entries.push({name: job.name, state: canonicalState(job.state), jobId: job.id});
+		}
+		// A nested agent inherits its parent's view of the team plus its parent itself.
+		if (workerMode) {
+			const inherited = [String(workerSpec?.name ?? ''), ...(Array.isArray(workerSpec?.rosterNames) ? workerSpec.rosterNames : [])];
+			for (const name of inherited) {
+				if (name.length === 0 || name === selfName || names.includes(name)) continue;
+				names.push(name);
+				entries.push({name});
+			}
 		}
 		const roster = buildRoster(entries, selfName);
 		return {...(roster.length > 0 ? {roster} : {}), rosterNames: names};
@@ -3326,7 +3339,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				record.updatedAt = now;
 				writeJob(record);
 				enqueueSignal(
-					signalOf(record, {
+					signalOf({...record, id: `${id}-handback-${now.toString(36)}`}, {
 						state: 'done',
 						finishedAt: now,
 						durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
