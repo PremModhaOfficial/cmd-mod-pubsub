@@ -1102,6 +1102,120 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return `pubsub: canceled ${id} (${String(job.label ?? 'unlabelled')})`;
 	}
 
+	// ------------------------------------------------------------------ launch
+	//
+	// fire(intent) is the only way a job starts and failJob(job, reason) is the only
+	// way one fails: both write the record and emit the signal, so every failure mode
+	// (and every guard a later phase adds) produces exactly one result. A guard
+	// rejects before the spawn and calls failJob(); nothing writes a failed record by
+	// hand.
+
+	interface JobIntent {
+		readonly label: string;
+		readonly kind: 'command' | 'agent';
+		readonly command?: string;
+		readonly prompt?: string;
+		readonly cwd: string;
+	}
+
+	type Launch = {readonly ok: true; readonly id: string; readonly pid: number} | {readonly ok: false; readonly error: string};
+
+	function failJob(job: JobRecord, reason: string): void {
+		const now = runtime.now();
+		const signal = signalOf(job, {
+			state: 'failed',
+			finishedAt: now,
+			durationMs: Math.max(0, now - Number(job.startedAt ?? now)),
+			body: reason,
+		});
+		// The state table decides whether this job may still fail: a terminal job keeps
+		// whatever result it already has, and emits nothing.
+		if (!applyPatch(job.id, patchOf(signal), job, now)) return;
+		enqueueSignal(signal);
+		refreshJobs();
+	}
+
+	function fire(intent: JobIntent): Launch {
+		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const logPath = join(logsDir, `${id}.log`);
+		const startedAt = runtime.now();
+		const owner = requireOwner();
+		const record: JobRecord = {
+			id,
+			owner,
+			label: intent.label,
+			kind: intent.kind,
+			state: 'queued',
+			cwd: intent.cwd,
+			logPath,
+			startedAt,
+			sessionId,
+			updatedAt: startedAt,
+			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+		};
+		writeJob(record);
+		try {
+			cmd.session?.appendCustomEntry({
+				customType: 'pubsub/job',
+				data: {id, label: intent.label, kind: intent.kind, state: 'queued', owner, sessionId},
+			});
+		} catch {
+			/* audit trail is optional */
+		}
+
+		const spec = {
+			id,
+			label: intent.label,
+			kind: intent.kind,
+			owner,
+			cwd: intent.cwd,
+			logPath,
+			inboxDir,
+			jobsDir,
+			startedAt,
+			tailMax: LOG_TAIL_BYTES_MAX,
+			bin: runtime.env.COMMANDCODE_BIN ?? 'cmd',
+			sessionId,
+			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+		};
+
+		let worker: ChildHandle;
+		try {
+			worker = runtime.spawn(runtime.execPath, ['-e', WORKER_SOURCE], {
+				cwd: intent.cwd,
+				detached: true,
+				stdio: 'ignore',
+				env: {...runtime.env, PUBSUB_SPEC: JSON.stringify(spec), PUBSUB_WORKER: '1'},
+			});
+		} catch (error) {
+			const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
+			failJob(record, reason);
+			return {ok: false, error: reason};
+		}
+
+		// A spawn failure is also an async 'error' event; without a listener it would be
+		// an uncaught exception in the host, and the job would sit at `queued` forever.
+		worker.on('error', error => {
+			failJob(readJob(id) ?? record, `worker spawn error: ${String((error as Error)?.message ?? error)}`);
+		});
+		worker.unref();
+
+		if (typeof worker.pid !== 'number') {
+			const reason = 'the worker process did not start';
+			failJob(readJob(id) ?? record, reason);
+			return {ok: false, error: reason};
+		}
+
+		// Merge the pid onto the freshest record: the worker may already have written
+		// `running`, and a blind overwrite would drag it back to `queued`.
+		const latest = readJob(id) ?? record;
+		latest.workerPid = worker.pid;
+		latest.updatedAt = runtime.now();
+		writeJob(latest);
+		refreshJobs();
+		return {ok: true, id, pid: worker.pid};
+	}
+
 	// ------------------------------------------------------------------ dashboard
 
 	cmd.ui.pane({
@@ -1200,120 +1314,21 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				return {ok: false, error: 'pass command or prompt, not both'};
 			}
 
-			const owner = requireOwner();
-			const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-			const cwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd;
-			const logPath = join(logsDir, `${id}.log`);
-			const startedAt = runtime.now();
-			const kind = prompt !== undefined ? 'agent' : 'command';
-			const spec = {
-				id,
+			const launched = fire({
 				label,
-				kind,
-				owner,
-				cwd,
-				logPath,
-				inboxDir,
-				jobsDir,
-				startedAt,
-				tailMax: LOG_TAIL_BYTES_MAX,
-				bin: runtime.env.COMMANDCODE_BIN ?? 'cmd',
-				sessionId,
-				...(prompt !== undefined ? {prompt} : {command}),
-			};
-			const record: JobRecord = {
-				id,
-				owner,
-				label,
-				kind,
-				state: 'queued',
-				cwd,
-				logPath,
-				startedAt,
-				sessionId,
-				updatedAt: startedAt,
-				...(prompt !== undefined ? {prompt} : {command}),
-			};
-			writeJob(record);
-			try {
-				cmd.session?.appendCustomEntry({customType: 'pubsub/job', data: {id, label, kind, state: 'queued', owner, sessionId}});
-			} catch {
-				/* audit trail is optional */
-			}
-
-			let worker;
-			try {
-				worker = runtime.spawn(runtime.execPath, ['-e', WORKER_SOURCE], {
-					cwd,
-					detached: true,
-					stdio: 'ignore',
-					env: {...runtime.env, PUBSUB_SPEC: JSON.stringify(spec), PUBSUB_WORKER: '1'},
-				});
-			} catch (error) {
-				const now = runtime.now();
-				const reason = `spawn error: ${String((error as Error)?.message ?? error)}`;
-				const signal = signalOf(record, {
-					state: 'failed',
-					finishedAt: now,
-					durationMs: Math.max(0, now - startedAt),
-					body: reason,
-				});
-				if (!applyPatch(id, patchOf(signal), record, now)) return {ok: false, error: reason};
-				enqueueSignal(signal);
-				refreshJobs();
-				return {ok: false, error: reason};
-			}
-
-			// A spawn failure is an async 'error' event; without a listener it is an
-			// uncaught exception in the host. Record it and emit a signal so the job
-			// does not sit at `queued` forever.
-			worker.on('error', error => {
-				const current = readJob(id);
-				if (current !== undefined && normalizeState(current.state) === 'canceled') return;
-				const now = runtime.now();
-				const reason = `worker spawn error: ${String((error as Error)?.message ?? error)}`;
-				const signal = signalOf(current ?? record, {
-					state: 'failed',
-					finishedAt: now,
-					durationMs: Math.max(0, now - startedAt),
-					body: reason,
-				});
-				// A terminal job keeps its result: no state change, and no phantom signal.
-				if (!applyPatch(id, patchOf(signal), current ?? record, now)) return;
-				enqueueSignal(signal);
-				refreshJobs();
+				kind: prompt !== undefined ? 'agent' : 'command',
+				command,
+				prompt,
+				cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
 			});
-			worker.unref();
-
-			if (typeof worker.pid !== 'number') {
-				const now = runtime.now();
-				const reason = 'the worker process did not start';
-				const signal = signalOf(record, {
-					state: 'failed',
-					finishedAt: now,
-					durationMs: Math.max(0, now - startedAt),
-					body: reason,
-				});
-				if (!applyPatch(id, patchOf(signal), record, now)) return {ok: false, error: reason};
-				enqueueSignal(signal);
-				refreshJobs();
-				return {ok: false, error: reason};
-			}
-
-			// Merge the pid onto the freshest record: the worker may already have written
-			// `running`, and a blind overwrite would drag it back to `queued`.
-			const latest = readJob(id) ?? record;
-			latest.workerPid = worker.pid;
-			latest.updatedAt = runtime.now();
-			writeJob(latest);
-			refreshJobs();
+			if (!launched.ok) return {ok: false, error: launched.error};
 			return {
 				ok: true,
 				content: [
 					{
 						type: 'text',
 						text:
-							`fired ${id} (${label}), pid ${worker.pid}.\n` +
+							`fired ${launched.id} (${label}), pid ${launched.pid}.\n` +
 							`It will report back here when it exits. Do not wait for it; carry on.`,
 					},
 				],

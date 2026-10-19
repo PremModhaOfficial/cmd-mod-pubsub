@@ -571,6 +571,72 @@ try {
 	assert.ok(rendered.includes('teleported'), 'and its raw state stays visible');
 	ok('an invalid transition is rejected and an unknown state is loud');
 
+
+	// 15. one spawn-failure choke point -------------------------------------
+	// Three different ways a spawn can fail, one contract: a failed record, exactly
+	// one failed signal, exactly one delivery.
+	const failureModes = [
+		{
+			name: 'sync throw',
+			make() {
+				const bundle = makeRuntime({
+					spawn() {
+						throw new Error('EAGAIN');
+					},
+				});
+				return {...bundle, trigger() {}};
+			},
+			toolFails: true,
+		},
+		{
+			name: 'async error event',
+			make() {
+				const child = makeChild();
+				const bundle = makeRuntime({spawn: () => child});
+				return {...bundle, trigger: () => child.emit('error', new Error('EPIPE'))};
+			},
+			toolFails: false,
+		},
+		{
+			name: 'missing pid',
+			make() {
+				const bundle = makeRuntime({spawn: () => makeChild({pid: null})});
+				return {...bundle, trigger() {}};
+			},
+			toolFails: true,
+		},
+	];
+
+	for (const mode of failureModes) {
+		const dir = mkdtempSync(join(tmpdir(), 'pubsub-fail-'));
+		const session = makeSession();
+		const bundle = mode.make();
+		const api = makeApi({spoolDir: dir, session, runtime: bundle.runtime});
+		mod(api.api, api.runtime);
+		const fireTool = api.toolDefs.find((def) => def.schema.name === 'pubsub_fire');
+		const launched = await fireTool.run({input: {label: 'boom', command: 'true'}});
+		assert.equal(launched.ok, !mode.toolFails, `${mode.name}: the tool reports the failure state`);
+		bundle.trigger();
+
+		const signals = readdirSync(join(dir, 'inbox')).filter((name) => name.endsWith('.json'));
+		assert.equal(signals.length, 1, `${mode.name}: exactly one failed signal`);
+		const signal = JSON.parse(readFileSync(join(dir, 'inbox', signals[0]), 'utf8'));
+		assert.equal(signal.state, 'failed', `${mode.name}: the signal is a failure`);
+		assert.equal(typeof signal.body, 'string', `${mode.name}: the signal carries the reason`);
+
+		const records = readdirSync(join(dir, 'jobs')).filter((name) => name.endsWith('.json'));
+		assert.equal(records.length, 1, `${mode.name}: one job record`);
+		const record = JSON.parse(readFileSync(join(dir, 'jobs', records[0]), 'utf8'));
+		assert.equal(record.state, 'failed', `${mode.name}: the record is failed too`);
+		assert.equal(record.failureReason, signal.body, `${mode.name}: record and signal carry the same reason`);
+		assert.equal(record.id, signal.id, `${mode.name}: the signal belongs to the record`);
+
+		api.listeners.get('run_start')[0]({sessionId: 'failure'});
+		const delivered = api.userMessages.filter((message) => message.text.includes('boom failed'));
+		assert.equal(delivered.length, 1, `${mode.name}: exactly one failed signal is delivered`);
+	}
+	ok('every spawn failure goes through one choke point and emits one signal');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);
