@@ -15,7 +15,7 @@
 //      factory argument, so the OS never runs during the suite
 
 import assert from 'node:assert/strict';
-import {existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync} from 'node:fs';
+import {existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
@@ -420,6 +420,85 @@ try {
 	new Script(worker, {filename: 'PUBSUB_WORKER_SOURCE'});
 	assert.match(worker, /PUBSUB_SPEC/, 'the worker reads its spec from the environment');
 	ok('one envelope for record and signal; the inline worker source compiles');
+
+	// 11. spool claim / settle ---------------------------------------------
+	// A signal this session does not own belongs to another session. onStop used to
+	// delete one when the restore rename failed; settle('held') must never destroy
+	// it, and the owner must still collect it exactly once.
+	const raceDir = mkdtempSync(join(tmpdir(), 'pubsub-race-'));
+	const raceSessionA = makeSession();
+	const raceSessionB = makeSession();
+	const restoreFails = {
+		rename(from, to) {
+			if (from.startsWith(join(raceDir, 'claimed')) && to.startsWith(join(raceDir, 'inbox'))) {
+				throw new Error('EXDEV'); // the restore path the old code deleted on
+			}
+			return renameSync(from, to);
+		},
+	};
+	const raceA = makeApi({spoolDir: raceDir, session: raceSessionA, runtime: makeRuntime().runtime});
+	const raceB = makeApi({spoolDir: raceDir, session: raceSessionB, runtime: makeRuntime({fs: restoreFails}).runtime});
+	mod(raceA.api, raceA.runtime);
+	mod(raceB.api, raceB.runtime);
+	const raceOwner = ownerEntries(raceSessionA)[0];
+	assert.notEqual(ownerEntries(raceSessionB)[0], raceOwner, 'the two racing sessions are distinct owners');
+
+	writeFileSync(
+		join(raceDir, 'inbox', `${Date.now()}-race-1.json`),
+		JSON.stringify({id: 'race-1', owner: raceOwner, label: 'race', kind: 'command', state: 'done', title: 'race done', body: 'ok'}),
+	);
+	assert.equal(raceB.registeredHooks.onStop(), undefined, 'onStop hands nothing foreign to the model');
+	assert.equal(raceB.userMessages.length, 0, "B must not receive A's signal");
+	assert.equal(raceB.shownEntries.length, 0, "B must not show A's signal");
+	const raceFiles = readdirSync(join(raceDir, 'inbox')).filter((name) => name.includes('race-1'));
+	assert.equal(raceFiles.length, 1, "a foreign signal survives a failed restore: it is put back, never deleted");
+	assert.equal(
+		JSON.parse(readFileSync(join(raceDir, 'inbox', raceFiles[0]), 'utf8')).id,
+		'race-1',
+		'the held signal comes back intact',
+	);
+	ok("onStop never deletes a foreign session's signal");
+
+	// The pending count reads the same spool, so it cannot disagree with delivery.
+	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'pubsub');
+	const raceCommandB = raceB.commandDefs.find((def) => def.name === 'pubsub');
+	assert.match(
+		raceCommandA.handler({args: 'list'}).message,
+		/1 signal\(s\) waiting for this session/,
+		'A sees its one pending signal',
+	);
+	assert.match(
+		raceCommandB.handler({args: 'list'}).message,
+		/0 signal\(s\) waiting for this session/,
+		'B sees none of A\'s signals',
+	);
+	raceA.listeners.get('run_start')[0]({sessionId: 'race-a'});
+	assert.equal(raceA.userMessages.length, 1, 'the owner collects the held signal once');
+	assert.match(raceA.userMessages[0].text, /race done/, 'the held signal arrives intact');
+	raceA.listeners.get('run_start')[0]({sessionId: 'race-a'});
+	assert.equal(raceA.userMessages.length, 1, 'and only once');
+	ok('a held signal is delivered to its owner exactly once');
+
+	// 12. no session bound is a state, not an exception ---------------------
+	const unboundDir = mkdtempSync(join(tmpdir(), 'pubsub-unbound-'));
+	const unboundSession = makeSession();
+	const u = makeApi({spoolDir: unboundDir, session: unboundSession, runtime: makeRuntime().runtime});
+	mod(u.api, u.runtime);
+	const unboundOwner = ownerEntries(unboundSession)[0];
+	writeFileSync(
+		join(unboundDir, 'inbox', `${Date.now()}-unbound-1.json`),
+		JSON.stringify({id: 'unbound-1', owner: unboundOwner, label: 'unbound', kind: 'command', state: 'done', title: 'unbound', body: 'x'}),
+	);
+	u.api.session = undefined; // the session unbinds (hot reload teardown) before the drain
+	const drainTick = u.everyTicks.find((tick) => tick.ms === 400);
+	assert.equal(typeof drainTick?.fn, 'function', 'a drain tick is scheduled');
+	drainTick.fn();
+	assert.ok(
+		readdirSync(join(unboundDir, 'inbox')).some((name) => name.includes('unbound-1')),
+		'no bound session: the signal is held in inbox/, not dropped',
+	);
+	assert.equal(u.userMessages.length, 0, 'nothing is delivered without a session');
+	ok('no session bound holds the signal instead of throwing');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

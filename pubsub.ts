@@ -73,6 +73,7 @@ const LIST_SCAN_MAX = 50;
 const DELIVERED_LEDGER_MAX = 5000;
 const LEDGER_COMPACT_BYTES = 512 * 1024;
 const PANE_ROWS_MAX = 12;
+const PENDING_SCAN_MAX = 500;
 const OWNER_TYPE = 'pubsub/owner';
 
 const TERMINAL_STATES = new Set(['waiting-input', 'done', 'failed', 'canceled']);
@@ -379,6 +380,19 @@ function signalOf(
 	};
 }
 
+// One claimed inbox file: the signal, plus the two paths settle() needs to undo
+// or finish the claim. Ownership is what the drain decides; Settled is how the
+// claim ends.
+interface Claim {
+	readonly name: string;
+	readonly signal: Signal;
+	readonly live: string;
+	readonly claimed: string;
+}
+
+type Ownership = 'mine' | 'foreign' | 'orphan' | 'pending';
+type Settled = 'accepted' | 'held' | 'quarantined';
+
 function patchOf(signal: Signal): JobPatch {
 	const patch: JobPatch = {
 		exitCode: typeof signal.exitCode === 'number' ? signal.exitCode : undefined,
@@ -595,14 +609,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return workerMode ? 'foreign' : 'orphan';
 	}
 
-	function quarantine(file: string, name: string): void {
-		try {
-			spool.rename(file, join(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${name}`));
-		} catch {
-			spool.remove(file);
-		}
-	}
-
 	function markDelivered(id: string): void {
 		const job = readJob(id);
 		if (job === undefined) return;
@@ -611,77 +617,129 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		writeJob(job);
 	}
 
+	// `queueMessage` only steers a run that is already going - it never STARTS one,
+	// so an idle session would leave the result unread until someone asked for it.
+	// `sendUserMessage` starts the turn when idle and queues behind the active turn
+	// otherwise. This is the A2A delivery path.
 	function deliver(message: Signal): void {
-		// No bound session means sendUserMessage would degrade to a silent queue push
-		// (headless post-run) and we would delete the only durable copy. Throw so the
-		// drain puts the signal back in inbox/ for the next bound session.
-		if (cmd.session === undefined) throw new Error('no session bound');
-		// `queueMessage` only steers a run that is already going - it never STARTS one,
-		// so an idle session would leave the result unread until someone asked for it.
-		// `sendUserMessage` starts the turn when idle and queues behind the active turn
-		// otherwise. This is the A2A delivery path.
 		cmd.sendUserMessage(formatSignal(message), {deliverAs: deliverAs()});
 		cmd.showEntry('pubsub', message);
-		rememberDelivered(message.id);
-		markDelivered(message.id);
+	}
+
+	// ------------------------------------------------------------------ spool
+	//
+	// One file in inbox/ is one undelivered signal, and rename() is the claim: it is
+	// atomic, so exactly one drainer wins a file even with several sessions on one
+	// spool. next() and settle() are the only two operations on a claimed file, so
+	// drain, onStop and the pending count cannot disagree about a signal - and in
+	// particular a signal this session does not own is put back, never deleted.
+
+	function inboxNames(): string[] {
+		try {
+			return spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
+		} catch {
+			return [];
+		}
+	}
+
+	// Claim the next signal this session may deliver. Everything else - torn, already
+	// delivered, untagged, foreign, or not classifiable yet - is settled right here,
+	// so the caller only ever sees its own work. `seen` bounds one pass.
+	function next(seen: Set<string>): Claim | undefined {
+		for (const name of inboxNames()) {
+			if (seen.has(name)) continue;
+			seen.add(name);
+			const live = join(inboxDir, name);
+			const claimed = join(claimedDir, name);
+			try {
+				spool.rename(live, claimed);
+			} catch {
+				/* another drainer won it */
+				continue;
+			}
+			let signal: Signal | undefined;
+			try {
+				signal = JSON.parse(spool.readFile(claimed)) as Signal;
+			} catch {
+				signal = undefined;
+			}
+			if (signal === undefined || typeof signal.id !== 'string' || signal.id.length === 0) {
+				spool.remove(claimed);
+				continue;
+			}
+			const claim: Claim = {name, signal, live, claimed};
+			if (deliveredIds.has(signal.id)) {
+				// Delivered once already (a replayed claimed/ file): drop this copy.
+				settle(claim, 'accepted');
+				continue;
+			}
+			const owner = classify(signal);
+			if (owner === 'orphan') {
+				settle(claim, 'quarantined');
+				continue;
+			}
+			if (owner !== 'mine') {
+				settle(claim, 'held');
+				continue;
+			}
+			return claim;
+		}
+		return undefined;
+	}
+
+	function settle(claim: Claim, outcome: Settled): void {
+		if (outcome === 'accepted') {
+			rememberDelivered(claim.signal.id);
+			spool.remove(claim.claimed);
+			return;
+		}
+		if (outcome === 'quarantined') {
+			try {
+				spool.rename(
+					claim.claimed,
+					join(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`),
+				);
+			} catch {
+				/* leave it in claimed/; sweepClaimed bounds it. Never delete a signal here. */
+			}
+			return;
+		}
+		// Held: put it back for its owner. If the rename cannot happen, write the
+		// signal back into inbox/ instead of deleting the only durable copy.
+		try {
+			spool.rename(claim.claimed, claim.live);
+		} catch {
+			try {
+				spool.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
+				spool.remove(claim.claimed);
+			} catch {
+				/* it stays in claimed/ and is swept later. Never deleted. */
+			}
+		}
 	}
 
 	function drain(): void {
 		if (draining) return;
 		draining = true;
+		const seen = new Set<string>();
 		try {
-			const names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
-			for (const name of names.slice(0, FILES_PER_DRAIN_MAX)) {
-				const live = join(inboxDir, name);
-				const claimed = join(claimedDir, name);
-				// Claim by rename first: rename is atomic, so exactly one drainer wins a
-				// given file even if two sessions are running against one spool.
-				try {
-					spool.rename(live, claimed);
-				} catch {
-					continue;
-				}
-				let message: Signal;
-				try {
-					message = JSON.parse(spool.readFile(claimed)) as Signal;
-				} catch {
-					spool.remove(claimed);
-					continue;
-				}
-				if (typeof message.id !== 'string' || message.id.length === 0) {
-					spool.remove(claimed);
-					continue;
-				}
-				if (deliveredIds.has(message.id)) {
-					spool.remove(claimed);
-					continue;
-				}
-				const owner = classify(message);
-				if (owner === 'orphan') {
-					quarantine(claimed, name);
-					continue;
-				}
-				if (owner !== 'mine') {
-					// Another session's result, or ownership not known yet. Put it back.
-					try {
-						spool.rename(claimed, live);
-					} catch {
-						/* it stays claimable and will be swept later if abandoned */
-					}
+			for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
+				const claim = next(seen);
+				if (claim === undefined) return;
+				// No bound session is a state, not an exception: sending here would
+				// degrade to a silent queue push in a headless run. Hold it instead.
+				if (cmd.session === undefined) {
+					settle(claim, 'held');
 					continue;
 				}
 				try {
-					deliver(message);
-					spool.remove(claimed);
+					deliver(claim.signal);
 				} catch {
-					// No session bound yet. Put it back so the next tick can deliver it
-					// instead of dropping the signal on the floor.
-					try {
-						spool.rename(claimed, live);
-					} catch {
-						/* keep it in claimed/; a later run can still drain that */
-					}
+					settle(claim, 'held');
+					continue;
 				}
+				markDelivered(claim.signal.id);
+				settle(claim, 'accepted');
 			}
 		} finally {
 			draining = false;
@@ -697,58 +755,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 	};
 
-	// Claim and remove up to `limit` signals without delivering them. The caller decides
-	// how they reach the model (onStop continues the run with them as the reason).
-	function claimPending(limit: number): Signal[] {
-		const out: Signal[] = [];
-		let names: string[];
-		try {
-			names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
-		} catch {
-			return out;
+	// Claim up to `limit` signals without delivering them; the caller decides how they
+	// reach the model (onStop continues the run with them as the reason). An unsettled
+	// claim stays in claimed/ and is swept later.
+	function claimPending(limit: number): Claim[] {
+		const seen = new Set<string>();
+		const claims: Claim[] = [];
+		while (claims.length < limit) {
+			const claim = next(seen);
+			if (claim === undefined) break;
+			claims.push(claim);
 		}
-		for (const name of names.slice(0, limit)) {
-			const live = join(inboxDir, name);
-			const claimed = join(claimedDir, name);
-			try {
-				spool.rename(live, claimed);
-			} catch {
-				continue;
-			}
-			let message: Signal | undefined;
-			try {
-				message = JSON.parse(spool.readFile(claimed)) as Signal;
-			} catch {
-				spool.remove(claimed);
-				continue;
-			}
-			if (typeof message.id !== 'string' || message.id.length === 0) {
-				spool.remove(claimed);
-				continue;
-			}
-			if (deliveredIds.has(message.id)) {
-				spool.remove(claimed);
-				continue;
-			}
-			const owner = classify(message);
-			if (owner === 'orphan') {
-				quarantine(claimed, name);
-				continue;
-			}
-			if (owner !== 'mine') {
-				try {
-					spool.rename(claimed, live);
-				} catch {
-					spool.remove(claimed);
-				}
-				continue;
-			}
-			rememberDelivered(message.id);
-			markDelivered(message.id);
-			out.push(message);
-			spool.remove(claimed);
-		}
-		return out;
+		return claims;
 	}
 
 	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
@@ -832,21 +850,16 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	let lastJobsSignature = '';
 	let lastStatus = '';
 
+	// How many signals are waiting for this session. It claims through the same
+	// next()/settle() pair the drain uses, so the count cannot drift from delivery.
 	function countPending(): number {
-		let names: string[];
-		try {
-			names = spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
-		} catch {
-			return 0;
-		}
+		const seen = new Set<string>();
 		let count = 0;
-		for (const name of names.slice(0, 500)) {
-			try {
-				const message = JSON.parse(spool.readFile(join(inboxDir, name))) as Signal;
-				if (typeof message.id === 'string' && !deliveredIds.has(message.id) && classify(message) === 'mine') count++;
-			} catch {
-				/* torn file */
-			}
+		while (count < PENDING_SCAN_MAX) {
+			const claim = next(seen);
+			if (claim === undefined) break;
+			count += 1;
+			settle(claim, 'held');
 		}
 		return count;
 	}
@@ -1336,9 +1349,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		onStop: () => {
 			const pending = claimPending(5);
 			if (pending.length === 0) return undefined;
-			for (const message of pending) cmd.showEntry('pubsub', message);
+			for (const claim of pending) {
+				cmd.showEntry('pubsub', claim.signal);
+				markDelivered(claim.signal.id);
+				settle(claim, 'accepted');
+			}
 			refreshJobs();
-			return {continue: true, reason: pending.map(formatSignal).join('\n\n')};
+			return {continue: true, reason: pending.map(claim => formatSignal(claim.signal)).join('\n\n')};
 		},
 	});
 
