@@ -45,11 +45,11 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `agent_type`, `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a headless `cmd -p` in a fresh process. `cwd` defaults to the mod workspace root. |
+| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `subagent_type` (or the deprecated `agent_type`), `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. |
 | `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, elapsed time and owner, plus how many signals are still waiting for this session. |
 | `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
-| `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its own worker session (pinned as `subagent-<id>`) with a new instruction. The resumed run is a new job with its own signal. |
+| `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. The resumed run is a new job with its own signal. |
 | `subagent_send` | `title`, `body` | Publishes a signal into the agent loop of **this** session. The agent-to-agent channel: worker and peer agents signal a session so neither blocks or polls. Delivered as a visible user turn. |
 
 `subagent_spawn` is the whole point: it returns in milliseconds with the job id and pid, and the result
@@ -65,6 +65,44 @@ arrives later **as a signal, never as a tool result** — so there is nothing to
 // continue it afterwards
 {"id": "m3k2-9f1a2b", "prompt": "Now open issues for the three worst offenders."}
 ```
+
+
+### Agent definitions
+
+A definition is a Markdown file with YAML frontmatter; the body is the worker's system prompt. Only
+`name` and `description` are required.
+
+```markdown
+---
+name: code-reviewer
+description: Reviews code for quality, security, and maintainability
+tools: Read, Grep, Glob, Bash
+model: sonnet
+permissionMode: default
+---
+
+You are a senior code reviewer. Report findings, not edits.
+```
+
+Discovery walks up from the working directory to the repository root (the closest
+`.commandcode/agents/` wins), then scans `~/.commandcode/agents/`, then adds the built-ins. Directories
+are scanned recursively, and a project definition overrides a user or built-in definition by name.
+
+Built-ins: `explore` and `plan` (read-only, one-shot), `general-purpose` (the fallback) and `claude`.
+`general` is accepted as the host-reserved alias for `general-purpose`.
+
+Parsed fields: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`,
+`skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`. Unknown fields are ignored. A file
+with a missing name or description, a bad first line, a colon or over-256-character name, or unparseable
+YAML is skipped and written to `<subagent_dir>/agents.log`; `/agents` lists every definition and every
+skip with its reason.
+
+`subagent_type` is canonical; `agent_type` is a deprecated alias. Omitting the type uses
+`general-purpose`; with no `general-purpose` definition the call fails with `subagent_type is required`.
+
+With the mod installed, the body is injected through the host's `appendSystemPrompt` hook in the ACP
+worker. When the mod is loaded only with `--mod` (development), this host's `cmd acp` ignores `--mod`, so
+the worker carries the body at the front of the task prompt instead; the job log says which path ran.
 
 `permission_mode`, `isolation` and `tools` are **refused explicitly** rather than silently ignored: they
 arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
@@ -84,6 +122,7 @@ the `/pubsub` command and the `pubsub_dir` / `pubsub_deliver` flags.
 /subagents jobs          # open the async-jobs dashboard pane
 /subagents cancel <id>   # cancel a queued/running job
 /subagents open <id>     # one job: state, exit code, duration, log
+/agents [name|path]      # subagent definitions: scope, validity, source file
 ```
 
 The `jobs` pane lists recent jobs with a state marker (`◌` queued, `●` running, `?` waiting-input,
@@ -107,8 +146,9 @@ queued → running → waiting-input | done | failed | canceled
 
 - **queued** — the job record is written, the detached worker is being spawned.
 - **running** — the worker has written its child's pid.
-- **waiting-input** — the worker exited with a question (its last log line ends in `?`). A headless
-  worker cannot stay alive waiting for input, so answering it means firing a follow-up job.
+- **waiting-input** — a shell job exited with a question (its last log line ends in `?`). A headless
+  worker cannot stay alive waiting for input, so answering it means firing a follow-up job. An ACP
+  agent job ends its turn (`end_turn`) and reports `done` instead.
 - **done** / **failed** — the child exited, with code, duration and a log tail carried in the signal.
 - **canceled** — terminal. `subagent_cancel` kills the child and worker and emits a `canceled` signal.
   A worker that notices the cancellation while exiting will not overwrite the state.
@@ -120,9 +160,11 @@ gone instead of waiting forever. A detached worker survives the harness, so a li
 waiting.
 
 A job that overruns `timeout_ms` is `SIGTERM`ed and then `SIGKILL`ed, and signals `failed` with
-`timed out after …`. A `cmd -p` run that hits its turn cap exits 8 and signals
-`exit 8 (max turns reached; result is partial)`; any other non-zero exit is `failed` with the CLI's own
-error in the log tail, so an API or auth failure is visible rather than silent.
+`timed out after …`. An ACP turn reports its `stopReason`: `end_turn` is `done`; `cancelled`,
+`max_tokens` and `max_turn_requests` are `failed` with the reason. A rejected `model` or `effort`
+config option is logged and the turn continues on the session default. A process that exits before the
+prompt completes is `failed` with `ACP exited before the prompt completed`, so an API or auth failure
+is visible rather than silent.
 
 Finished jobs keep their record and their log for **30 days** (`BETTER_SUBAGENTS_RETENTION_DAYS` overrides
 it), then both are swept. A running job is never swept, however old its record is.
@@ -211,7 +253,7 @@ interface, and the smoke test drives every one of them.
 
 | Seam | Interface | Why it is a module |
 | --- | --- | --- |
-| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
+| Runtime | `Runtime`: `spawn`, `kill`, `alive`, `now`, `sleep`, `pid`, `execPath`, `env`, `cwd`, `home`, `fs` | The OS is one adapter, the test is the other. No other code names `node:fs`, `node:child_process` or the clock. |
 | States | `isState`, `normalizeState`, `canTransition`, `isTerminal` | The six states and their edges in one table. An invalid edge is rejected; an unknown state is loud. |
 | Envelope | `signalOf(record, result)`, `patchOf(signal)` | One contract for "this job reached this state", in both directions. |
 | Spool | `next() -> Claim`, `settle(claim, 'accepted' \| 'held' \| 'quarantined')` | One claim policy for the drain, `onStop` and the pending count. A signal is never deleted because it belongs to someone else. |
@@ -229,7 +271,7 @@ state code and would make the `waiting-input` heuristic a unit test, but it need
 
 ```bash
 node test/smoke.mjs   # the unit/behaviour suite: prints PASS, never touches the network
-node test/e2e.mjs     # the real thing: a real printf job, a real cmd -p job, a real timeout, a resume
+node test/e2e.mjs     # the real thing: a real printf job, a real ACP job, a real timeout, a resume
 ```
 
 `test/e2e.mjs` needs `cmd` on PATH (or `COMMANDCODE_BIN`), a signed-in Command Code and network, so CI runs

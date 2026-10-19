@@ -58,7 +58,8 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import {homedir} from 'node:os';
-import {join} from 'node:path';
+import {dirname, join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 
 // Bounds. Every loop and buffer below is capped on purpose.
 const DRAIN_INTERVAL_MS = 400;
@@ -93,6 +94,28 @@ const WAIT_POLL_MS = 200;
 const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
 
+// Agent definitions. A definition is a Markdown file with YAML frontmatter; its
+// body is the worker's system prompt. Project discovery walks up from the working
+// directory, so the closest `.commandcode/agents/` wins, then user, then built-ins.
+const AGENT_NAME_MAX = 256;
+const AGENT_SCAN_MAX = 1000;
+const AGENT_SCAN_DEPTH_MAX = 8;
+const AGENT_LOG_FILE = 'agents.log';
+const WORKER_PROMPT_ENV = 'BETTER_SUBAGENTS_AGENT_PROMPT';
+// The host reserves these names for its own agents. We never register *our*
+// built-ins under them; `general` resolves to our `general-purpose` instead.
+const HOST_RESERVED_AGENT_NAMES: Record<string, true> = {
+	explore: true,
+	plan: true,
+	review: true,
+	general: true,
+};
+// The mod file the worker passes back to `cmd --mod <file> acp`. ACP is the
+// accepted transport (docs/adr/0001-worker-and-control.md). The host loads a mod
+// through jiti under a virtual filename (`<real>.load-<n>.<ext>`), so the shim is
+// stripped to recover a path that exists on disk.
+const MOD_PATH = fileURLToPath(import.meta.url).replace(/\.load-\d+(?=\.[^./]+$)/, '');
+
 const OWNER_TYPE = 'subagent/owner';
 // The 0.1.0 transcript entry. Read once so an installed session keeps its identity
 // across the rename; never written again.
@@ -107,7 +130,7 @@ const PUBSUB_DIR_DEFAULT = join(homedir(), '.commandcode', 'pubsub');
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
 // containing quotes, `$`, or a newline cannot break the wrapper.
-const WORKER_SOURCE = `
+export const WORKER_SOURCE = `
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -145,12 +168,17 @@ const readTail = () => {
   try { return fs.readFileSync(spec.logPath, 'utf8').slice(-spec.tailMax); } catch (e) { return ''; }
 };
 
+// The envelope is the parent's signalEnvelope, injected here as source. Both
+// sides therefore construct a signal from the same field list.
+const signalEnvelope = ${signalEnvelope.toString()};
+
+let settled = false;
+
 // One constructor for "this job reached this state": the record patch and the
-// signal are derived from the same facts, so they cannot disagree. The parent has
-// the same contract in signalOf/patchOf; this copy lives here because the worker
-// runs in its own process. Sharing it outright needs the worker extracted from
-// the string, which is follow-up work.
+// signal are derived from the same facts, so they cannot disagree.
 const settle = (state, detail, code, tail) => {
+  if (settled) return;
+  settled = true;
   const finishedAt = Date.now();
   const durationMs = Math.max(0, finishedAt - spec.startedAt);
   const failed = state === 'failed';
@@ -162,44 +190,33 @@ const settle = (state, detail, code, tail) => {
     failureReason: failed ? detail : undefined,
     awaitingInput: state === 'waiting-input' ? true : undefined
   });
-  emit({
-    id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner, state: state,
+  emit(signalEnvelope({
+    id: spec.id, label: spec.label, kind: spec.kind, owner: spec.owner,
+    startedAt: spec.startedAt, logPath: spec.logPath, sessionId: spec.sessionId
+  }, {
+    state: state,
     exitCode: typeof code === 'number' ? code : null,
-    startedAt: spec.startedAt, finishedAt: finishedAt, durationMs: durationMs,
-    logPath: spec.logPath, sessionId: spec.sessionId,
-    title: spec.label + ' ' + state,
+    finishedAt: finishedAt,
+    durationMs: durationMs,
     body: detail + (tail ? '\\n\\n' + tail : '')
-  });
+  }));
 };
 
 const fail = (reason, code) => settle('failed', reason, code, '');
-
-// The child's argv. An agent job resumes its own worker session when the parent
-// asked for a resume, and pins its session name so a later resume can find it.
-const childArgs = () => {
-  if (spec.prompt === undefined) return ['-c', spec.command];
-  const args = [];
-  if (typeof spec.resumeSession === 'string' && spec.resumeSession.length > 0) args.push('-r', spec.resumeSession);
-  args.push('-p', spec.prompt);
-  if (typeof spec.sessionName === 'string' && spec.sessionName.length > 0) args.push('-n', spec.sessionName);
-  if (typeof spec.model === 'string' && spec.model.length > 0) args.push('-m', spec.model);
-  if (typeof spec.maxTurns === 'number' && spec.maxTurns > 0) args.push('--max-turns', String(spec.maxTurns));
-  return args;
-};
 
 let out;
 try {
   out = fs.openSync(spec.logPath, 'w');
 } catch (e) {
-  fail('cannot open log: ' + String(e && e.message || e));
+  fail('cannot open log: ' + String(e && e.message || e), null);
   process.exit(0);
 }
+const logWrite = text => { try { fs.writeSync(out, text); } catch (e) {} };
 
-const child = spec.prompt !== undefined
-  ? spawn(spec.bin, childArgs(), {cwd: spec.cwd, stdio: ['ignore', out, out]})
-  : spawn('/bin/sh', ['-c', spec.command], {cwd: spec.cwd, stdio: ['ignore', out, out]});
+const child = spec.kind === 'agent'
+  ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['pipe', 'pipe', 'pipe']})
+  : spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', out, out]});
 
-let settled = false;
 let timedOut = false;
 let killTimer;
 let hardTimer;
@@ -217,36 +234,57 @@ if (typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0) {
 }
 
 const clearTimers = () => {
-  if (killTimer) clearTimeout(killTimer);
-  if (hardTimer) clearTimeout(hardTimer);
+  clearTimeout(killTimer);
+  clearTimeout(hardTimer);
+};
+
+// The ACP child is long-lived only for the turn. After the signal is written,
+// close its stdin, then make sure it cannot outlive the worker.
+const shutdown = () => {
+  try { child.stdin.end(); } catch (e) {}
+  try { child.kill('SIGTERM'); } catch (e) {}
+  setTimeout(() => {
+    try { child.kill('SIGKILL'); } catch (e) {}
+    process.exit(0);
+  }, 1000);
 };
 
 const finish = (code, spawnError, signal) => {
   if (settled) return;
-  settled = true;
   clearTimers();
-  try { fs.closeSync(out); } catch (e) {}
   const record = readRecord();
   // The cancel tool has already written the record and emitted its own signal.
-  if (record.state === 'canceled') return;
+  if (record.state === 'canceled') {
+    settled = true;
+    shutdown();
+    return;
+  }
 
   const tail = readTail();
-  const spy = spec.prompt !== undefined;
+  const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
+  if (spec.kind === 'agent') {
+    const detail = timedOut
+      ? 'timed out after ' + timeoutLabel
+      : spawnError !== undefined
+        ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
+        : 'ACP exited before the prompt completed (exit ' + String(code) + ')';
+    fail(detail, code);
+    shutdown();
+    return;
+  }
+
   const lastLine = tail.trimEnd().split('\\n').filter(line => line.trim()).pop() || '';
   const failed = timedOut || spawnError !== undefined || (code !== 0 && code !== null);
-  const wantsInput = !failed && spy && /\\?\\s*$/.test(lastLine);
-  const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
+  const wantsInput = !failed && /\\?\\s*$/.test(lastLine);
   const detail = timedOut
     ? 'timed out after ' + timeoutLabel
     : spawnError !== undefined
       ? 'spawn error: ' + String(spawnError && spawnError.message || spawnError)
-      : code === 8 && spy
-        ? 'exit 8 (max turns reached; result is partial)'
-        : typeof code === 'number' && code !== 0
-          ? 'exit ' + code
-          : signal
-            ? 'terminated by ' + signal
-            : 'exit 0';
+      : typeof code === 'number' && code !== 0
+        ? 'exit ' + code
+        : signal
+          ? 'terminated by ' + signal
+          : 'exit 0';
   settle(failed ? 'failed' : wantsInput ? 'waiting-input' : 'done', detail, code, tail);
 };
 
@@ -257,8 +295,196 @@ if (typeof child.pid === 'number') {
 child.on('exit', (code, signal) => finish(code, undefined, signal));
 child.on('error', err => finish(null, err));
 
+// The ACP client. One child, one session, one prompt. session/new creates the
+// session and returns its id, modes, and model/effort config options; the order
+// is initialize, session/new (or session/resume), set_mode, set_config_option,
+// session/prompt. Updates stream to the job log.
+if (spec.kind === 'agent' && child.stdout && child.stderr) {
+  let nextId = 1;
+  const pending = new Map();
+  const sendMessage = message => {
+    try { child.stdin.write(JSON.stringify(Object.assign({jsonrpc: '2.0'}, message)) + '\\n'); } catch (e) {}
+  };
+  const request = (method, params) => {
+    const {promise, resolve, reject} = Promise.withResolvers();
+    const id = nextId++;
+    pending.set(id, {resolve: resolve, reject: reject});
+    sendMessage({id: id, method: method, params: params});
+    return promise;
+  };
+  const reply = (id, result) => sendMessage({id: id, result: result});
+  const replyError = (id, code, message) => sendMessage({id: id, error: {code: code, message: message}});
+
+  const handleLine = line => {
+    let message;
+    try { message = JSON.parse(line); } catch (e) { return; }
+    if (message && typeof message.method === 'string') {
+      if (message.method === 'session/update') {
+        const update = message.params && message.params.update;
+        if (!update) return;
+        if (update.sessionUpdate === 'agent_message_chunk' && update.content && typeof update.content.text === 'string') {
+          logWrite(update.content.text);
+        } else if (update.sessionUpdate === 'tool_call') {
+          logWrite('\\n[tool] ' + String(update.title || update.kind || 'call') + '\\n');
+        } else if (update.sessionUpdate === 'tool_call_update' && update.status) {
+          logWrite('[tool ' + String(update.status) + '] ' + String(update.title || '') + '\\n');
+        }
+        return;
+      }
+      if (message.method === 'session/request_permission') {
+        const options = (message.params && message.params.options) || [];
+        const title = message.params && message.params.toolCall ? String(message.params.toolCall.title || '') : '';
+        const allow = options.find(option => option.kind === 'allow_once')
+          || options.find(option => option.kind === 'allow_always')
+          || options[0];
+        if (allow && typeof allow.optionId === 'string') {
+          logWrite('\\n[permission] ' + title + ' -> ' + String(allow.name || allow.optionId) + '\\n');
+          reply(message.id, {outcome: {outcome: 'selected', optionId: allow.optionId}});
+        } else {
+          logWrite('\\n[permission] ' + title + ' -> denied (no allowed option)\\n');
+          reply(message.id, {outcome: {outcome: 'cancelled'}});
+        }
+        return;
+      }
+      if (message.method === 'fs/read_text_file') {
+        try { reply(message.id, {content: fs.readFileSync(message.params.path, 'utf8')}); }
+        catch (e) { replyError(message.id, -32000, String(e && e.message || e)); }
+        return;
+      }
+      if (message.method === 'fs/write_text_file') {
+        try {
+          fs.mkdirSync(path.dirname(message.params.path), {recursive: true});
+          fs.writeFileSync(message.params.path, String(message.params.content || ''));
+          reply(message.id, null);
+        } catch (e) { replyError(message.id, -32000, String(e && e.message || e)); }
+        return;
+      }
+      if (message.id !== undefined) replyError(message.id, -32601, 'method not found: ' + message.method);
+      return;
+    }
+    if (message && message.id !== undefined && pending.has(message.id)) {
+      const entry = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) entry.reject(new Error(String(message.error.message || 'ACP error')));
+      else entry.resolve(message.result);
+    }
+  };
+
+  let lineBuffer = '';
+  child.stdout.on('data', chunk => {
+    lineBuffer += chunk.toString();
+    let index;
+    while ((index = lineBuffer.indexOf('\\n')) >= 0) {
+      const line = lineBuffer.slice(0, index).trim();
+      lineBuffer = lineBuffer.slice(index + 1);
+      if (line.length > 0) handleLine(line);
+    }
+  });
+  child.stderr.on('data', chunk => logWrite(chunk.toString().replace(/\\s+$/, '') + '\\n'));
+
+  // Spec permissionMode -> ACP mode id. auto and bypassPermissions are deliberately
+  // absent: auto has no ACP equivalent and bypass is only inherited (phase 8).
+  const modeIds = {
+    default: 'default',
+    acceptEdits: 'auto-accept',
+    dontAsk: 'dont-ask',
+    plan: 'plan',
+    manual: 'default'
+  };
+
+  const runPrompt = async () => {
+    await request('initialize', {
+      protocolVersion: 1,
+      clientCapabilities: {fs: {readTextFile: true, writeTextFile: true}, terminal: false}
+    });
+    // session/resume returns the mode/config state, not a sessionId: the resumed id
+    // is the one the worker sent. session/new is the only place an id is discovered.
+    let sessionId;
+    let configOptions = [];
+    if (typeof spec.resumeSession === 'string' && spec.resumeSession.length > 0) {
+      try {
+        const state = await request('session/resume', {sessionId: spec.resumeSession, cwd: spec.cwd, mcpServers: []});
+        sessionId = spec.resumeSession;
+        configOptions = state && Array.isArray(state.configOptions) ? state.configOptions : [];
+        logWrite('[acp] resumed ' + sessionId + '\\n');
+      } catch (error) {
+        logWrite('[acp] resume failed: ' + String(error && error.message || error) + '\\n');
+      }
+    }
+    if (sessionId === undefined) {
+      const session = await request('session/new', {cwd: spec.cwd, mcpServers: []});
+      if (!session || typeof session.sessionId !== 'string') throw new Error('session/new returned no sessionId');
+      sessionId = session.sessionId;
+      configOptions = Array.isArray(session.configOptions) ? session.configOptions : [];
+    }
+    writeRecord({acpSessionId: sessionId});
+    logWrite('[acp] session ' + sessionId + ' cwd ' + spec.cwd + '\\n');
+    if (typeof spec.permissionMode === 'string') {
+      if (modeIds[spec.permissionMode]) {
+        try {
+          await request('session/set_mode', {sessionId: sessionId, modeId: modeIds[spec.permissionMode]});
+        } catch (error) {
+          logWrite('[acp] mode not set: ' + String(error && error.message || error) + '\\n');
+        }
+      } else if (spec.permissionMode === 'auto' || spec.permissionMode === 'bypassPermissions') {
+        // auto is a classifier and bypass requires the main conversation to be in
+        // it. Neither is safe to infer here; phase 8 applies the inheritance rule.
+        logWrite('[acp] permissionMode ' + spec.permissionMode + ' is not applied in this phase\\n');
+      }
+    }
+    // Family aliases resolve to the newest model the session offers, matching the
+    // host's catalog order. A full id passes through unchanged.
+    const modelOptions = (configOptions.find(option => option && option.id === 'model')?.options) || [];
+    const modelAliases = {sonnet: /sonnet/i, opus: /opus/i, haiku: /haiku/i, fable: /fable/i};
+    let modelValue = spec.model;
+    if (typeof modelValue === 'string' && modelAliases[modelValue.toLowerCase()]) {
+      const match = modelOptions.find(option => option && modelAliases[modelValue.toLowerCase()].test(String(option.name || '')));
+      if (match && typeof match.value === 'string') {
+        logWrite('[acp] model alias ' + modelValue + ' -> ' + match.value + '\\n');
+        modelValue = match.value;
+      }
+    }
+    for (const option of ['model', 'effort']) {
+      const value = option === 'model' ? modelValue : spec[option];
+      if (typeof value !== 'string' || value.length === 0 || value === 'inherit') continue;
+      try {
+        await request('session/set_config_option', {sessionId: sessionId, configId: option, value: value});
+      } catch (error) {
+        logWrite('[acp] ' + option + ' not set: ' + String(error && error.message || error) + '\\n');
+      }
+    }
+    // The definition body belongs in the system prompt. That path depends on the mod
+    // being loaded by the ACP child (installed), which writes promptMarkerPath from
+    // its factory. When the marker is absent, the body is carried in the prompt so
+    // it can never silently disappear.
+    const body = typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+    let hookReady = false;
+    if (typeof spec.promptMarkerPath === 'string' && spec.promptMarkerPath.length > 0) {
+      try { hookReady = fs.existsSync(spec.promptMarkerPath); } catch (e) { hookReady = false; }
+    }
+    let promptText = spec.prompt;
+    if (body.length > 0 && !hookReady) {
+      promptText = 'AGENT DEFINITION (your system prompt):\\n' + body + '\\n\\nTASK:\\n' + String(spec.prompt);
+      logWrite('[acp] mod not loaded in the ACP child; the definition body is in the prompt\\n');
+    }
+    const result = await request('session/prompt', {sessionId: sessionId, prompt: [{type: 'text', text: promptText}]});
+    clearTimers();
+    const stopReason = result && result.stopReason;
+    if (stopReason === 'end_turn') settle('done', 'exit 0', 0, readTail());
+    else if (stopReason === 'cancelled') fail('cancelled', null);
+    else if (stopReason === 'max_tokens') fail('max tokens reached; result is partial', null);
+    else if (stopReason === 'max_turn_requests') fail('max turns reached; result is partial', null);
+    else fail('ACP turn ended: ' + String(stopReason || 'unknown'), null);
+    shutdown();
+  };
+  runPrompt().catch(error => {
+    fail('ACP session failed: ' + String(error && error.message || error), null);
+    shutdown();
+  });
+}
+
 process.on('uncaughtException', err => {
-  try { fail('worker crash: ' + String(err && err.message || err)); } catch (e) {}
+  try { fail('worker crash: ' + String(err && err.message || err), null); } catch (e) {}
   process.exit(0);
 });
 `;
@@ -296,6 +522,7 @@ export interface SpoolFs {
 	rename(from: string, to: string): void;
 	remove(file: string): void;
 	stat(file: string): {size: number; mtimeMs: number};
+	exists(file: string): boolean;
 }
 
 export interface Runtime {
@@ -307,6 +534,10 @@ export interface Runtime {
 	readonly pid: number;
 	readonly execPath: string;
 	readonly env: Record<string, string | undefined>;
+	/** The workspace root: project discovery starts here. */
+	readonly cwd: string;
+	/** The user home: `~/.commandcode/agents` lives under it. */
+	readonly home: string;
 	readonly fs: SpoolFs;
 }
 
@@ -328,6 +559,13 @@ function osSpoolFs(): SpoolFs {
 		stat: file => {
 			const stats = statSync(file);
 			return {size: stats.size, mtimeMs: stats.mtimeMs};
+		},
+		exists: file => {
+			try {
+				return statSync(file).isDirectory();
+			} catch {
+				return false;
+			}
 		},
 	};
 }
@@ -354,6 +592,8 @@ const OS_RUNTIME: Runtime = {
 	pid: process.pid,
 	execPath: process.execPath,
 	env: process.env,
+	cwd: process.cwd(),
+	home: homedir(),
 	fs: osSpoolFs(),
 };
 
@@ -364,6 +604,540 @@ function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
 		...overrides,
 		fs: {...OS_RUNTIME.fs, ...overrides.fs},
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Agent definitions
+//
+// A definition is Markdown with YAML frontmatter. The body is the system prompt,
+// not the host's. Only `name` and `description` are required; every other T1 field
+// is parsed and carried on the definition even when a later phase applies it.
+//
+// Discovery order is precedence order: project directories from the working
+// directory upward (closest first), then the user directory, then built-ins. The
+// first definition of a name wins. Invalid files never fail the session: they are
+// recorded with a reason, written to agents.log, and reported by `/agents`.
+// ---------------------------------------------------------------------------
+
+export type AgentScope = 'project' | 'user' | 'builtin';
+
+export interface AgentDefinition {
+	name: string;
+	description: string;
+	systemPrompt: string;
+	source: AgentScope;
+	path?: string;
+	tools?: string[];
+	disallowedTools?: string[];
+	model?: string;
+	permissionMode?: string;
+	maxTurns?: number;
+	skills?: string[];
+	isolation?: string;
+	background?: boolean;
+	color?: string;
+	omitClaudeMd?: boolean;
+	effort?: string;
+	readOnly?: boolean;
+	oneShot?: boolean;
+}
+
+export interface AgentEntry {
+	name: string;
+	source: AgentScope;
+	path: string;
+	valid: boolean;
+	reason?: string;
+	definition?: AgentDefinition;
+}
+
+export interface AgentRegistry {
+	entries(): AgentEntry[];
+	list(): AgentDefinition[];
+	get(name: string): AgentDefinition | undefined;
+	refresh(): void;
+}
+
+export interface AgentRegistryDeps {
+	readonly fs: SpoolFs;
+	readonly cwd: string;
+	readonly home: string;
+	readonly builtins: AgentDefinition[];
+	readonly log: (message: string) => void;
+}
+
+export type FrontmatterResult =
+	| {ok: true; fields: Record<string, unknown>; body: string}
+	| {ok: false; reason: string};
+
+// A conservative YAML subset: top-level `key: value`, inline and block lists,
+// quoted and block scalars, nested maps (ignored, because unknown fields must not
+// error). Anything outside it is reported as bad YAML, which is the documented
+// skip rule. No dependency, no eval, no way to run a value.
+function parseYamlScalar(raw: string): {ok: true; value: unknown} | {ok: false; reason: string} {
+	const text = raw.trim();
+	if (text.length === 0) return {ok: true, value: undefined};
+	if (text.startsWith('[')) {
+		if (!text.endsWith(']')) return {ok: false, reason: 'unclosed flow sequence'};
+		const inner = text.slice(1, -1).trim();
+		if (inner.length === 0) return {ok: true, value: []};
+		const items: string[] = [];
+		let current = '';
+		let quote = '';
+		for (const char of inner) {
+			if (quote.length > 0) {
+				current += char;
+				if (char === quote) quote = '';
+				continue;
+			}
+			if (char === '"' || char === "'") {
+				quote = char;
+				current += char;
+				continue;
+			}
+			if (char === ',') {
+				items.push(current.trim());
+				current = '';
+				continue;
+			}
+			current += char;
+		}
+		if (quote.length > 0) return {ok: false, reason: 'unterminated quoted scalar'};
+		items.push(current.trim());
+		const values: unknown[] = [];
+		for (const item of items) {
+			if (item.length === 0) return {ok: false, reason: 'empty flow sequence item'};
+			const parsed = parseYamlScalar(item);
+			if (!parsed.ok) return parsed;
+			values.push(parsed.value);
+		}
+		return {ok: true, value: values};
+	}
+	if (text.startsWith('{')) {
+		if (!text.endsWith('}')) return {ok: false, reason: 'unclosed flow mapping'};
+		return {ok: true, value: null};
+	}
+	if (text.startsWith('"')) {
+		if (text.length < 2 || !text.endsWith('"')) return {ok: false, reason: 'unterminated double-quoted scalar'};
+		try {
+			return {ok: true, value: JSON.parse(text)};
+		} catch {
+			return {ok: false, reason: 'bad escape in double-quoted scalar'};
+		}
+	}
+	if (text.startsWith("'")) {
+		if (text.length < 2 || !text.endsWith("'")) return {ok: false, reason: 'unterminated single-quoted scalar'};
+		return {ok: true, value: text.slice(1, -1).replaceAll("''", "'")};
+	}
+	const comment = text.search(/\s#/);
+	const bare = (comment >= 0 ? text.slice(0, comment) : text).trim();
+	if (bare === 'true') return {ok: true, value: true};
+	if (bare === 'false') return {ok: true, value: false};
+	if (bare === 'null' || bare === '~') return {ok: true, value: undefined};
+	return {ok: true, value: bare};
+}
+
+export function parseFrontmatter(source: string): FrontmatterResult {
+	const text = source.startsWith('\uFEFF') ? source.slice(1) : source;
+	const lines = text.split('\n');
+	if (lines[0]?.trim() !== '---') return {ok: false, reason: 'frontmatter must start with --- on the first line'};
+	let close = -1;
+	for (let index = 1; index < lines.length; index += 1) {
+		if (lines[index].trim() === '---') {
+			close = index;
+			break;
+		}
+	}
+	if (close < 0) return {ok: false, reason: 'frontmatter is not closed'};
+
+	// Group top-level keys with their indented lines before parsing any value, so a
+	// block scalar and a block list are one case rather than interleaved state.
+	const blocks: {key: string; inline: string; lines: string[]}[] = [];
+	for (let index = 1; index < close; index += 1) {
+		const line = lines[index];
+		const trimmed = line.trim();
+		if (trimmed.length === 0 || trimmed.startsWith('#')) {
+			if (blocks.length > 0) blocks[blocks.length - 1].lines.push('');
+			continue;
+		}
+		if (line.startsWith('\t')) return {ok: false, reason: 'tab indentation is not valid YAML'};
+		const indent = line.length - line.trimStart().length;
+		if (indent > 0) {
+			if (blocks.length === 0) return {ok: false, reason: 'unexpected indentation'};
+			blocks[blocks.length - 1].lines.push(line.slice(Math.min(indent, 2)));
+			continue;
+		}
+		const match = /^([A-Za-z0-9_.-]+):(.*)$/.exec(line);
+		if (match === null) return {ok: false, reason: `expected key: value, got "${line.slice(0, 40)}"`};
+		blocks.push({key: match[1], inline: match[2].trim(), lines: []});
+	}
+
+	const fields: Record<string, unknown> = {};
+	for (const block of blocks) {
+		if (Object.hasOwn(fields, block.key)) return {ok: false, reason: `duplicate key "${block.key}"`};
+		const blockScalar = block.inline === '|' || block.inline === '|-' || block.inline === '>' || block.inline === '>-';
+		if (blockScalar) {
+			const body = block.lines.map(line => line.replace(/\s+$/, ''));
+			fields[block.key] = (block.inline.startsWith('>') ? body.join(' ') : body.join('\n')).replace(/^\n+|\n+$/g, '');
+			continue;
+		}
+		if (block.inline.length === 0 && block.lines.length > 0) {
+			const first = block.lines.find(line => line.trim().length > 0);
+			if (first !== undefined && first.trim().startsWith('- ')) {
+				const values: unknown[] = [];
+				for (const line of block.lines) {
+					const item = line.trim();
+					if (item.length === 0) continue;
+					if (!item.startsWith('- ')) return {ok: false, reason: `expected a list item, got "${item.slice(0, 40)}"`};
+					const parsed = parseYamlScalar(item.slice(2));
+					if (!parsed.ok) return parsed;
+					values.push(parsed.value);
+				}
+				fields[block.key] = values;
+				continue;
+			}
+			// A nested map. Unknown fields are ignored by contract, so its contents do
+			// not need to be understood; storing null keeps the key known.
+			fields[block.key] = null;
+			continue;
+		}
+		if (block.lines.some(line => line.trim().length > 0)) {
+			return {ok: false, reason: `unexpected indentation under "${block.key}"`};
+		}
+		if (block.inline.length === 0) {
+			fields[block.key] = undefined;
+			continue;
+		}
+		const parsed = parseYamlScalar(block.inline);
+		if (!parsed.ok) return parsed;
+		fields[block.key] = parsed.value;
+	}
+
+	return {ok: true, fields, body: lines.slice(close + 1).join('\n').replace(/^\r?\n/, '').trimEnd()};
+}
+
+function listField(value: unknown): string[] | undefined {
+	if (value === undefined || value === null) return undefined;
+	if (Array.isArray(value)) {
+		const items = value.filter((item): item is string => typeof item === 'string').map(item => item.trim()).filter(Boolean);
+		return items.length > 0 ? items : undefined;
+	}
+	if (typeof value !== 'string') return undefined;
+	const text = value.trim();
+	if (text.length === 0) return undefined;
+	if (text === '*') return ['*'];
+	return text.split(',').map(item => item.trim()).filter(Boolean);
+}
+
+function stringField(value: unknown): string | undefined {
+	return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function booleanField(value: unknown): boolean | undefined {
+	if (typeof value === 'boolean') return value;
+	if (value === 'true') return true;
+	if (value === 'false') return false;
+	return undefined;
+}
+
+function numberField(value: unknown): number | undefined {
+	const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : Number.NaN;
+	return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : undefined;
+}
+
+export function agentDefinitionFromSource(
+	source: string,
+	path: string,
+	scope: AgentScope,
+): {ok: true; definition: AgentDefinition} | {ok: false; reason: string} {
+	const frontmatter = parseFrontmatter(source);
+	if (!frontmatter.ok) return frontmatter;
+	const fields = frontmatter.fields;
+
+	const name = stringField(fields.name) ?? '';
+	if (name.length === 0) return {ok: false, reason: 'name: required'};
+	// Characters, not UTF-16 code units: the limit is on the name a human sees.
+	if ([...name].length > AGENT_NAME_MAX) {
+		return {ok: false, reason: `name: must be at most ${AGENT_NAME_MAX} characters`};
+	}
+	if (name.includes(':')) return {ok: false, reason: 'name: must not contain ":" (plugin-scoped identifiers reserve it)'};
+	if (name.startsWith('-')) return {ok: false, reason: 'name: must not start with "-"'};
+	const description = stringField(fields.description);
+	if (description === undefined) return {ok: false, reason: 'description: required'};
+
+	const definition: AgentDefinition = {
+		name,
+		description,
+		systemPrompt: frontmatter.body,
+		source: scope,
+		path,
+	};
+	const tools = listField(fields.tools);
+	const disallowed = listField(fields.disallowedTools);
+	const skills = listField(fields.skills);
+	if (tools !== undefined) definition.tools = tools;
+	if (disallowed !== undefined) definition.disallowedTools = disallowed;
+	const model = stringField(fields.model);
+	const permissionMode = stringField(fields.permissionMode);
+	const maxTurns = numberField(fields.maxTurns);
+	const isolation = stringField(fields.isolation);
+	const color = stringField(fields.color);
+	const effort = stringField(fields.effort);
+	if (model !== undefined) definition.model = model;
+	if (permissionMode !== undefined) definition.permissionMode = permissionMode;
+	if (maxTurns !== undefined) definition.maxTurns = maxTurns;
+	if (skills !== undefined) definition.skills = skills;
+	if (isolation !== undefined) definition.isolation = isolation;
+	if (color !== undefined) definition.color = color;
+	if (effort !== undefined) definition.effort = effort;
+	const background = booleanField(fields.background);
+	const omitClaudeMd = booleanField(fields.omitClaudeMd);
+	if (background !== undefined) definition.background = background;
+	if (omitClaudeMd !== undefined) definition.omitClaudeMd = omitClaudeMd;
+	return {ok: true, definition};
+}
+
+// The T1 built-ins. `general-purpose` is the fallback and `claude` the catch-all.
+// `explore` and `plan` mirror the host's reserved agents (read-only, one-shot) but
+// live in this registry: the mod resolves them, so the host's copies are never
+// shadowed through addAgent.
+export const BUILTIN_AGENT_DEFINITIONS: AgentDefinition[] = [
+	{
+		name: 'explore',
+		description: 'Read-only codebase exploration: find files, symbols, and call paths.',
+		systemPrompt:
+			'You are a read-only codebase explorer. Find the files, symbols, and call paths that answer the question. Do not edit anything. Report concrete paths with line numbers and a short summary of the call flow. Be quick by default; go deeper only when the task needs it.',
+		source: 'builtin',
+		path: '',
+		tools: ['Read', 'Grep', 'Glob'],
+		model: 'inherit',
+		permissionMode: 'plan',
+		readOnly: true,
+		oneShot: true,
+	},
+	{
+		name: 'plan',
+		description: 'Read-only design: turn findings into an implementation plan.',
+		systemPrompt:
+			'You are a planning agent. Explore the codebase read-only, identify the constraints, then return a concrete implementation plan: the files to change, the ordered steps, the risks, and the tests. Do not implement.',
+		source: 'builtin',
+		path: '',
+		tools: ['Read', 'Grep', 'Glob'],
+		model: 'inherit',
+		permissionMode: 'plan',
+		readOnly: true,
+		oneShot: true,
+	},
+	{
+		name: 'general-purpose',
+		description: 'General-purpose agent for multi-step tasks. The fallback when no subagent_type is given.',
+		systemPrompt:
+			'You are a general-purpose autonomous agent. You receive one self-contained task, complete it fully, and report back once at the end. Work autonomously: you cannot ask follow-up questions, so make reasonable assumptions and state them in the final report. Use the minimum set of tool calls that gets the job done correctly.',
+		source: 'builtin',
+		path: '',
+	},
+	{
+		name: 'claude',
+		description: 'Catch-all coding agent for a task that fits no specialized definition.',
+		systemPrompt:
+			'You are a general-purpose coding agent. Complete the assigned task end to end, then report what changed and how it was verified.',
+		source: 'builtin',
+		path: '',
+	},
+];
+
+export function builtinAgentDefinitions(env: Record<string, string | undefined>): AgentDefinition[] {
+	if (env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS === '1' || env.BETTER_SUBAGENTS_DISABLE_BUILTIN_AGENTS === '1') return [];
+	if (env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS === '1') {
+		return BUILTIN_AGENT_DEFINITIONS.filter(definition => definition.name !== 'explore' && definition.name !== 'plan');
+	}
+	return [...BUILTIN_AGENT_DEFINITIONS];
+}
+
+export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
+	let entries: AgentEntry[] = [];
+	// Each (file, reason) is logged once per process, so a refresh from `/agents`
+	// cannot flood the debug log with the same skip.
+	const loggedSkips = new Set<string>();
+
+	function reportInvalid(entry: AgentEntry): void {
+		const key = `${entry.path}\u0000${entry.reason ?? ''}`;
+		if (loggedSkips.has(key)) return;
+		loggedSkips.add(key);
+		deps.log(`${entry.path}: ${entry.reason ?? 'invalid'}`);
+	}
+
+	function scanFile(path: string, scope: AgentScope): AgentDefinition | undefined {
+		let source = '';
+		try {
+			source = deps.fs.readFile(path);
+		} catch (error) {
+			const entry: AgentEntry = {
+				name: '',
+				source: scope,
+				path,
+				valid: false,
+				reason: `unreadable: ${String((error as Error)?.message ?? error)}`,
+			};
+			entries.push(entry);
+			reportInvalid(entry);
+			return undefined;
+		}
+		const parsed = agentDefinitionFromSource(source, path, scope);
+		if (!parsed.ok) {
+			const entry: AgentEntry = {name: '', source: scope, path, valid: false, reason: parsed.reason};
+			entries.push(entry);
+			reportInvalid(entry);
+			return undefined;
+		}
+		return parsed.definition;
+	}
+
+	// Recursive scan. Subdirectories never change a project or user identity: the
+	// name comes from the frontmatter only. Bounded by depth and entry count. A
+	// duplicate is an error only within one agents root; a farther root or a built-in
+	// with the same name is ordinary precedence and is skipped silently.
+	function scanDir(
+		dir: string,
+		scope: AgentScope,
+		depth: number,
+		found: AgentDefinition[],
+		localNames: Set<string>,
+	): void {
+		if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
+		let names: string[] = [];
+		try {
+			names = deps.fs.readdir(dir).sort();
+		} catch {
+			return;
+		}
+		for (const name of names) {
+			if (entries.length >= AGENT_SCAN_MAX) return;
+			const full = join(dir, name);
+			if (name.toLowerCase().endsWith('.md')) {
+				const definition = scanFile(full, scope);
+				if (definition === undefined) continue;
+				if (localNames.has(definition.name)) {
+					const entry: AgentEntry = {
+						name: definition.name,
+						source: scope,
+						path: full,
+						valid: false,
+						reason: `duplicate name "${definition.name}" (the first definition in this directory wins)`,
+					};
+					entries.push(entry);
+					reportInvalid(entry);
+					continue;
+				}
+				localNames.add(definition.name);
+				found.push(definition);
+				continue;
+			}
+			if (deps.fs.exists(full)) scanDir(full, scope, depth + 1, found, localNames);
+		}
+	}
+
+	// The project dirs from the working directory upward, closest first. Walk-up
+	// stops at the repository root (the directory holding .git) or the filesystem
+	// root, so a nested `.commandcode/agents` closest to the cwd wins.
+	function projectDirs(): string[] {
+		const dirs: string[] = [];
+		let current = deps.cwd;
+		for (let depth = 0; depth <= 64; depth += 1) {
+			const candidate = join(current, '.commandcode', 'agents');
+			if (deps.fs.exists(candidate)) dirs.push(candidate);
+			if (deps.fs.exists(join(current, '.git'))) break;
+			const parent = dirname(current);
+			if (parent === current) break;
+			current = parent;
+		}
+		return dirs;
+	}
+
+	function refresh(): void {
+		entries = [];
+		const found: AgentDefinition[] = [];
+		for (const dir of projectDirs()) scanDir(dir, 'project', 0, found, new Set());
+		scanDir(join(deps.home, '.commandcode', 'agents'), 'user', 0, found, new Set());
+		found.push(...deps.builtins);
+
+		// Precedence, not an error: the first loaded definition of a name wins. A
+		// duplicate inside one agents root was already reported by scanDir.
+		const seen = new Set<string>();
+		for (const definition of found) {
+			if (seen.has(definition.name)) continue;
+			seen.add(definition.name);
+			entries.push({
+				name: definition.name,
+				source: definition.source,
+				path: definition.path ?? '',
+				valid: true,
+				definition,
+			});
+		}
+	}
+
+	refresh();
+	return {
+		entries: () => [...entries],
+		list: () => entries.flatMap(entry => (entry.valid && entry.definition !== undefined ? [entry.definition] : [])),
+		get: name => entries.find(entry => entry.valid && entry.definition?.name === name)?.definition,
+		refresh,
+	};
+}
+
+// ---------------------------------------------------------------------------
+// Worker spec
+//
+// The worker is one detached Node process. `buildSpec` is the only place a spec
+// is shaped and `buildArgs` the only place an argv is built, so replacing the
+// transport (the old `cmd -p` argv, now ACP) touches one function. The spec is
+// passed in the environment: no shell interpolation.
+// ---------------------------------------------------------------------------
+
+export interface WorkerSpecInput {
+	id: string;
+	label: string;
+	kind: 'command' | 'agent';
+	owner?: string;
+	cwd: string;
+	logPath: string;
+	inboxDir: string;
+	jobsDir: string;
+	startedAt: number;
+	tailMax: number;
+	bin: string;
+	sessionId?: string;
+	agentType?: string;
+	systemPrompt?: string;
+	model?: string;
+	effort?: string;
+	permissionMode?: string;
+	maxTurns?: number;
+	timeoutMs?: number;
+	resumeSession?: string;
+	prompt?: string;
+	command?: string;
+	/** Written by the mod when the ACP child loaded it; proves the prompt hook is live. */
+	promptMarkerPath?: string;
+}
+
+export interface WorkerSpec extends WorkerSpecInput {
+	args: string[];
+}
+
+// ACP is the accepted worker transport: `cmd --mod <file> acp` loads this mod in
+// the worker so appendSystemPrompt can return the definition body, and the adapter
+// speaks JSON-RPC over stdout/stdin. Shell jobs keep the /bin/sh argv.
+export function buildArgs(spec: WorkerSpec, modPath: string): string[] {
+	if (spec.kind === 'command') return ['-c', String(spec.command ?? '')];
+	return ['--mod', modPath, 'acp'];
+}
+
+export function buildSpec(input: WorkerSpecInput, modPath: string): WorkerSpec {
+	const spec: WorkerSpec = {...input, args: []};
+	spec.args = buildArgs(spec, modPath);
+	return spec;
 }
 
 // The identity a job record and its signal share. Declared once, so the two
@@ -398,6 +1172,11 @@ interface JobRecord extends JobIdentity {
 	timeoutMs?: number;
 	sessionName?: string;
 	resumedFrom?: string;
+	/** The ACP session the worker created; a resume targets this id. */
+	acpSessionId?: string;
+	effort?: string;
+	permissionMode?: string;
+	isolation?: string;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;
@@ -540,8 +1319,18 @@ function signalOf(
 	record: JobRecord,
 	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
 ): Signal {
+	return signalEnvelope(record, {...result, state: canonicalState(result.state)});
+}
+
+// The envelope itself, shared with the detached worker: WORKER_SOURCE embeds this
+// function's source at module load, so the parent and the worker cannot construct
+// a signal with different fields. Keep the body plain JS and self-contained.
+export function signalEnvelope(
+	record: JobIdentity,
+	result: {state: string; finishedAt?: number; durationMs?: number; exitCode?: number | null; title?: string; body?: string},
+): Signal {
 	const label = String(record.label ?? record.id);
-	const state = canonicalState(result.state);
+	const state = String(result.state);
 	return {
 		id: record.id,
 		owner: record.owner,
@@ -733,6 +1522,67 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// A headless worker loads this mod too. It has its own owner token and must never
 	// steal an unaddressed signal from the session that fired it.
 	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
+
+	// Definitions are discovered once at bind, refreshed at each run start and by
+	// `/agents`, so a new file is picked up without a restart. Invalid files are
+	// skipped with an agents.log entry and remain visible (with the reason) in
+	// `/agents`.
+	const registry = createAgentRegistry({
+		fs: spool,
+		cwd: runtime.cwd,
+		home: runtime.home,
+		builtins: builtinAgentDefinitions(runtime.env),
+		log: message => {
+			try {
+				spool.appendFile(join(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}\n`);
+			} catch {
+				/* the session still runs; the skip is visible in /agents too */
+			}
+		},
+	});
+
+	// The worker process reads the spec from its environment. Only the worker uses
+	// this: the parent already has the definition.
+	let workerSpec: WorkerSpec | undefined;
+	if (workerMode) {
+		try {
+			workerSpec = JSON.parse(String(runtime.env[WORKER_SPEC_ENV] ?? '')) as WorkerSpec;
+		} catch {
+			workerSpec = undefined;
+		}
+	}
+
+	// `cmd acp` in this host version loads installed mods but ignores `--mod`. The
+	// marker tells the worker whether appendSystemPrompt is actually live in the ACP
+	// child; without it the worker carries the body in the prompt instead.
+	if (workerMode && workerSpec?.systemPrompt !== undefined && workerSpec.promptMarkerPath !== undefined) {
+		try {
+			spool.writeFile(workerSpec.promptMarkerPath, '1');
+		} catch {
+			/* the worker falls back to the prompt body */
+		}
+	}
+
+	function resolveAgentDefinition(name?: string): {ok: true; definition: AgentDefinition} | {ok: false; error: string} {
+		if (name === undefined) {
+			const fallback = registry.get('general-purpose') ?? registry.get('general');
+			if (fallback !== undefined) return {ok: true, definition: fallback};
+			return {ok: false, error: 'subagent_type is required'};
+		}
+		const exact = registry.get(name);
+		if (exact !== undefined) return {ok: true, definition: exact};
+		// `general` is the host's reserved name for the same agent. Resolve it here
+		// rather than registering a second agent under a name the host owns.
+		if (name === 'general') {
+			const general = registry.get('general-purpose');
+			if (general !== undefined) return {ok: true, definition: general};
+		}
+		const available = registry.list().map(definition => definition.name).sort().join(', ');
+		return {
+			ok: false,
+			error: `unknown subagent_type "${name}"${available.length > 0 ? `; available: ${available}` : ''}`,
+		};
+	}
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
 		(pick('subagent_deliver', 'steer', 'pubsub_deliver', 'steer') === 'follow-up' ? 'follow-up' : 'steer');
@@ -1279,7 +2129,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			const model = typeof job.model === 'string' && job.model.length > 0 ? ` · ${job.model}` : '';
 			const owner = typeof job.owner === 'string' && job.owner.length > 0 ? ` · ${job.owner.slice(-6)}` : '';
 			const unread = isTerminalState(state) && job.deliveredAt === undefined ? ' · unread' : '';
-			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${model}${owner}${unread}`;
+			// The type is the resolved definition name (canonical `subagent_type`); the
+			// agent name is the spawn label. Shell jobs have neither.
+			const agentType =
+				typeof job.agentType === 'string' && job.agentType.length > 0
+					? ` · subagent_type=${job.agentType}`
+					: job.kind === 'agent'
+						? ' · subagent_type=general-purpose'
+						: '';
+			return `  ${stateMarker(state)} ${job.id}  ${String(job.label ?? '(unlabelled)')}  [${state}${exit}${duration}]${agentType}${model}${owner}${unread}`;
 		});
 		const orphanNote = orphaned > 0 ? ` ${orphaned} orphaned signal(s) quarantined.` : '';
 		const filterNote = wanted === undefined ? '' : ` matching ${wanted}`;
@@ -1354,13 +2212,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly command?: string;
 		readonly prompt?: string;
 		readonly cwd: string;
-		/** agent jobs only; recorded now, used when the registry lands (phase 6) */
+		/** the resolved definition name: the canonical `subagent_type` */
 		readonly agentType?: string;
+		/** the definition body, delivered as the worker's system prompt */
+		readonly systemPrompt?: string;
 		readonly model?: string;
 		readonly maxTurns?: number;
+		readonly effort?: string;
+		readonly permissionMode?: string;
+		readonly isolation?: string;
 		/** SIGTERM then SIGKILL after this long; 0 or absent means no timeout */
 		readonly timeoutMs?: number;
-		/** resume this worker session first (`cmd -r <name> -p <prompt>`) */
+		/** resume this ACP session id first */
 		readonly resumeSession?: string;
 		readonly resumedFrom?: string;
 	}
@@ -1382,20 +2245,22 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		refreshJobs();
 	}
 
-	// The worker session name, deterministic from the job id: a resume can find the
-	// worker's own conversation by name without the parent having to parse it out of
-	// the worker's output.
+	// The worker session name, deterministic from the job id. It stays on the record
+	// for display and for records written before ACP; a resume targets acpSessionId.
 	function sessionNameOf(id: string): string {
 		return `subagent-${id}`;
 	}
 
-	function fire(intent: JobIntent): Launch {
-		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-		const logPath = join(logsDir, `${id}.log`);
-		const startedAt = runtime.now();
-		const owner = ownerId();
+	// What the job is: one record, before anything is spawned.
+	function makeRecord(
+		intent: JobIntent,
+		id: string,
+		logPath: string,
+		startedAt: number,
+		owner: string | undefined,
+	): JobRecord {
 		const isAgent = intent.prompt !== undefined;
-		const record: JobRecord = {
+		return {
 			id,
 			owner,
 			label: intent.label,
@@ -1415,44 +2280,21 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: {}),
 			...(intent.model !== undefined ? {model: intent.model} : {}),
 			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
+			...(intent.effort !== undefined ? {effort: intent.effort} : {}),
+			...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
+			...(intent.isolation !== undefined ? {isolation: intent.isolation} : {}),
 			...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
 			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 		};
-		writeJob(record);
-		try {
-			cmd.session?.appendCustomEntry({
-				customType: JOB_ENTRY_TYPE,
-				data: {id, label: intent.label, kind: intent.kind, state: 'queued', owner, sessionId},
-			});
-		} catch {
-			/* audit trail is optional */
-		}
+	}
 
-		const spec = {
-			id,
-			label: intent.label,
-			kind: intent.kind,
-			owner,
-			cwd: intent.cwd,
-			logPath,
-			inboxDir,
-			jobsDir,
-			startedAt,
-			tailMax: LOG_TAIL_BYTES_MAX,
-			bin: runtime.env.COMMANDCODE_BIN ?? 'cmd',
-			sessionId,
-			sessionName: isAgent ? sessionNameOf(id) : undefined,
-			model: intent.model,
-			maxTurns: intent.maxTurns,
-			timeoutMs: intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? intent.timeoutMs : undefined,
-			resumeSession: intent.resumeSession,
-			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
-		};
-
+	// How it runs: one detached worker, whose spec is built only by buildSpec.
+	function startWorker(record: JobRecord, spec: WorkerSpec): Launch {
+		const id = record.id;
 		let worker: ChildHandle;
 		try {
 			worker = runtime.spawn(runtime.execPath, ['-e', WORKER_SOURCE], {
-				cwd: intent.cwd,
+				cwd: spec.cwd,
 				detached: true,
 				stdio: 'ignore',
 				env: {...runtime.env, [WORKER_SPEC_ENV]: JSON.stringify(spec), [WORKER_ENV]: '1'},
@@ -1484,6 +2326,53 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		writeJob(latest);
 		refreshJobs();
 		return {ok: true, id, pid: worker.pid};
+	}
+
+	function fire(intent: JobIntent): Launch {
+		const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+		const logPath = join(logsDir, `${id}.log`);
+		const startedAt = runtime.now();
+		const owner = ownerId();
+		const record = makeRecord(intent, id, logPath, startedAt, owner);
+		writeJob(record);
+		try {
+			cmd.session?.appendCustomEntry({
+				customType: JOB_ENTRY_TYPE,
+				data: {id, label: intent.label, kind: intent.kind, state: 'queued', owner, sessionId},
+			});
+		} catch {
+			/* audit trail is optional */
+		}
+
+		const isAgent = intent.prompt !== undefined;
+		const spec = buildSpec(
+			{
+				id,
+				label: intent.label,
+				kind: intent.kind,
+				owner,
+				cwd: intent.cwd,
+				logPath,
+				inboxDir,
+				jobsDir,
+				startedAt,
+				tailMax: LOG_TAIL_BYTES_MAX,
+				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
+				sessionId,
+				...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
+				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
+				...(intent.model !== undefined ? {model: intent.model} : {}),
+				...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
+				...(intent.effort !== undefined ? {effort: intent.effort} : {}),
+				...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
+				...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
+				...(intent.resumeSession !== undefined ? {resumeSession: intent.resumeSession} : {}),
+				...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+				...(isAgent ? {promptMarkerPath: join(logsDir, `${id}.mod`)} : {}),
+			},
+			MOD_PATH,
+		);
+		return startWorker(record, spec);
 	}
 
 	// ------------------------------------------------------------------ dashboard
@@ -1603,23 +2492,52 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			if (input[unsupported] !== undefined) return badInput(`${unsupported} is not implemented in this release; omit it`);
 		}
 		const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
-		const maxTurns = Number(input.max_turns);
+		const requestedMaxTurns = Number(input.max_turns);
 		const timeoutMs = Number(input.timeout_ms);
-		const agentType =
+		// `subagent_type` is canonical; `agent_type` is the 1.x alias and must behave
+		// identically. Passing both with different values is ambiguous, not a merge.
+		const subagentType =
+			typeof input.subagent_type === 'string' && input.subagent_type.trim().length > 0
+				? input.subagent_type.trim()
+				: undefined;
+		const aliasType =
 			typeof input.agent_type === 'string' && input.agent_type.trim().length > 0 ? input.agent_type.trim() : undefined;
+		if (subagentType !== undefined && aliasType !== undefined && subagentType !== aliasType) {
+			return badInput('pass subagent_type or its deprecated alias agent_type, not both');
+		}
+
+		let definition: AgentDefinition | undefined;
+		if (prompt !== undefined) {
+			// Omitted type resolves to general-purpose, or fails with the documented
+			// error when no general-purpose agent exists.
+			const resolved = resolveAgentDefinition(subagentType ?? aliasType);
+			if (!resolved.ok) return badInput(resolved.error);
+			definition = resolved.definition;
+		}
+		const definitionModel = definition?.model === 'inherit' ? undefined : definition?.model;
+		const maxTurns =
+			prompt === undefined
+				? undefined
+				: Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0
+					? Math.round(requestedMaxTurns)
+					: definition?.maxTurns;
 		const launched = fire({
 			label,
 			kind: prompt !== undefined ? 'agent' : 'command',
 			command,
 			prompt,
 			cwd: typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : cmd.cwd,
-			agentType,
-			model: prompt === undefined ? undefined : model,
-			maxTurns: prompt === undefined || !Number.isFinite(maxTurns) || maxTurns <= 0 ? undefined : Math.round(maxTurns),
+			agentType: definition?.name,
+			systemPrompt: definition?.systemPrompt,
+			model: prompt === undefined ? undefined : model ?? definitionModel,
+			maxTurns,
+			effort: definition?.effort,
+			permissionMode: definition?.permissionMode,
+			isolation: definition?.isolation,
 			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
 		});
 		if (!launched.ok) return badInput(launched.error);
-		const kind = prompt !== undefined ? `agent (${agentType ?? 'general-purpose'})` : 'shell (/bin/sh -c)';
+		const kind = definition !== undefined ? `agent (${definition.name})` : 'shell (/bin/sh -c)';
 		return okText(
 			`spawned ${launched.id} "${label}" as ${kind}, pid ${launched.pid}.\n` +
 				`log ${join(logsDir, `${launched.id}.log`)}\n` +
@@ -1731,18 +2649,23 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (record.prompt === undefined) {
 			return badInput(`subagent: job ${id} is a shell job; there is no agent session to resume`);
 		}
-		// Resume the worker's OWN conversation by its deterministic session name, so the
-		// new instruction continues with the context the worker already has.
+		// Resume the ACP session the first run created, so the new instruction continues
+		// with the context the worker already has. An older record without one starts a
+		// fresh session (the definition body still applies).
+		const definition = record.agentType === undefined ? undefined : resolveAgentDefinition(record.agentType);
 		const launched = fire({
 			label: `${String(record.label ?? id)} (resume)`,
 			kind: 'agent',
 			prompt: instruction,
 			cwd: String(record.cwd ?? cmd.cwd),
 			agentType: record.agentType,
+			systemPrompt: definition?.ok === true ? definition.definition.systemPrompt : undefined,
 			model: record.model,
 			maxTurns: record.maxTurns,
+			effort: record.effort,
+			permissionMode: record.permissionMode,
 			timeoutMs: record.timeoutMs,
-			resumeSession: record.sessionName ?? sessionNameOf(id),
+			resumeSession: record.acpSessionId,
 			resumedFrom: id,
 		});
 		if (!launched.ok) return badInput(launched.error);
@@ -1785,8 +2708,13 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				label: {type: 'string', description: 'Alias for description.'},
 				prompt: {type: 'string', description: 'Prompt for a detached headless Command Code agent.'},
 				command: {type: 'string', description: 'Shell command to run detached under /bin/sh -c.'},
-				agent_type: {type: 'string', description: "Agent type, recorded for the job (default 'general-purpose')."},
-				model: {type: 'string', description: 'Model for an agent job, passed to the worker as -m.'},
+				agent_type: {type: 'string', description: "Deprecated alias for subagent_type. Use subagent_type."},
+				subagent_type: {
+					type: 'string',
+					description:
+						"Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins.",
+				},
+				model: {type: 'string', description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model."},
 				max_turns: {type: 'number', description: 'Cap the agent conversation turns.'},
 				timeout_ms: {type: 'number', description: 'Kill the job after this many milliseconds and report a timeout.'},
 				run_in_background: {type: 'boolean', description: 'Only true is supported in this release.'},
@@ -1800,7 +2728,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	addSurface(
 		'subagent_list',
-		'List spawned jobs with their lifecycle states, model, elapsed time and owner, and count the signals still waiting for this session.',
+		'List spawned jobs with their lifecycle states, subagent_type, agent name, model, elapsed time and owner, and count the signals still waiting for this session.',
 		{
 			type: 'object',
 			properties: {
@@ -1874,6 +2802,42 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	// ------------------------------------------------------------------ command
 
+	// `/agents` is the definition surface: what loaded, from where, and what did
+	// not. It refreshes discovery first, so an edited file shows up without a
+	// restart.
+	function agentsText(filter?: string): string {
+		registry.refresh();
+		const entries = registry.entries();
+		const wanted = String(filter ?? '').trim().toLowerCase();
+		const shown =
+			wanted.length === 0
+				? entries
+				: entries.filter(entry => entry.name.toLowerCase() === wanted || entry.path.toLowerCase().includes(wanted));
+		const counts: Record<string, number> = {project: 0, user: 0, builtin: 0};
+		let valid = 0;
+		for (const entry of entries) {
+			if (!entry.valid) continue;
+			valid += 1;
+			counts[entry.source] = (counts[entry.source] ?? 0) + 1;
+		}
+		const lines = shown.map(entry => {
+			const flags: string[] = [];
+			if (entry.definition?.readOnly === true) flags.push('read-only');
+			if (entry.definition?.oneShot === true) flags.push('one-shot');
+			if (entry.source !== 'builtin' && Object.hasOwn(HOST_RESERVED_AGENT_NAMES, entry.name)) {
+				flags.push('shadows a host-reserved name');
+			}
+			const state = entry.valid ? 'valid' : `invalid: ${entry.reason ?? 'unknown'}`;
+			const location = entry.path.length > 0 ? `  ${entry.path}` : '';
+			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'}  ${entry.source}  ${state}${flags.length > 0 ? ` · ${flags.join(' · ')}` : ''}${location}`;
+		});
+		return (
+			`${valid} valid definition(s) (${counts.project} project, ${counts.user} user, ${counts.builtin} built-in), ` +
+			`${entries.length - valid} invalid.\n` +
+			(lines.length > 0 ? lines.join('\n') : '  (none)')
+		);
+	}
+
 	function commandHandler({args}: {args?: string}): {message: string} {
 		const [sub, ...rest] = String(args ?? '').trim().split(/\s+/).filter(Boolean);
 		if (sub === 'list') return {message: listText()};
@@ -1902,16 +2866,30 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		argumentHint: 'list|jobs|cancel <id>|open <id>',
 		handler: commandHandler,
 	});
+	cmd.addCommand({
+		name: 'agents',
+		description: 'List subagent definitions: scope, validity, and the file that provides each one',
+		argumentHint: '[name|path]',
+		handler: ({args}: {args?: string}) => ({message: agentsText(args)}),
+	});
 
 	// ------------------------------------------------------------------ lifecycle
 
 	cmd.hooks({
+		// The worker process loads this mod with `cmd --mod <file> acp`. Its whole
+		// purpose there is this hook: the definition body is the worker's system
+		// prompt. The parent already has the definition, so only worker mode registers
+		// it, and only when a body was passed.
+		...(workerSpec?.systemPrompt !== undefined && workerSpec.systemPrompt.length > 0
+			? {appendSystemPrompt: () => String(workerSpec?.systemPrompt ?? '')}
+			: {}),
 		onSessionStart: (info: {source?: string; sessionId?: string}) => {
 			if (typeof info?.sessionId === 'string' && info.sessionId.length > 0) {
 				sessionId = info.sessionId;
 			}
 			// Restore (or mint) the owner token before any drain runs.
 			ownerId();
+			registry.refresh();
 			sweepClaimed();
 			sweepOrphaned();
 			sweepExpired();
@@ -1942,6 +2920,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (typeof event?.sessionId === 'string' && event.sessionId.length > 0) {
 			sessionId = event.sessionId;
 			ownerId();
+			registry.refresh();
 			safeDrain();
 		}
 	});
