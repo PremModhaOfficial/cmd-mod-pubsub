@@ -1595,7 +1595,11 @@ process.stdin.on('data', (data) => {
 			env: {
 				...process.env,
 				BETTER_SUBAGENTS_WORKER: '1',
-				SUBAGENT_SPEC: JSON.stringify({systemPrompt: 'DEFINITION BODY', startup: 'STARTUP-CONTEXT-X'}),
+				SUBAGENT_SPEC: JSON.stringify({
+					systemPrompt: 'DEFINITION BODY',
+					roster: 'ROSTER-LINE',
+					startup: 'STARTUP-CONTEXT-X',
+				}),
 			},
 		}).runtime,
 	});
@@ -1604,6 +1608,8 @@ process.stdin.on('data', (data) => {
 	const hookText = startupHookBundle.registeredHooks.appendSystemPrompt();
 	assert.match(hookText, /DEFINITION BODY/, 'the definition body is still the base system prompt');
 	assert.match(hookText, /STARTUP-CONTEXT-X/, 'the startup bundle joins the system prompt');
+	assert.ok(hookText.indexOf('ROSTER-LINE') > hookText.indexOf('DEFINITION BODY'), 'the roster follows the body');
+	assert.ok(hookText.indexOf('STARTUP-CONTEXT-X') > hookText.indexOf('ROSTER-LINE'), 'the startup bundle follows the roster');
 
 	const startupAcpSpec = seam.buildSpec(
 		{
@@ -1621,6 +1627,7 @@ process.stdin.on('data', (data) => {
 			prompt: 'the task',
 			agentType: 'general-purpose',
 			systemPrompt: 'WORKER-SYSTEM',
+			roster: 'ROSTER-LINE',
 			startup: 'STARTUP-CONTEXT-X',
 			promptMarkerPath: join(acpDir, 'logs', 'acp-startup.mod'),
 		},
@@ -1636,6 +1643,7 @@ process.stdin.on('data', (data) => {
 	await startupExit.promise;
 	const startupLog = readFileSync(join(acpDir, 'logs', 'acp-startup.log'), 'utf8');
 	assert.match(startupLog, /PROMPT "AGENT DEFINITION[\s\S]*STARTUP-CONTEXT-X[\s\S]*TASK:\\nthe task"/, 'without the hook the bundle precedes the task');
+	assert.ok(startupLog.indexOf('ROSTER-LINE') < startupLog.indexOf('STARTUP-CONTEXT-X'), 'the roster precedes the startup bundle');
 	assert.match(startupLog, /STARTUP-CONTEXT-X/, 'the startup bundle reaches the worker prompt');
 
 	// The whole path: a memory definition is discovered, its directory is created,

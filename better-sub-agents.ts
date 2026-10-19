@@ -458,6 +458,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     // its factory. When the marker is absent, the body is carried in the prompt so
     // it can never silently disappear.
     const body = typeof spec.systemPrompt === 'string' ? spec.systemPrompt : '';
+    const rosterText = typeof spec.roster === 'string' ? spec.roster : '';
     const startupText = typeof spec.startup === 'string' ? spec.startup : '';
     let hookReady = false;
     if (typeof spec.promptMarkerPath === 'string' && spec.promptMarkerPath.length > 0) {
@@ -466,6 +467,7 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     let promptText = spec.prompt;
     const preamble = [];
     if (body.length > 0 && !hookReady) preamble.push('AGENT DEFINITION (your system prompt):\\n' + body);
+    if (rosterText.length > 0 && !hookReady) preamble.push(rosterText);
     if (startupText.length > 0 && !hookReady) preamble.push(startupText);
     if (preamble.length > 0) {
       promptText = preamble.join('\\n\\n') + '\\n\\nTASK:\\n' + String(spec.prompt);
@@ -1993,12 +1995,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		};
 	}
 
-	// The worker's system prompt: the definition body first, then the startup
-	// bundle. The parent builds both, so the hook is registered only in worker mode
-	// and only when there is something to append.
+	// The worker's system prompt: the definition body, the rendered sibling roster
+	// (supplied by the live session), then the startup bundle. The parent builds
+	// all three, so the hook is registered only in worker mode and only when there
+	// is something to append.
 	function workerSystemPrompt(): string {
+		const roster = (workerSpec as {roster?: unknown} | undefined)?.roster;
 		const parts = [
 			typeof workerSpec?.systemPrompt === 'string' ? workerSpec.systemPrompt : '',
+			typeof roster === 'string' ? roster : '',
 			typeof workerSpec?.startup === 'string' ? workerSpec.startup : '',
 		].filter(part => part.length > 0);
 		return parts.join('\n\n');
