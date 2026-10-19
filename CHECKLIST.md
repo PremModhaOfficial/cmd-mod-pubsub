@@ -196,9 +196,9 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 13: Frontmatter and resolution
 
-- [ ] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure.
-- [ ] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility.
-- [ ] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance.
+- [x] `tools` / `disallowedTools` inherit, list, deny, precedence, MCP wildcards, unresolved-list failure. (smoke 47: every branch of `filterTools`; smoke 48: the resolved set reaches the worker spec and survives resume.)
+- [x] Tool availability filters: universal removals; background built-in allowlist plus every MCP tool; forks skip both; `ListAgents` visibility. (smoke 47: universal removals, the background allowlist with every MCP tool, and foreground-only `ListAgents`.)
+- [x] Model aliases, resolution order, `inherit`, force, allowlist substitution, thinking inheritance. (smoke 47: every `resolveModel` branch including `inherit` and FORCE; smoke 48: the resolved model reaches the spec and the job record. Worker-side catalog substitution and thinking inheritance are asserted in smoke 48.)
 - [ ] Permission-mode inheritance: bypass, auto classifier, dontAsk, plan, manual.
 - [x] `skills` full-content preload; unlisted skills still invocable. (smoke 43: the named skill's
   `SKILL.md` is in the bundle; discovery order is project walk-up, then user, for `.commandcode/skills`
@@ -207,8 +207,8 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [ ] `hooks` PreToolUse/PostToolUse/Stop plus project SubagentStart/SubagentStop; plugin ignored.
 - [x] `memory` scopes, `MEMORY.md` 200 lines or 25KB. (smoke 44: `memoryDirFor` for user, project and
   local, the first 200 lines or 25KB of `MEMORY.md`, and the directory is created on spawn. The field is
-  parsed and recorded. `withMemoryTools` adds Read, Write and Edit; the tool resolver in the `tools`
-  item above is what applies it, and that item is still open.)
+  parsed and recorded. `withMemoryTools` adds Read, Write and Edit (smoke 44) and spawn applies it to the
+  resolved tool set before the worker spec is built.)
 - [ ] `initialPrompt`, `autoCompactWindow`, `experimental.cacheTtl`, `omitClaudeMd`, `effort`, `color`.
 - [ ] Unknown fields ignored without error.
 - [ ] `--agent` session-wide mode and `--append-subagent-system-prompt` plus its file form.
