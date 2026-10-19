@@ -111,12 +111,45 @@ the worker carries the body at the front of the task prompt instead; the job log
 arrive in phase 8. A foreground run (`run_in_background: false`) is refused for the same reason — the
 background path is the only one that exists yet.
 
+### Live messaging
+
+A spawn with `name` is addressable. Sending to it is one tool call:
+
+```jsonc
+{"to": "Tester", "message": "Check the auth path before you finish."}
+```
+
+The target's state decides the path:
+
+- **running**: the message is appended to `control/<job>/send.jsonl` while the ACP turn finishes
+  normally. The worker reads the queue at the next safe point and runs the message as its own prompt
+  (`session/prompt`); the live turn is never restarted.
+- **idle**: the worker is alive with no active turn, so the message starts a turn immediately.
+- **finished**: a new worker resumes the recorded ACP session (`session/resume`) with the same
+  definition, model, effort, permissions, and full context. The message is the new turn.
+
+Each live turn reports back as its own `kind: "message"` signal containing only that turn's reply, so the
+sender sees the answer without waiting for the agent to exit. An idle live agent waits 30 seconds for a
+message (`BETTER_SUBAGENTS_LIVE_IDLE_MS` overrides it) and then exits; a later message resumes it.
+`main` is always addressable: from an agent it writes a signal owned by the parent session; from the main
+session it is delivered as a note.
+
+A named agent starts with a **sibling roster** snapshot when at least one other named agent exists:
+`main` plus the other named agents, with their state and job id. `ListAgents` exposes the same set. A
+message from a worker to a peer is accepted only for a name in that roster.
+
+`SubagentHandback` is the explicit final-report path for an agent that reports through it: the report is
+delivered as one signal and the wrapper suppresses the duplicate end-of-turn result.
+
 ### Deprecated aliases (one release)
 
-`pubsub_fire`, `pubsub_list`, `pubsub_cancel` and `pubsub_send` are still registered and marked
-`[deprecated: use subagent_…]`. They are registered from the **same run function**, so an installed
-prompt, a script, or a habit that still calls the old name behaves identically and cannot drift. So are
-the `/pubsub` command and the `pubsub_dir` / `pubsub_deliver` flags.
+`pubsub_fire`, `pubsub_list` and `pubsub_cancel` are still registered, marked `[deprecated: use
+subagent_…]`, and delegate to the **same run function**, so an installed prompt, a script, or a habit that
+still calls the old name cannot drift. So are the `/pubsub` command and the `pubsub_dir` /
+`pubsub_deliver` flags.
+
+`pubsub_send` is not an alias: it is the 0.1.0 **note** channel. It takes `title`/`body` and publishes a
+note into this session; `subagent_send` takes `to`/`message` and delivers a live message to another agent.
 
 ## Command
 
@@ -209,6 +242,7 @@ claimed/          rename target during delivery, so two drains cannot deliver on
 orphaned/         untagged legacy signals, quarantined instead of leaked
 logs/             one log per fired job
 jobs/             one JSON record per job (for subagent_list and the jobs pane)
+control/          one directory per live agent: send.jsonl, cancel, state.json (and permission files)
 delivered.jsonl   durable delivery ledger, so a restart cannot replay a signal
 worktrees/        reserved for `isolation: worktree` (phase 7)
 ```
@@ -241,10 +275,12 @@ Treat `subagent_spawn` exactly like handing a shell to the model: only enable th
 allowed to run background commands, and do not point it at untrusted prompts. Job records and logs are
 written to `subagent_dir` in plain text and are readable by anything that can read that directory.
 
-`subagent_send` injects a message into your own session's agent loop. Only signals whose owner token matches
-the session are delivered, and untagged signals are quarantined, but **the token is an isolation
-mechanism, not an authorization boundary**: any local process that can write to the shared spool can
-write a signal tagged with a token it has read from disk. Use a private `subagent_dir` if that matters.
+`subagent_send` appends to the target agent's control queue (or resumes its session); `pubsub_send`
+injects a note into your own session's agent loop. Only signals whose owner token matches the session are
+delivered, and untagged signals are quarantined, but **the token is an isolation mechanism, not an
+authorization boundary**: any local process that can write to the shared spool can write a signal tagged
+with a token it has read from disk. A live agent accepts a peer message only for a name in the roster the
+parent handed it. Use a private `subagent_dir` if that matters.
 
 No network, no telemetry, no credentials: the mod never reads `auth.json`, opens no socket, and makes no
 outbound connection.

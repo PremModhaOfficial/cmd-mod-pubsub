@@ -1765,6 +1765,17 @@ process.stdin.on('data', (data) => {
 	const hbRecord = JSON.parse(readFileSync(join(hbDir, 'jobs', 'hb-1.json'), 'utf8'));
 	assert.equal(typeof hbRecord.handbackAt, 'number', 'the record marks the handback');
 
+	// A terminal record with a live worker is still stoppable: the cancel is a process
+	// stop plus the control marker, not a state transition.
+	writeFileSync(
+		join(liveSpool, 'jobs', 'live-idle.json'),
+		JSON.stringify({...liveRecord, id: 'live-idle', label: 'idle live', state: 'done', workerPid: livePid}),
+	);
+	const liveStopped = await toolOf(sendBundle, 'subagent_cancel').run({input: {id: 'live-idle'}});
+	assert.equal(liveStopped.ok, true, JSON.stringify(liveStopped));
+	assert.match(liveStopped.content[0].text, /stopped live agent/, 'a live idle agent can be stopped');
+	assert.ok(existsSync(join(liveSpool, 'control', 'live-idle', 'cancel')), 'the worker receives the cancel marker');
+
 	// A worker's own sends: main is a signal owned by the parent, and a peer must be
 	// in the roster the parent handed the worker.
 	const workerMain = visibility(false);

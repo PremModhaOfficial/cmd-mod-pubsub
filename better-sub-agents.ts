@@ -2511,7 +2511,18 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (job === undefined) return {ok: false, message: `subagent: no job ${id}`};
 		const state = normalizeState(job.state);
 		if (state !== undefined && isTerminal(state)) {
-			return {ok: false, message: `subagent: job ${id} is already ${state}`};
+			// A live agent's record is terminal after its first turn, but its worker is
+			// still addressable. Stopping it is a process stop, not a state change.
+			if (!liveState(job).alive) return {ok: false, message: `subagent: job ${id} is already ${state}`};
+			try {
+				spool.mkdir(join(controlRoot, id));
+				spool.writeFile(join(controlRoot, id, 'cancel'), '1');
+			} catch {
+				/* the kill below still stops it */
+			}
+			killPid(job.pid, 'SIGTERM');
+			killPid(job.workerPid, 'SIGTERM');
+			return {ok: true, message: `subagent: stopped live agent ${id} (${String(job.label ?? 'unlabelled')})`};
 		}
 
 		const now = runtime.now();
@@ -2703,6 +2714,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const isAgent = intent.prompt !== undefined;
 		const live = isAgent && intent.live !== false;
 		const roster = isAgent ? rosterFor(intent.name) : {rosterNames: []};
+		const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
 		if (live) {
 			try {
 				spool.mkdir(join(controlRoot, id));
@@ -2736,7 +2748,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 				...(roster.roster !== undefined ? {roster: roster.roster} : {}),
 				...(roster.rosterNames.length > 0 ? {rosterNames: roster.rosterNames} : {}),
-				...(live ? {live: true, controlDir: join(controlRoot, id)} : {}),
+				...(live ? {live: true, controlDir: join(controlRoot, id), ...(Number.isFinite(idleMs) && idleMs > 0 ? {idleMs} : {})} : {}),
 				...(isAgent ? {promptMarkerPath: join(logsDir, `${id}.mod`)} : {}),
 			},
 			MOD_PATH,
