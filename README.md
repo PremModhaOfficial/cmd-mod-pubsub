@@ -45,12 +45,15 @@ is inlined into it, so `better-sub-agents.ts` is the whole mod.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `subagent_type` (or the deprecated `agent_type`), `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. |
+| `subagent_spawn` | `description`, plus **either** `prompt` **or** `command`; optional `name`, `subagent_type` (or the deprecated `agent_type`), `model`, `max_turns`, `timeout_ms`, `cwd` | Starts a detached worker and returns immediately. `command` runs under `/bin/sh -c`; `prompt` runs a subagent definition over an ACP session. `subagent_type` defaults to `general-purpose`; `cwd` defaults to the mod workspace root. A `name` makes the agent addressable with `subagent_send`. |
 | `subagent_list` | `state?`, `limit?` | Spawned jobs with state, model, elapsed time and owner, plus how many signals are still waiting for this session. |
 | `subagent_output` | `id`, `wait?`, `wait_ms?`, `offset?`, `max_chars?` | One job's state, exit code, duration and owner, plus a bounded slice of its log (tail by default). `wait` blocks briefly until the job finishes — opt in only when you actually need it. |
 | `subagent_cancel` | `id` | Cancels a `queued` or `running` job (`SIGTERM`, then `SIGKILL` after 1s). The firing session receives one `canceled` signal. |
 | `subagent_resume` | `id`, `prompt` | Continues a finished **agent** job in its ACP session with a new instruction. The resumed run is a new job with its own signal. |
-| `subagent_send` | `title`, `body` | Publishes a signal into the agent loop of **this** session. The agent-to-agent channel: worker and peer agents signal a session so neither blocks or polls. Delivered as a visible user turn. |
+| `subagent_send` | `to`, `message` | Live message to a **named** agent or `main`. A running target queues the message and answers at its next safe point; an idle target starts a turn; a finished target resumes its ACP session with full context. The reply arrives as its own message signal. |
+| `subagent_agents` | `scope?` | Agent definitions with scope, model, tools, validity, and source file. |
+| `ListAgents` | none | Where cross-session messaging is on: `main` plus every named agent this conversation can message with `subagent_send`. Foreground agents only; a background agent does not keep it. |
+| `SubagentHandback` | `report` | Inside an agent: hand the final report to the conversation that receives the result. The wrapper then suppresses its duplicate end-of-turn signal. |
 
 `subagent_spawn` is the whole point: it returns in milliseconds with the job id and pid, and the result
 arrives later **as a signal, never as a tool result** — so there is nothing to wait for.

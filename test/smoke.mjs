@@ -1764,6 +1764,54 @@ process.stdin.on('data', (data) => {
 	assert.match(hbSignals[0].body, /42/, 'the report is the signal body');
 	const hbRecord = JSON.parse(readFileSync(join(hbDir, 'jobs', 'hb-1.json'), 'utf8'));
 	assert.equal(typeof hbRecord.handbackAt, 'number', 'the record marks the handback');
+
+	// A worker's own sends: main is a signal owned by the parent, and a peer must be
+	// in the roster the parent handed the worker.
+	const workerMain = visibility(false);
+	const fromWorker = await toolOf(workerMain, 'subagent_send').run({input: {to: 'main', message: 'from the worker'}});
+	assert.equal(fromWorker.ok, true, JSON.stringify(fromWorker));
+	const workerRoot = String(workerMain.api.getFlag('subagent_dir'));
+	const workerSignals = readdirSync(join(workerRoot, 'inbox')).map((name) =>
+		JSON.parse(readFileSync(join(workerRoot, 'inbox', name), 'utf8')),
+	);
+	assert.equal(workerSignals.length, 1, 'a worker message to main is one signal');
+	assert.equal(workerSignals[0].owner, 'owner-vis', 'it is addressed to the parent session');
+	assert.match(workerSignals[0].body, /from the worker/, 'the message is the body');
+
+	const peerDir = mkdtempSync(join(tmpdir(), 'subagent-peer-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(peerDir, dir), {recursive: true});
+	const peerSpec = {
+		id: 'peer-host',
+		owner: 'owner-vis',
+		name: 'Worker',
+		kind: 'agent',
+		rosterNames: ['Peer'],
+		jobsDir: join(peerDir, 'jobs'),
+		inboxDir: join(peerDir, 'inbox'),
+		logPath: join(peerDir, 'logs', 'peer-host.log'),
+		controlDir: join(peerDir, 'control', 'peer-host'),
+		startedAt: 1,
+		tailMax: 100,
+		background: false,
+	};
+	const peerRt = makeRuntime({
+		env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(peerSpec)},
+		alive: (pid) => pid === 777,
+	});
+	const peer = makeApi({spoolDir: peerDir, session: makeSession(), runtime: peerRt.runtime});
+	mod(peer.api, peer.runtime);
+	writeFileSync(
+		join(peerDir, 'jobs', 'peer.json'),
+		JSON.stringify({id: 'peer', owner: 'owner-other', name: 'Peer', state: 'running', kind: 'agent', startedAt: 1, workerPid: 777}),
+	);
+	const toPeer = await toolOf(peer, 'subagent_send').run({input: {to: 'Peer', message: 'hello peer'}});
+	assert.equal(toPeer.ok, true, JSON.stringify(toPeer));
+	assert.match(readFileSync(join(peerDir, 'control', 'peer', 'send.jsonl'), 'utf8'), /hello peer/, 'a roster peer receives the message');
+	assert.equal(
+		(await toolOf(peer, 'subagent_send').run({input: {to: 'Worker', message: 'x'}})).ok,
+		false,
+		'a worker cannot address a name outside its roster',
+	);
 	ok('ListAgents visibility, subagent_agents, and SubagentHandback');
 
 	process.stdout.write('\nPASS\n');
