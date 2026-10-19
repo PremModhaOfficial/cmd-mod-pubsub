@@ -1334,7 +1334,7 @@ process.stdin.on('data', (data) => {
 	);
 	chmodSync(fakeCmd, 0o755);
 
-	const runAcpJob = async (id, markerPath, resumeSession) => {
+	const runAcpJob = async (id, markerPath, resumeSession, extraRecord = {}) => {
 		const spec = seam.buildSpec(
 			{
 				id,
@@ -1359,7 +1359,7 @@ process.stdin.on('data', (data) => {
 			},
 			'/mod.ts',
 		);
-		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued'}));
+		writeFileSync(join(acpDir, 'jobs', `${id}.json`), JSON.stringify({id, state: 'queued', ...extraRecord}));
 		const child = spawn(process.execPath, ['-e', workerText], {
 			cwd: acpDir,
 			env: {...process.env, SUBAGENT_SPEC: JSON.stringify(spec), BETTER_SUBAGENTS_WORKER: '1'},
@@ -1412,6 +1412,12 @@ process.stdin.on('data', (data) => {
 	assert.ok(!acpResumed.log.includes('SESSION_NEW'), 'resume does not fall back to a new session');
 	assert.equal(acpResumed.record.acpSessionId, 'acp-old', 'the resumed id stays on the record');
 	assert.equal(acpResumed.signals[0].state, 'done', 'the resumed turn finishes');
+
+	// SubagentHandback already delivered the report. The wrapper must record the
+	// terminal state without emitting a second signal for the same run.
+	const acpHandback = await runAcpJob('acp-handback', markerPath, undefined, {handbackAt: 1});
+	assert.equal(acpHandback.record.state, 'done', 'a handback run still settles its record');
+	assert.equal(acpHandback.signals.length, 0, 'the handback signal is not duplicated');
 	ok('ACP worker: initialize, session/new, set_mode, set_config_option, session/prompt, log and signal');
 
 	// 36. the sibling roster -------------------------------------------------
@@ -1675,6 +1681,90 @@ process.stdin.on('data', (data) => {
 	assert.ok(!/Scout/.test(namedSpec.roster), 'the new agent is not in its own roster');
 	assert.ok(namedSpec.rosterNames.includes('Helper'), 'the roster names travel as data');
 	ok('subagent_send: running queues, idle starts a turn, finished resumes, main is addressable');
+
+	// 40. ListAgents, subagent_agents, and SubagentHandback ------------------
+	// ListAgents is a foreground surface. The same factory, run as a background
+	// worker, must not register it. subagent_agents lists definitions; handback is
+	// the worker's explicit final-report path.
+	const visibility = (background, crossSessionEnabled = true) => {
+		const dir = mkdtempSync(join(tmpdir(), 'subagent-vis-'));
+		const spec = {
+			id: 'w-vis',
+			owner: 'owner-vis',
+			name: 'Worker',
+			kind: 'agent',
+			jobsDir: join(dir, 'jobs'),
+			inboxDir: join(dir, 'inbox'),
+			logPath: join(dir, 'logs', 'w-vis.log'),
+			controlDir: join(dir, 'control', 'w-vis'),
+			startedAt: 1,
+			tailMax: 100,
+			background,
+		};
+		const rt = makeRuntime({
+			env: {
+				...process.env,
+				BETTER_SUBAGENTS_WORKER: '1',
+				SUBAGENT_SPEC: JSON.stringify(spec),
+				...(crossSessionEnabled ? {} : {BETTER_SUBAGENTS_CROSS_SESSION: '0'}),
+			},
+		});
+		const bundle = makeApi({spoolDir: dir, session: makeSession(), runtime: rt.runtime});
+		mod(bundle.api, bundle.runtime);
+		return bundle;
+	};
+	assert.ok(!toolNames(visibility(true)).includes('ListAgents'), 'a background worker does not keep ListAgents');
+	assert.ok(toolNames(visibility(false)).includes('ListAgents'), 'a foreground worker keeps ListAgents');
+	assert.ok(!toolNames(visibility(false, false)).includes('ListAgents'), 'cross-session messaging off removes ListAgents');
+	assert.ok(toolNames(sendBundle).includes('ListAgents'), 'the main session has ListAgents');
+	assert.ok(toolNames(visibility(false)).includes('SubagentHandback'), 'a worker can hand a report back');
+	assert.ok(!toolNames(sendBundle).includes('SubagentHandback'), 'the main session has no handback tool');
+
+	const defs = await toolOf(sendBundle, 'subagent_agents').run({input: {scope: 'builtin'}});
+	assert.equal(defs.ok, true, JSON.stringify(defs));
+	assert.match(defs.content[0].text, /general-purpose/, 'definitions include the built-in fallback');
+	assert.match(defs.content[0].text, /builtin/, 'each row names its scope');
+
+	const listAgentsOut = await toolOf(sendBundle, 'ListAgents').run({input: {}});
+	assert.equal(listAgentsOut.ok, true, JSON.stringify(listAgentsOut));
+	assert.match(listAgentsOut.content[0].text, /\bmain\b/, 'ListAgents always offers main');
+	assert.match(listAgentsOut.content[0].text, /Helper/, 'ListAgents lists a named peer');
+	assert.match(listAgentsOut.content[0].text, /Scout/, 'ListAgents lists the named spawn');
+
+	const hbDir = mkdtempSync(join(tmpdir(), 'subagent-hb-'));
+	for (const dir of ['logs', 'inbox', 'jobs', 'control']) mkdirSync(join(hbDir, dir), {recursive: true});
+	const hbSpec = {
+		id: 'hb-1',
+		owner: 'owner-hb',
+		name: 'Reporter',
+		label: 'reporter',
+		kind: 'agent',
+		jobsDir: join(hbDir, 'jobs'),
+		inboxDir: join(hbDir, 'inbox'),
+		logPath: join(hbDir, 'logs', 'hb-1.log'),
+		controlDir: join(hbDir, 'control', 'hb-1'),
+		startedAt: 10,
+		tailMax: 100,
+		background: false,
+	};
+	const hbRt = makeRuntime({env: {...process.env, BETTER_SUBAGENTS_WORKER: '1', SUBAGENT_SPEC: JSON.stringify(hbSpec)}});
+	const hb = makeApi({spoolDir: hbDir, session: makeSession(), runtime: hbRt.runtime});
+	mod(hb.api, hb.runtime);
+	writeFileSync(
+		join(hbDir, 'jobs', 'hb-1.json'),
+		JSON.stringify({id: 'hb-1', label: 'reporter', kind: 'agent', owner: 'owner-hb', state: 'running', startedAt: 10}),
+	);
+	const handback = await toolOf(hb, 'SubagentHandback').run({input: {report: 'the final answer is 42'}});
+	assert.equal(handback.ok, true, JSON.stringify(handback));
+	const hbSignals = readdirSync(join(hbDir, 'inbox')).map((name) =>
+		JSON.parse(readFileSync(join(hbDir, 'inbox', name), 'utf8')),
+	);
+	assert.equal(hbSignals.length, 1, 'handback emits exactly one signal');
+	assert.equal(hbSignals[0].owner, 'owner-hb', 'the report is addressed to the parent session');
+	assert.match(hbSignals[0].body, /42/, 'the report is the signal body');
+	const hbRecord = JSON.parse(readFileSync(join(hbDir, 'jobs', 'hb-1.json'), 'utf8'));
+	assert.equal(typeof hbRecord.handbackAt, 'number', 'the record marks the handback');
+	ok('ListAgents visibility, subagent_agents, and SubagentHandback');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

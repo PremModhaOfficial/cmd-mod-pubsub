@@ -2816,7 +2816,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// for one release: an installed prompt, a script, or a habit that still calls the
 	// old name keeps working, and cannot drift from the new one because there is only
 	// one implementation.
-
 	type ToolResult = {ok: boolean; error?: string; content?: {type: string; text: string}[]};
 	const okText = (value: string): ToolResult => ({ok: true, content: [{type: 'text', text: value}]});
 	const badInput = (error: string): ToolResult => ({ok: false, error});
@@ -3057,6 +3056,33 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		);
 	};
 
+	// The read side of the team: definitions, addressable agents, and the agent's
+	// explicit final report. `ListAgents` is registered only where it belongs.
+	function agentsToolText(scope?: string): string {
+		registry.refresh();
+		const wanted = String(scope ?? '').trim().toLowerCase();
+		const entries = registry.entries().filter(entry => wanted.length === 0 || entry.source === wanted);
+		if (entries.length === 0) return `no${wanted.length > 0 ? ` ${wanted}` : ''} agent definitions`;
+		const lines = entries.map(entry => {
+			const state = entry.valid ? 'valid' : `invalid: ${entry.reason ?? 'unknown'}`;
+			const model = entry.definition?.model !== undefined ? ` model=${entry.definition.model}` : '';
+			const tools = entry.definition?.tools !== undefined ? ` tools=${entry.definition.tools.join(',')}` : '';
+			const source = entry.path.length > 0 ? ` · ${entry.path}` : '';
+			return `  ${entry.name.length > 0 ? entry.name : '(unnamed)'} · ${entry.source} · ${state}${model}${tools}${source}`;
+		});
+		return `${entries.length} definition(s)${wanted.length > 0 ? ` in ${wanted}` : ''}:\n${lines.join('\n')}`;
+	}
+
+	function listAgentsText(): string {
+		const lines = [`${ROSTER_MAIN} — this conversation`];
+		for (const name of rosterNames()) {
+			const record = namedJob(name);
+			if (record === undefined) continue;
+			lines.push(`${name} — ${canonicalState(record.state)} (job ${record.id})`);
+		}
+		return lines.join('\n');
+	}
+
 	const noteRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
 		const title = typeof input.title === 'string' ? input.title : '';
 		if (title.length === 0) return badInput('title is required');
@@ -3239,6 +3265,68 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		},
 		resumeRun,
 	);
+
+	addSurface(
+		'subagent_agents',
+		'List the available agent definitions: scope, model, tools, validity, and the file that provides each one. Pass `scope` to filter to project, user, or builtin.',
+		{
+			type: 'object',
+			properties: {
+				scope: {type: 'string', description: 'Only definitions from this scope (project, user, builtin).'},
+			},
+			required: [],
+		},
+		async ({input}: {input: Record<string, unknown>}) =>
+			okText(agentsToolText(typeof input.scope === 'string' ? input.scope : undefined)),
+		{readOnly: true},
+	);
+
+	const crossSessionMessaging = runtime.env.BETTER_SUBAGENTS_CROSS_SESSION !== '0';
+	if (listAgentsVisible({background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging})) {
+		addSurface(
+			'ListAgents',
+			'List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.',
+			{type: 'object', properties: {}, required: []},
+			async () => okText(listAgentsText()),
+			{readOnly: true},
+		);
+	}
+
+	if (workerSpec !== undefined) {
+		addSurface(
+			'SubagentHandback',
+			'Hand your final report back to the conversation that receives this run\'s result. The report is delivered as its own message; end the turn afterwards. The wrapper suppresses the duplicate end-of-turn result.',
+			{
+				type: 'object',
+				properties: {
+					report: {type: 'string', description: 'The final report for the parent conversation.'},
+				},
+				required: ['report'],
+			},
+			async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
+				const report = String(input.report ?? '').trim();
+				if (report.length === 0) return badInput('report is required and must not be empty');
+				const id = String(workerSpec?.id ?? '');
+				const record = id.length === 0 ? undefined : readJob(id);
+				if (record === undefined) return badInput(`subagent: no job ${id || '(worker)'}`);
+				const now = runtime.now();
+				record.handbackAt = now;
+				record.updatedAt = now;
+				writeJob(record);
+				enqueueSignal(
+					signalOf(record, {
+						state: 'done',
+						finishedAt: now,
+						durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
+						body: report,
+						title: `${String(record.label ?? id)} handback`,
+					}),
+				);
+				refreshJobs();
+				return okText(`handed the report back (job ${id}); it reaches the parent as one message`);
+			},
+		);
+	}
 
 	addSurface(
 		'subagent_send',
