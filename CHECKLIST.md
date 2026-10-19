@@ -164,7 +164,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [ ] Make `subagent_send` live messaging. Keep `pubsub_send` as the legacy note tool only.
 - [ ] Add `subagent_agents` and `/agents`.
 - [ ] Accept the Claude Code environment aliases alongside `BETTER_SUBAGENTS_*`.
-- [x] Write the ADR for the live-messaging, fork, and permission-prompt transport before Phase 15. (`docs/adr/0001-worker-and-control.md`, accepted 2026-10-20: ACP for non-fork jobs, CLI fork plus ACP load for forks.)
+- [x] Write the ADR for the live-messaging, fork, and permission-prompt transport before Phase 15. (`docs/adr/0001-worker-and-control.md`, accepted 2026-10-20: ACP for non-fork jobs, CLI fork plus one-shot `cmd --resume -p` follow-ups for forks.)
 - Gate: the naming table matches `SPEC.md`; every old alias has a deprecation test.
 
 ## Phase 12: Scopes, discovery, and built-ins
