@@ -3886,6 +3886,8 @@ process.stdin.on('data', (data) => {
 		description: 'tester',
 		kind: 'agent',
 		agentType: 'general-purpose',
+		agentId: 'live-1',
+		live: true,
 		state: 'running',
 		startedAt: 1,
 		workerPid: livePid,
@@ -4080,7 +4082,17 @@ process.stdin.on('data', (data) => {
 	mod(peer.api, peer.runtime);
 	writeFileSync(
 		join(peerDir, 'jobs', 'peer.json'),
-		JSON.stringify({id: 'peer', owner: 'owner-other', name: 'Peer', state: 'running', kind: 'agent', startedAt: 1, workerPid: 777}),
+		JSON.stringify({
+			id: 'peer',
+			owner: 'owner-other',
+			name: 'Peer',
+			state: 'running',
+			kind: 'agent',
+			agentId: 'peer',
+			live: true,
+			startedAt: 1,
+			workerPid: 777,
+		}),
 	);
 	const toPeer = await toolOf(peer, 'subagent_send').run({input: {to: 'Peer', message: 'hello peer'}});
 	assert.equal(toPeer.ok, true, JSON.stringify(toPeer));
