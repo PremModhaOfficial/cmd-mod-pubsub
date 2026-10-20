@@ -66,6 +66,11 @@ export function isSignalState(value: unknown): value is SignalState {
 }
 
 export function canTransition(from: JobState, to: JobState): boolean {
+	// A terminal job keeps its result. It has no outgoing edge, and that includes
+	// the edge to the state it already has: a job that failed and then failed
+	// again wrote a second signal and overwrote the saved reason and finish time.
+	// A terminal state is terminal, even for itself.
+	if (isTerminal(from)) return false;
 	// Writing the state a job already has is not a transition; every other edge must
 	// be in the table.
 	if (from === to) return true;

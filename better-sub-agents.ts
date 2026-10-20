@@ -1073,6 +1073,7 @@ function isSignalState(value) {
 }
 __name(isSignalState, "isSignalState");
 function canTransition(from, to) {
+  if (isTerminal(from)) return false;
   if (from === to) return true;
   return STATE_TRANSITIONS[from].includes(to);
 }
@@ -1201,8 +1202,31 @@ function createLedger(deps) {
     }
   }
   __name(write, "write");
+  function readDisk() {
+    const found = /* @__PURE__ */ new Map();
+    try {
+      for (const line of deps.fs.readFile(deps.path).split("\n").filter(Boolean)) {
+        try {
+          const entry = JSON.parse(line);
+          if (typeof entry.id !== "string") continue;
+          const at = typeof entry.at === "number" ? entry.at : 0;
+          const known = found.get(entry.id);
+          if (known === void 0 || at > known) found.set(entry.id, at);
+        } catch {
+        }
+      }
+    } catch {
+    }
+    return found;
+  }
+  __name(readDisk, "readDisk");
   function retain(limit) {
-    const keep = ordered().slice(-Math.max(0, limit));
+    const merged = readDisk();
+    for (const [id, at] of ids) {
+      const known = merged.get(id);
+      if (known === void 0 || at > known) merged.set(id, at);
+    }
+    const keep = [...merged.entries()].sort((left, right) => left[1] - right[1]).slice(-Math.max(0, limit));
     ids.clear();
     for (const [id, at] of keep) ids.set(id, at);
     write();

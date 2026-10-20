@@ -44,10 +44,43 @@ export function createLedger(deps: LedgerDeps): Ledger {
 		}
 	}
 
+	// What the file holds right now, including facts another session wrote. The
+	// ledger is ONE file shared by every session, and each session holds its own
+	// map of what it delivered. A compaction that rewrote the file from that
+	// private map erased the other sessions' recent deliveries, and a restart
+	// then replayed those signals. The disk is the truth; the map is one
+	// session's view of it.
+	function readDisk(): Map<string, number> {
+		const found = new Map<string, number>();
+		try {
+			for (const line of deps.fs.readFile(deps.path).split('\n').filter(Boolean)) {
+				try {
+					const entry = JSON.parse(line) as {id?: unknown; at?: unknown};
+					if (typeof entry.id !== 'string') continue;
+					const at = typeof entry.at === 'number' ? entry.at : 0;
+					const known = found.get(entry.id);
+					if (known === undefined || at > known) found.set(entry.id, at);
+				} catch {
+					/* ignore a torn line */
+				}
+			}
+		} catch {
+			/* no ledger yet */
+		}
+		return found;
+	}
+
 	// Keep the newest `limit` facts - in memory and on disk, in one step. Pruning only
 	// one of the two would either lose the guard at restart or let a restart replay.
 	function retain(limit: number): void {
-		const keep = ordered().slice(-Math.max(0, limit));
+		// Merge first: the facts on disk include the ones other sessions wrote
+		// since this session last read the file.
+		const merged = readDisk();
+		for (const [id, at] of ids) {
+			const known = merged.get(id);
+			if (known === undefined || at > known) merged.set(id, at);
+		}
+		const keep = [...merged.entries()].sort((left, right) => left[1] - right[1]).slice(-Math.max(0, limit));
 		ids.clear();
 		for (const [id, at] of keep) ids.set(id, at);
 		write();

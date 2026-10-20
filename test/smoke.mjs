@@ -360,7 +360,8 @@ try {
 	assert.equal(jobStates.canTransition('running', 'done'), true);
 	assert.equal(jobStates.canTransition('done', 'running'), false, 'a terminal state has no outgoing edge');
 	assert.equal(jobStates.canTransition('queued', 'done'), false, 'running cannot be skipped');
-	assert.equal(jobStates.canTransition('done', 'done'), true, 'writing the same state is not a transition');
+	assert.equal(jobStates.canTransition('done', 'done'), false, 'a terminal job cannot be rewritten, even to its own state');
+	assert.equal(jobStates.canTransition('running', 'running'), true, 'writing the same live state is not a transition');
 	assert.equal(jobStates.isTerminal('canceled'), true);
 	assert.equal(jobStates.isTerminal('queued'), false);
 	assert.equal(jobStates.marker('done'), '✓');
@@ -589,6 +590,70 @@ try {
 	assert.ok(restarted.size() > 0, 'a full ledger never clears its guard');
 	assert.equal(restarted.has('bulk-49'), true, 'the newest fact survives repeated retention');
 	ok('ledger: has/accept/retain keep memory and disk consistent and never clear');
+
+	// 17b. One session's compaction keeps another session's records ---------
+	// The ledger is one file shared by every session, and each session holds
+	// its own map of what it has delivered. The compaction rewrote the file
+	// from that private map, so a session that crossed its cap erased the
+	// other session's recent deliveries from disk. After a restart, the other
+	// session's signal was delivered a second time.
+	const sharedLedgerDir = mkdtempSync(join(tmpdir(), 'subagent-ledger-shared-'));
+	const sharedLedgerPath = join(sharedLedgerDir, 'delivered.jsonl');
+	const sharedLedgerOptions = {
+		fs: realFs,
+		path: sharedLedgerPath,
+		now: () => fixedNow,
+		max: 1,
+		keep: 1,
+		compactBytes: 1024 * 1024,
+	};
+	// Two sessions open the same file. The second one delivers a signal.
+	const sessionOneLedger = ledgerFactory(sharedLedgerOptions);
+	const sessionTwoLedger = ledgerFactory({...sharedLedgerOptions, now: () => fixedNow + 1000});
+	sessionTwoLedger.accept('from-session-two');
+	// The first one crosses its cap, so it compacts and rewrites the file. Its
+	// own facts are older, so the cap prunes THEM - not the other session's.
+	sessionOneLedger.accept('from-session-one-1');
+	sessionOneLedger.accept('from-session-one-2');
+	const sharedDiskIds = () =>
+		readFileSync(sharedLedgerPath, 'utf8')
+			.split('\n')
+			.filter(Boolean)
+			.map((line) => JSON.parse(line).id);
+	assert.ok(
+		sharedDiskIds().includes('from-session-two'),
+		`one session's compaction must not erase another session's delivery records: ${JSON.stringify(sharedDiskIds())}`,
+	);
+	const sharedRestarted = ledgerFactory(sharedLedgerOptions);
+	assert.equal(
+		sharedRestarted.has('from-session-two'),
+		true,
+		'the other session cannot replay a delivered signal after a restart',
+	);
+	ok('ledger: one session\'s compaction keeps another session\'s records');
+
+	// 17c. A job that already failed does not fail twice --------------------
+	// A spawn with no pid failed immediately, and its async 'error' event
+	// arrived afterwards. The state table allows a job to keep the state it
+	// already has, so the second failure was accepted: two signals were
+	// written, and the second one overwrote the saved reason and finish time.
+	//
+	// The check is on the state table itself, because that is what decides it:
+	// a terminal job must not be able to move to any state at all, including
+	// the one it already has.
+	assert.equal(
+		jobStates.canTransition('failed', 'failed'),
+		false,
+		'a failed job cannot fail again: the state table must refuse a terminal job',
+	);
+	assert.equal(
+		jobStates.canTransition('done', 'failed'),
+		false,
+		'a done job cannot fail either',
+	);
+	assert.equal(jobStates.canTransition('queued', 'failed'), true, 'a queued job can still fail');
+	assert.equal(jobStates.canTransition('running', 'failed'), true, 'a running job can still fail');
+	ok('a job that already failed does not fail twice');
 
 	// 18. no replay after a restart -----------------------------------------
 	const replayDir = mkdtempSync(join(tmpdir(), 'pubsub-replay-'));
