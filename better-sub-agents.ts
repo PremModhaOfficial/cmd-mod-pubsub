@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname, isAbsolute as isAbsolute2, join as join3, resolve, sep } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join3, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -410,6 +410,213 @@ function nonEmpty(value) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
 }
 __name(nonEmpty, "nonEmpty");
+
+// src/worktree.ts
+import { dirname, resolve, sep } from "node:path";
+function gitSeam(runtime) {
+  return {
+    git(args, cwd) {
+      const reply = runtime.run?.("git", args, { cwd, timeoutMs: 3e4 });
+      if (reply === void 0) return { code: 1, stdout: "", stderr: "git is not available" };
+      return {
+        code: typeof reply.code === "number" ? reply.code : reply.ok ? 0 : 1,
+        stdout: String(reply.stdout ?? ""),
+        stderr: String(reply.stderr ?? "")
+      };
+    }
+  };
+}
+__name(gitSeam, "gitSeam");
+function isInside(parent, child) {
+  const root = resolve(parent);
+  const target = resolve(child);
+  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+__name(isInside, "isInside");
+function firstLine(value) {
+  return value.trim().split("\n")[0].trim();
+}
+__name(firstLine, "firstLine");
+function mainCheckoutRoots(seam, cwd) {
+  const top = seam.git(["rev-parse", "--show-toplevel"], cwd);
+  if (top.code !== 0) return [];
+  const topLevel = firstLine(top.stdout);
+  if (topLevel.length === 0) return [];
+  const roots = [topLevel];
+  const common = seam.git(["rev-parse", "--path-format=absolute", "--git-common-dir"], topLevel);
+  let commonDir = "";
+  if (common.code === 0) {
+    commonDir = firstLine(common.stdout);
+  } else {
+    const plain = seam.git(["rev-parse", "--git-common-dir"], topLevel);
+    if (plain.code === 0) commonDir = resolve(topLevel, firstLine(plain.stdout));
+  }
+  if (commonDir.length > 0 && !isInside(topLevel, commonDir)) roots.push(dirname(commonDir));
+  return roots;
+}
+__name(mainCheckoutRoots, "mainCheckoutRoots");
+function defaultBranch(seam, cwd) {
+  const candidates = [];
+  const head = seam.git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
+  if (head.code === 0) {
+    const name = firstLine(head.stdout);
+    if (name.length > 0) candidates.push(name);
+  }
+  candidates.push("main", "master");
+  for (const candidate of candidates) {
+    if (seam.git(["rev-parse", "--verify", "--quiet", candidate], cwd).code === 0) return candidate;
+  }
+  return void 0;
+}
+__name(defaultBranch, "defaultBranch");
+function createJobWorktree(seam, opts) {
+  const roots = mainCheckoutRoots(seam, opts.cwd);
+  if (roots.length === 0) {
+    return { ok: false, error: "isolation: worktree needs a git repository (git rev-parse --show-toplevel failed)" };
+  }
+  const base = defaultBranch(seam, opts.cwd);
+  if (base === void 0) {
+    return {
+      ok: false,
+      error: "isolation: worktree cannot resolve the default branch (no origin/HEAD, main, or master)"
+    };
+  }
+  try {
+    seam.fs.mkdir(dirname(opts.path));
+  } catch (error) {
+    const message = String(error?.message ?? error);
+    return { ok: false, error: `isolation: worktree cannot create ${dirname(opts.path)}: ${message}` };
+  }
+  const added = seam.git(["worktree", "add", "--detach", opts.path, base], roots[0]);
+  if (added.code !== 0) {
+    const reason = firstLine(added.stderr) || firstLine(added.stdout) || `exit ${added.code}`;
+    return { ok: false, error: `isolation: worktree add failed: ${reason}` };
+  }
+  const head = seam.git(["rev-parse", "HEAD"], opts.path);
+  const start = head.code === 0 ? firstLine(head.stdout) : "";
+  return { ok: true, path: opts.path, base, ...start.length > 0 ? { head: start } : {}, mainCheckouts: roots };
+}
+__name(createJobWorktree, "createJobWorktree");
+function worktreeChanged(seam, path, head) {
+  const status = seam.git(["status", "--porcelain"], path);
+  if (status.code !== 0) return void 0;
+  if (status.stdout.trim().length > 0) return true;
+  if (head === void 0) return false;
+  const current = seam.git(["rev-parse", "HEAD"], path);
+  if (current.code !== 0) return void 0;
+  return firstLine(current.stdout) !== head;
+}
+__name(worktreeChanged, "worktreeChanged");
+function finalizeWorktree(seam, record) {
+  if (typeof record.worktree !== "string" || record.worktree.length === 0 || record.worktreeFinalized === true) {
+    return void 0;
+  }
+  const path = record.worktree;
+  if (record.live === true) return { kept: true, path };
+  const changed = worktreeChanged(seam, path, record.worktreeHead);
+  if (changed === void 0) return { kept: true, path, error: "git status failed; kept the worktree" };
+  if (changed) return { kept: true, path };
+  const removed = seam.git(["worktree", "remove", "--force", path], record.worktreeRepo ?? dirname(path));
+  if (removed.code !== 0) {
+    return { kept: true, path, error: `git worktree remove failed: ${firstLine(removed.stderr) || `exit ${removed.code}`}` };
+  }
+  return { kept: false, path };
+}
+__name(finalizeWorktree, "finalizeWorktree");
+function isolationRoots(seam, cwd, spec) {
+  const supplied = (spec?.mainCheckouts ?? []).filter((root) => typeof root === "string" && root.length > 0);
+  const mainCheckouts = supplied.length > 0 ? supplied : mainCheckoutRoots(seam, cwd);
+  const worktree = typeof spec?.worktree === "string" && spec.worktree.length > 0 ? spec.worktree : void 0;
+  if (worktree !== void 0) {
+    return { worktree, mainCheckouts };
+  }
+  if (mainCheckouts.length > 1 && isInside(mainCheckouts[0], cwd)) {
+    return { worktree: mainCheckouts[0], mainCheckouts };
+  }
+  return void 0;
+}
+__name(isolationRoots, "isolationRoots");
+var SHELL_TOOL_NAMES = {
+  bash: true,
+  shell: true,
+  sh: true,
+  monitor: true,
+  powershell: true,
+  pwsh: true
+};
+var NULL_DEVICES = {
+  "/dev/null": true,
+  "/dev/stdout": true,
+  "/dev/stderr": true,
+  "/dev/tty": true
+};
+function namedCwd(input) {
+  for (const key of ["cwd", "workdir", "working_directory", "workingDirectory"]) {
+    const value = input[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return void 0;
+}
+__name(namedCwd, "namedCwd");
+function commandEscapesWorktree(command, roots) {
+  if (/\b(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)\s*=/.test(command)) {
+    return "the command overrides the git directory or work tree";
+  }
+  if (/\bgit\b[^\n;&|]*\s--prefix[=\s]/.test(command)) return "the command overrides git --prefix";
+  const outsideWorktree = command.split(roots.worktree).join("");
+  for (const main of roots.mainCheckouts) {
+    if (outsideWorktree.includes(main)) return `the command names the main checkout (${main})`;
+  }
+  const targets = [];
+  for (const match of command.matchAll(/(?:^|[;&|]\s*|\s)(?:cd|pushd|set-location|sl)\s+(['"]?)([^\s'";|&]+)\1/gi)) {
+    targets.push({ kind: "cd", target: match[2] });
+  }
+  for (const match of command.matchAll(/(?:\d?|&)>>?\|?\s*(['"]?)([^\s'";|&<>]+)\1/g)) {
+    targets.push({ kind: "redirect", target: match[2] });
+  }
+  for (const match of command.matchAll(/\bgit\b[^\n;&|]*(?:-C\s+|--work-tree[=\s]+|--git-dir[=\s]+)(['"]?)([^\s'";|&]+)\1/g)) {
+    targets.push({ kind: "git path", target: match[2] });
+  }
+  for (const { kind, target } of targets) {
+    if (kind === "cd" && (target === "-" || target.startsWith("~"))) {
+      return `a cd to ${target} leaves the worktree`;
+    }
+    if (target.startsWith("$")) continue;
+    const resolved = resolve(roots.worktree, target);
+    if (kind === "cd" && !isInside(roots.worktree, resolved)) {
+      return `a cd to ${target} leaves the worktree (${resolved})`;
+    }
+    if (kind === "redirect" && NULL_DEVICES[resolved] === true) continue;
+    if (kind !== "cd" && !isInside(roots.worktree, resolved)) {
+      return `a ${kind} to ${target} escapes the worktree (${resolved})`;
+    }
+  }
+  return void 0;
+}
+__name(commandEscapesWorktree, "commandEscapesWorktree");
+function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
+  const name = toolName.toLowerCase();
+  if (SHELL_TOOL_NAMES[name] !== true) return void 0;
+  const named = namedCwd(input);
+  const cwd = named === void 0 ? toolCwd : resolve(toolCwd, named);
+  const insideWorktree = isInside(roots.worktree, cwd);
+  if (!insideWorktree) {
+    for (const main of roots.mainCheckouts) {
+      if (!isInside(main, cwd)) continue;
+      return {
+        block: true,
+        reason: `Blocked: this subagent is isolated in its worktree (${roots.worktree}); a command in the main checkout (${cwd}) is not allowed. Run it inside the worktree.`
+      };
+    }
+  }
+  if (name === "powershell" || name === "pwsh") return void 0;
+  const command = [input.command, input.script, input.cmd].find((value) => typeof value === "string");
+  if (command === void 0) return void 0;
+  const escape = commandEscapesWorktree(command, roots);
+  if (escape === void 0) return void 0;
+  return { block: true, reason: `Blocked: ${escape}. This subagent is isolated in ${roots.worktree}.` };
+}
+__name(guardToolCall, "guardToolCall");
 
 // src/index.ts
 function scanOutput(text) {
@@ -1549,7 +1756,7 @@ var OS_RUNTIME = {
     }
   }, "alive"),
   // The only wait in the mod, used by subagent_output's opt-in blocking read.
-  sleep: /* @__PURE__ */ __name((ms) => new Promise((resolve2) => setTimeout(resolve2, ms)), "sleep"),
+  sleep: /* @__PURE__ */ __name((ms) => new Promise((resolve3) => setTimeout(resolve3, ms)), "sleep"),
   // The fallback for a host without `cmd.clock.after`, and the seam the tests drive.
   later: /* @__PURE__ */ __name((ms, fn) => {
     const timer = setTimeout(fn, ms);
@@ -2393,7 +2600,7 @@ function createAgentRegistry(deps) {
     for (let depth = 0; depth <= 64; depth += 1) {
       bases.push(current);
       if (hasGitMarker(deps.fs, current)) break;
-      const parent = dirname(current);
+      const parent = dirname2(current);
       if (parent === current) break;
       current = parent;
     }
@@ -2603,7 +2810,7 @@ function projectDirsUpward(cwd, fs) {
   for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
     dirs.push(current);
     if (fs !== void 0 && hasGitMarker(fs, current)) break;
-    const parent = dirname(current);
+    const parent = dirname2(current);
     if (parent === current) break;
     current = parent;
   }
@@ -2615,15 +2822,15 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const files = [];
   for (const path of paths) {
     const absolute = isAbsolute2(path) ? path : join3(cwd, path);
-    let dir = dirname(absolute);
+    let dir = dirname2(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
-      if (dir === cwd || dir === dirname(dir) || !dir.startsWith(cwd)) break;
+      if (dir === cwd || dir === dirname2(dir) || !dir.startsWith(cwd)) break;
       const filePath = join3(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
       if (file !== void 0) files.push(file);
-      dir = dirname(dir);
+      dir = dirname2(dir);
     }
   }
   return files;
@@ -2887,210 +3094,6 @@ function buildSpec(input, modPath) {
   return spec;
 }
 __name(buildSpec, "buildSpec");
-function gitSeam(runtime) {
-  return {
-    git(args, cwd) {
-      const reply = runtime.run?.("git", args, { cwd, timeoutMs: 3e4 });
-      if (reply === void 0) return { code: 1, stdout: "", stderr: "git is not available" };
-      return {
-        code: typeof reply.code === "number" ? reply.code : reply.ok ? 0 : 1,
-        stdout: String(reply.stdout ?? ""),
-        stderr: String(reply.stderr ?? "")
-      };
-    }
-  };
-}
-__name(gitSeam, "gitSeam");
-function isInside(parent, child) {
-  const root = resolve(parent);
-  const target = resolve(child);
-  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
-}
-__name(isInside, "isInside");
-function firstLine(value) {
-  return value.trim().split("\n")[0].trim();
-}
-__name(firstLine, "firstLine");
-function mainCheckoutRoots(seam, cwd) {
-  const top = seam.git(["rev-parse", "--show-toplevel"], cwd);
-  if (top.code !== 0) return [];
-  const topLevel = firstLine(top.stdout);
-  if (topLevel.length === 0) return [];
-  const roots = [topLevel];
-  const common = seam.git(["rev-parse", "--path-format=absolute", "--git-common-dir"], topLevel);
-  let commonDir = "";
-  if (common.code === 0) {
-    commonDir = firstLine(common.stdout);
-  } else {
-    const plain = seam.git(["rev-parse", "--git-common-dir"], topLevel);
-    if (plain.code === 0) commonDir = resolve(topLevel, firstLine(plain.stdout));
-  }
-  if (commonDir.length > 0 && !isInside(topLevel, commonDir)) roots.push(dirname(commonDir));
-  return roots;
-}
-__name(mainCheckoutRoots, "mainCheckoutRoots");
-function defaultBranch(seam, cwd) {
-  const candidates = [];
-  const head = seam.git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd);
-  if (head.code === 0) {
-    const name = firstLine(head.stdout);
-    if (name.length > 0) candidates.push(name);
-  }
-  candidates.push("main", "master");
-  for (const candidate of candidates) {
-    if (seam.git(["rev-parse", "--verify", "--quiet", candidate], cwd).code === 0) return candidate;
-  }
-  return void 0;
-}
-__name(defaultBranch, "defaultBranch");
-function createJobWorktree(seam, opts) {
-  const roots = mainCheckoutRoots(seam, opts.cwd);
-  if (roots.length === 0) {
-    return { ok: false, error: "isolation: worktree needs a git repository (git rev-parse --show-toplevel failed)" };
-  }
-  const base = defaultBranch(seam, opts.cwd);
-  if (base === void 0) {
-    return {
-      ok: false,
-      error: "isolation: worktree cannot resolve the default branch (no origin/HEAD, main, or master)"
-    };
-  }
-  try {
-    seam.fs.mkdir(dirname(opts.path));
-  } catch (error) {
-    const message = String(error?.message ?? error);
-    return { ok: false, error: `isolation: worktree cannot create ${dirname(opts.path)}: ${message}` };
-  }
-  const added = seam.git(["worktree", "add", "--detach", opts.path, base], roots[0]);
-  if (added.code !== 0) {
-    const reason = firstLine(added.stderr) || firstLine(added.stdout) || `exit ${added.code}`;
-    return { ok: false, error: `isolation: worktree add failed: ${reason}` };
-  }
-  const head = seam.git(["rev-parse", "HEAD"], opts.path);
-  const start = head.code === 0 ? firstLine(head.stdout) : "";
-  return { ok: true, path: opts.path, base, ...start.length > 0 ? { head: start } : {}, mainCheckouts: roots };
-}
-__name(createJobWorktree, "createJobWorktree");
-function worktreeChanged(seam, path, head) {
-  const status = seam.git(["status", "--porcelain"], path);
-  if (status.code !== 0) return void 0;
-  if (status.stdout.trim().length > 0) return true;
-  if (head === void 0) return false;
-  const current = seam.git(["rev-parse", "HEAD"], path);
-  if (current.code !== 0) return void 0;
-  return firstLine(current.stdout) !== head;
-}
-__name(worktreeChanged, "worktreeChanged");
-function finalizeWorktree(seam, record) {
-  if (typeof record.worktree !== "string" || record.worktree.length === 0 || record.worktreeFinalized === true) {
-    return void 0;
-  }
-  const path = record.worktree;
-  if (record.live === true) return { kept: true, path };
-  const changed = worktreeChanged(seam, path, record.worktreeHead);
-  if (changed === void 0) return { kept: true, path, error: "git status failed; kept the worktree" };
-  if (changed) return { kept: true, path };
-  const removed = seam.git(["worktree", "remove", "--force", path], record.worktreeRepo ?? dirname(path));
-  if (removed.code !== 0) {
-    return { kept: true, path, error: `git worktree remove failed: ${firstLine(removed.stderr) || `exit ${removed.code}`}` };
-  }
-  return { kept: false, path };
-}
-__name(finalizeWorktree, "finalizeWorktree");
-function isolationRoots(seam, cwd, spec) {
-  const supplied = (spec?.mainCheckouts ?? []).filter((root) => typeof root === "string" && root.length > 0);
-  const mainCheckouts = supplied.length > 0 ? supplied : mainCheckoutRoots(seam, cwd);
-  const worktree = typeof spec?.worktree === "string" && spec.worktree.length > 0 ? spec.worktree : void 0;
-  if (worktree !== void 0) {
-    return { worktree, mainCheckouts };
-  }
-  if (mainCheckouts.length > 1 && isInside(mainCheckouts[0], cwd)) {
-    return { worktree: mainCheckouts[0], mainCheckouts };
-  }
-  return void 0;
-}
-__name(isolationRoots, "isolationRoots");
-var SHELL_TOOL_NAMES = {
-  bash: true,
-  shell: true,
-  sh: true,
-  monitor: true,
-  powershell: true,
-  pwsh: true
-};
-var NULL_DEVICES = {
-  "/dev/null": true,
-  "/dev/stdout": true,
-  "/dev/stderr": true,
-  "/dev/tty": true
-};
-function namedCwd(input) {
-  for (const key of ["cwd", "workdir", "working_directory", "workingDirectory"]) {
-    const value = input[key];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
-  }
-  return void 0;
-}
-__name(namedCwd, "namedCwd");
-function commandEscapesWorktree(command, roots) {
-  if (/\b(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)\s*=/.test(command)) {
-    return "the command overrides the git directory or work tree";
-  }
-  if (/\bgit\b[^\n;&|]*\s--prefix[=\s]/.test(command)) return "the command overrides git --prefix";
-  const outsideWorktree = command.split(roots.worktree).join("");
-  for (const main of roots.mainCheckouts) {
-    if (outsideWorktree.includes(main)) return `the command names the main checkout (${main})`;
-  }
-  const targets = [];
-  for (const match of command.matchAll(/(?:^|[;&|]\s*|\s)(?:cd|pushd|set-location|sl)\s+(['"]?)([^\s'";|&]+)\1/gi)) {
-    targets.push({ kind: "cd", target: match[2] });
-  }
-  for (const match of command.matchAll(/(?:\d?|&)>>?\|?\s*(['"]?)([^\s'";|&<>]+)\1/g)) {
-    targets.push({ kind: "redirect", target: match[2] });
-  }
-  for (const match of command.matchAll(/\bgit\b[^\n;&|]*(?:-C\s+|--work-tree[=\s]+|--git-dir[=\s]+)(['"]?)([^\s'";|&]+)\1/g)) {
-    targets.push({ kind: "git path", target: match[2] });
-  }
-  for (const { kind, target } of targets) {
-    if (kind === "cd" && (target === "-" || target.startsWith("~"))) {
-      return `a cd to ${target} leaves the worktree`;
-    }
-    if (target.startsWith("$")) continue;
-    const resolved = resolve(roots.worktree, target);
-    if (kind === "cd" && !isInside(roots.worktree, resolved)) {
-      return `a cd to ${target} leaves the worktree (${resolved})`;
-    }
-    if (kind === "redirect" && NULL_DEVICES[resolved] === true) continue;
-    if (kind !== "cd" && !isInside(roots.worktree, resolved)) {
-      return `a ${kind} to ${target} escapes the worktree (${resolved})`;
-    }
-  }
-  return void 0;
-}
-__name(commandEscapesWorktree, "commandEscapesWorktree");
-function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
-  const name = toolName.toLowerCase();
-  if (SHELL_TOOL_NAMES[name] !== true) return void 0;
-  const named = namedCwd(input);
-  const cwd = named === void 0 ? toolCwd : resolve(toolCwd, named);
-  const insideWorktree = isInside(roots.worktree, cwd);
-  if (!insideWorktree) {
-    for (const main of roots.mainCheckouts) {
-      if (!isInside(main, cwd)) continue;
-      return {
-        block: true,
-        reason: `Blocked: this subagent is isolated in its worktree (${roots.worktree}); a command in the main checkout (${cwd}) is not allowed. Run it inside the worktree.`
-      };
-    }
-  }
-  if (name === "powershell" || name === "pwsh") return void 0;
-  const command = [input.command, input.script, input.cmd].find((value) => typeof value === "string");
-  if (command === void 0) return void 0;
-  const escape = commandEscapesWorktree(command, roots);
-  if (escape === void 0) return void 0;
-  return { block: true, reason: `Blocked: ${escape}. This subagent is isolated in ${roots.worktree}.` };
-}
-__name(guardToolCall, "guardToolCall");
 function resolveModel(input = {}) {
   const env = input.env ?? {};
   const envModel = nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
@@ -3692,12 +3695,12 @@ function index_default(cmd, overrides = {}) {
     if (!workerMode) return void 0;
     try {
       const spec = JSON.parse(String(runtime.env[WORKER_SPEC_ENV] ?? ""));
-      return typeof spec.inboxDir === "string" ? dirname(spec.inboxDir) : void 0;
+      return typeof spec.inboxDir === "string" ? dirname2(spec.inboxDir) : void 0;
     } catch {
       return void 0;
     }
   })();
-  const root = workerRoot ?? resolve(pick("subagent_dir", SUBAGENT_DIR_DEFAULT, "pubsub_dir", PUBSUB_DIR_DEFAULT));
+  const root = workerRoot ?? resolve2(pick("subagent_dir", SUBAGENT_DIR_DEFAULT, "pubsub_dir", PUBSUB_DIR_DEFAULT));
   const forkMode = resolveForkMode({
     interactive: runtime.interactive === true,
     env: runtime.env,
@@ -3849,7 +3852,7 @@ function index_default(cmd, overrides = {}) {
         break;
       } catch {
       }
-      const parent = dirname(current);
+      const parent = dirname2(current);
       if (parent === current) break;
       current = parent;
     }
@@ -4284,7 +4287,7 @@ ${next2}`;
     if (job?.worktreeKept === true) return;
     if (worktreeChanged(git, path) !== false) return;
     const roots = mainCheckoutRoots(git, path);
-    const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname(path);
+    const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname2(path);
     git.git(["worktree", "remove", "--force", path], repo);
   }
   __name(discardCleanWorktree, "discardCleanWorktree");
