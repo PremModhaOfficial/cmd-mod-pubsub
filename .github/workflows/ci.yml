@@ -20,8 +20,13 @@ jobs:
         with:
           node-version: 24
 
-      - name: Run smoke test
-        run: node test/smoke.mjs
+      - name: Install dependencies
+        run: npm ci
+
+      # Build the bundle from `src/`, fail if the committed root artifact is
+      # stale, then run the bundle contract test and the smoke suite.
+      - name: Run gate
+        run: npm run gate
 
       # The end-to-end suite needs a signed-in cmd and network, so CI only proves
       # that it parses. Run it locally with `node test/e2e.mjs`.

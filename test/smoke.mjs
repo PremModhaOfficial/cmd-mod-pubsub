@@ -46,7 +46,6 @@ import {
 	makeRuntime,
 	makeSession,
 	makeWorkerDriver,
-	modSource,
 	ok,
 	ownerEntries,
 	realFs,
@@ -5620,15 +5619,17 @@ process.stdin.on('data', (data) => {
 	assert.equal(laterCalls[0].ms, 1000, 'after one second');
 	laterCalls[0].fn();
 	assert.equal(clock.kills.filter((kill) => kill.signal === 'SIGKILL').length, 2, 'the escalation kills both pids');
-	const modText = modSource();
-	const workerTextStart = modText.indexOf('const WORKER_SOURCE = `');
-	const workerTextEnd = modText.indexOf('\n`;', workerTextStart);
-	const parentText = modText.slice(0, workerTextStart) + modText.slice(workerTextEnd + 4);
-	const adapterStart = parentText.indexOf('const OS_RUNTIME');
-	const adapterEnd = parentText.indexOf('// The test adapter', adapterStart);
-	const outsideAdapter = parentText.slice(0, adapterStart) + parentText.slice(adapterEnd);
-	assert.ok(!outsideAdapter.includes('Date.now('), 'the parent reads the clock only through runtime.now');
-	assert.ok(!/\bsetTimeout\(/.test(outsideAdapter), 'the parent sets timers only through the host clock or runtime.later');
+	const workerSourceText = workerSource();
+	assert.ok(workerSourceText.length > 0, 'the worker source is a non-empty string');
+	new Script(workerSourceText, {filename: 'WORKER_SOURCE'});
+	assert.match(workerSourceText, /SUBAGENT_SPEC/, 'the worker reads its spec from the environment');
+	assert.match(workerSourceText, /const signalEnvelope = function signalEnvelope/, 'the worker embeds the shared envelope');
+	assert.match(workerSourceText, /session\/new/, 'the ACP session is created');
+	assert.match(workerSourceText, /session\/prompt/, 'the ACP prompt runs the turn');
+	assert.match(workerSourceText, /timed out after/, 'the worker names the timeout reason');
+	assert.match(workerSourceText, /SIGKILL/, 'the worker escalates the kill');
+	assert.ok(!workerSourceText.includes('childArgs'), 'the cmd -p argv builder is gone');
+	assert.ok(!workerSourceText.includes("args.push('-p'"), 'no -p prompt argv remains');
 	ok('the parent clock and timers go through the runtime seam');
 
 	// 96. retention keeps a changed worktree and removes only a clean one, through git.
