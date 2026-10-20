@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname3, isAbsolute as isAbsolute2, join as join9, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute2, join as join10, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -103,6 +103,927 @@ var FOREGROUND_WAIT_MAX_MS = 30 * 60 * 1e3;
 var FOREGROUND_POLL_MS = 200;
 var AGENT_API_ERROR = "Agent terminated early due to an API error";
 
+// src/definitions.ts
+import { dirname, join as join2 } from "node:path";
+var AGENT_SCOPES = ["managed", "cli", "project", "user", "plugin", "builtin"];
+var MEMORY_SCOPES = { user: "user", project: "project", local: "local" };
+function parseYamlScalar(raw) {
+  const text = raw.trim();
+  if (text.length === 0) return { ok: true, value: void 0 };
+  if (text.startsWith("[")) {
+    if (!text.endsWith("]")) return { ok: false, reason: "unclosed flow sequence" };
+    const inner = text.slice(1, -1).trim();
+    if (inner.length === 0) return { ok: true, value: [] };
+    const items = [];
+    let current = "";
+    let quote = "";
+    for (const char of inner) {
+      if (quote.length > 0) {
+        current += char;
+        if (char === quote) quote = "";
+        continue;
+      }
+      if (char === '"' || char === "'") {
+        quote = char;
+        current += char;
+        continue;
+      }
+      if (char === ",") {
+        items.push(current.trim());
+        current = "";
+        continue;
+      }
+      current += char;
+    }
+    if (quote.length > 0) return { ok: false, reason: "unterminated quoted scalar" };
+    items.push(current.trim());
+    const values = [];
+    for (const item of items) {
+      if (item.length === 0) return { ok: false, reason: "empty flow sequence item" };
+      const parsed = parseYamlScalar(item);
+      if (parsed.ok === false) return parsed;
+      values.push(parsed.value);
+    }
+    return { ok: true, value: values };
+  }
+  if (text.startsWith("{")) {
+    if (!text.endsWith("}")) return { ok: false, reason: "unclosed flow mapping" };
+    return { ok: true, value: null };
+  }
+  if (text.startsWith('"')) {
+    if (text.length < 2 || !text.endsWith('"')) return { ok: false, reason: "unterminated double-quoted scalar" };
+    try {
+      return { ok: true, value: JSON.parse(text) };
+    } catch {
+      return { ok: false, reason: "bad escape in double-quoted scalar" };
+    }
+  }
+  if (text.startsWith("'")) {
+    if (text.length < 2 || !text.endsWith("'")) return { ok: false, reason: "unterminated single-quoted scalar" };
+    return { ok: true, value: text.slice(1, -1).replaceAll("''", "'") };
+  }
+  const comment = text.search(/\s#/);
+  const bare = (comment >= 0 ? text.slice(0, comment) : text).trim();
+  if (bare === "true") return { ok: true, value: true };
+  if (bare === "false") return { ok: true, value: false };
+  if (bare === "null" || bare === "~") return { ok: true, value: void 0 };
+  return { ok: true, value: bare };
+}
+__name(parseYamlScalar, "parseYamlScalar");
+function normalizeNestedLines(raw) {
+  const lines = raw.filter((line) => line.trim().length > 0 && !line.trim().startsWith("#")).map((line) => {
+    const indent = line.length - line.trimStart().length;
+    return { indent, text: line.slice(indent).replace(/\s+$/, "") };
+  });
+  if (lines.length === 0) return lines;
+  const margin = Math.min(...lines.map((line) => line.indent));
+  return lines.map((line) => ({ indent: line.indent - margin, text: line.text }));
+}
+__name(normalizeNestedLines, "normalizeNestedLines");
+var isSequenceLine = /* @__PURE__ */ __name((text) => text === "-" || text.startsWith("- "), "isSequenceLine");
+var MAP_LINE = /^([A-Za-z0-9_.-]+):(?:[ \t]+(.*))?$/;
+function parseYamlNode(lines, start, indent) {
+  const first = lines[start];
+  if (first === void 0) return { ok: true, value: void 0, next: start };
+  return isSequenceLine(first.text) ? parseYamlSequence(lines, start, indent) : parseYamlMapping(lines, start, indent);
+}
+__name(parseYamlNode, "parseYamlNode");
+function parseYamlSequence(lines, start, indent) {
+  const values = [];
+  let index = start;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.indent < indent) break;
+    if (line.indent > indent) return { ok: false, reason: `unexpected indentation` };
+    if (!isSequenceLine(line.text)) break;
+    const rest = line.text === "-" ? "" : line.text.slice(2);
+    const trimmed = rest.trim();
+    if (trimmed.length === 0) {
+      const next = lines[index + 1];
+      if (next !== void 0 && next.indent > indent) {
+        const nested = parseYamlNode(lines, index + 1, next.indent);
+        if (!nested.ok) return nested;
+        values.push(nested.value);
+        index = nested.next;
+      } else {
+        values.push(null);
+        index += 1;
+      }
+      continue;
+    }
+    const map = MAP_LINE.exec(trimmed);
+    if (map !== null) {
+      const base = indent + (line.text.length - trimmed.length);
+      const itemLines = [{ indent: base, text: trimmed }];
+      let cursor = index + 1;
+      while (cursor < lines.length && lines[cursor].indent > indent) {
+        itemLines.push(lines[cursor]);
+        cursor += 1;
+      }
+      const nested = parseYamlNode(itemLines, 0, base);
+      if (!nested.ok) return nested;
+      values.push(nested.value);
+      index = cursor;
+      continue;
+    }
+    const parsed = parseYamlScalar(trimmed);
+    if (parsed.ok === false) return parsed;
+    values.push(parsed.value);
+    index += 1;
+  }
+  return { ok: true, value: values, next: index };
+}
+__name(parseYamlSequence, "parseYamlSequence");
+function parseYamlMapping(lines, start, indent) {
+  const value = {};
+  let index = start;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (line.indent < indent) break;
+    if (line.indent > indent) return { ok: false, reason: "unexpected indentation" };
+    const match = MAP_LINE.exec(line.text);
+    if (match === null) return { ok: false, reason: `expected key: value, got "${line.text.slice(0, 40)}"` };
+    const key = match[1];
+    const inline = (match[2] ?? "").trim();
+    if (Object.hasOwn(value, key)) return { ok: false, reason: `duplicate key "${key}"` };
+    const next = lines[index + 1];
+    if (inline.length > 0) {
+      if (next !== void 0 && next.indent > indent) {
+        return { ok: false, reason: `unexpected indentation under "${key}"` };
+      }
+      const parsed = parseYamlScalar(inline);
+      if (parsed.ok === false) return parsed;
+      value[key] = parsed.value;
+      index += 1;
+      continue;
+    }
+    if (next !== void 0 && next.indent > indent) {
+      const nested = parseYamlNode(lines, index + 1, next.indent);
+      if (!nested.ok) return nested;
+      value[key] = nested.value;
+      index = nested.next;
+      continue;
+    }
+    value[key] = void 0;
+    index += 1;
+  }
+  return { ok: true, value, next: index };
+}
+__name(parseYamlMapping, "parseYamlMapping");
+function parseFrontmatter(source) {
+  const text = source.startsWith("\uFEFF") ? source.slice(1) : source;
+  const lines = text.split("\n");
+  if (lines[0]?.trim() !== "---") return { ok: false, reason: "frontmatter must start with --- on the first line" };
+  let close = -1;
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === "---") {
+      close = index;
+      break;
+    }
+  }
+  if (close < 0) return { ok: false, reason: "frontmatter is not closed" };
+  const blocks = [];
+  for (let index = 1; index < close; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (trimmed.length === 0 || trimmed.startsWith("#")) {
+      if (blocks.length > 0) blocks[blocks.length - 1].lines.push("");
+      continue;
+    }
+    if (line.startsWith("	")) return { ok: false, reason: "tab indentation is not valid YAML" };
+    const indent = line.length - line.trimStart().length;
+    if (indent > 0) {
+      if (blocks.length === 0) return { ok: false, reason: "unexpected indentation" };
+      blocks[blocks.length - 1].lines.push(line);
+      continue;
+    }
+    const match = /^([A-Za-z0-9_.-]+):(.*)$/.exec(line);
+    if (match === null) return { ok: false, reason: `expected key: value, got "${line.slice(0, 40)}"` };
+    blocks.push({ key: match[1], inline: match[2].trim(), lines: [] });
+  }
+  const fields = {};
+  for (const block of blocks) {
+    if (Object.hasOwn(fields, block.key)) return { ok: false, reason: `duplicate key "${block.key}"` };
+    const blockScalar = block.inline === "|" || block.inline === "|-" || block.inline === ">" || block.inline === ">-";
+    if (blockScalar) {
+      const filled = block.lines.filter((line) => line.trim().length > 0);
+      const margin = filled.length === 0 ? 0 : Math.min(...filled.map((line) => line.length - line.trimStart().length));
+      const body = block.lines.map((line) => line.trim().length === 0 ? "" : line.slice(margin).replace(/\s+$/, ""));
+      fields[block.key] = (block.inline.startsWith(">") ? body.join(" ") : body.join("\n")).replace(/^\n+|\n+$/g, "");
+      continue;
+    }
+    const hasNested = block.lines.some((line) => line.trim().length > 0);
+    if (block.inline.length === 0 && hasNested) {
+      const parsed2 = parseYamlNode(normalizeNestedLines(block.lines), 0, 0);
+      if (parsed2.ok === false) return parsed2;
+      fields[block.key] = parsed2.value;
+      continue;
+    }
+    if (hasNested) {
+      return { ok: false, reason: `unexpected indentation under "${block.key}"` };
+    }
+    if (block.inline.length === 0) {
+      fields[block.key] = void 0;
+      continue;
+    }
+    const parsed = parseYamlScalar(block.inline);
+    if (parsed.ok === false) return parsed;
+    fields[block.key] = parsed.value;
+  }
+  return { ok: true, fields, body: lines.slice(close + 1).join("\n").replace(/^\r?\n/, "").trimEnd() };
+}
+__name(parseFrontmatter, "parseFrontmatter");
+function listField(value) {
+  if (value === void 0 || value === null) return void 0;
+  if (Array.isArray(value)) {
+    const items = value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
+    return items.length > 0 ? items : void 0;
+  }
+  if (typeof value !== "string") return void 0;
+  const text = value.trim();
+  if (text.length === 0) return void 0;
+  if (text === "*") return ["*"];
+  return text.split(",").map((item) => item.trim()).filter(Boolean);
+}
+__name(listField, "listField");
+function stringField(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
+}
+__name(stringField, "stringField");
+function booleanField(value) {
+  if (typeof value === "boolean") return value;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  return void 0;
+}
+__name(booleanField, "booleanField");
+function numberField(value) {
+  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : void 0;
+}
+__name(numberField, "numberField");
+function stringMapField(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const out = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (typeof raw !== "string") continue;
+    out[key] = raw;
+  }
+  return Object.keys(out).length > 0 ? out : void 0;
+}
+__name(stringMapField, "stringMapField");
+function serverFields(value) {
+  const command = stringField(value.command);
+  const url = stringField(value.url);
+  const args = listField(value.args);
+  const env = stringMapField(value.env);
+  if (command === void 0 && url === void 0) return void 0;
+  return {
+    ...command !== void 0 ? { command } : {},
+    ...args !== void 0 ? { args } : {},
+    ...env !== void 0 ? { env } : {},
+    ...url !== void 0 ? { url } : {}
+  };
+}
+__name(serverFields, "serverFields");
+function parseMcpServers(value) {
+  const out = [];
+  if (typeof value === "string") {
+    const name = stringField(value);
+    return name === void 0 ? void 0 : [{ name }];
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (typeof item === "string") {
+        const name2 = stringField(item);
+        if (name2 !== void 0) out.push({ name: name2 });
+        continue;
+      }
+      if (item === null || typeof item !== "object") continue;
+      const record = item;
+      const name = stringField(record.name) ?? stringField(record.server);
+      if (name === void 0) continue;
+      out.push({ name, ...serverFields(record) });
+    }
+  } else if (value !== null && typeof value === "object") {
+    for (const [name, config] of Object.entries(value)) {
+      const clean = name.trim();
+      if (clean.length === 0) continue;
+      if (config === null || config === void 0 || config === true) {
+        out.push({ name: clean });
+        continue;
+      }
+      if (typeof config === "string") {
+        out.push({ name: clean, command: config });
+        continue;
+      }
+      if (typeof config === "object" && !Array.isArray(config)) {
+        out.push({ name: clean, ...serverFields(config) });
+      }
+    }
+  }
+  return out.length > 0 ? out : void 0;
+}
+__name(parseMcpServers, "parseMcpServers");
+function hookRule(value, inheritedMatcher) {
+  if (typeof value === "string") {
+    const command2 = value.trim();
+    return command2.length === 0 ? [] : [{ command: command2, ...inheritedMatcher !== void 0 ? { matcher: inheritedMatcher } : {} }];
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
+  const record = value;
+  const matcher = stringField(record.matcher) ?? inheritedMatcher;
+  const nested = record.hooks;
+  if (nested !== void 0) {
+    return Array.isArray(nested) ? nested.flatMap((item) => hookRule(item, matcher)) : hookRule(nested, matcher);
+  }
+  const command = stringField(record.command);
+  if (command === void 0) return [];
+  const seconds = numberField(record.timeout);
+  return [
+    {
+      command,
+      ...matcher !== void 0 ? { matcher } : {},
+      ...seconds !== void 0 ? { timeoutMs: seconds * 1e3 } : {}
+    }
+  ];
+}
+__name(hookRule, "hookRule");
+function hookList(value) {
+  const rules = (Array.isArray(value) ? value : [value]).flatMap((item) => hookRule(item));
+  return rules.length > 0 ? rules : void 0;
+}
+__name(hookList, "hookList");
+function parseHooks(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const byEvent = {};
+  for (const [event, raw] of Object.entries(value)) {
+    const normalized = event.replace(/[^a-z]/gi, "").toLowerCase();
+    const key = normalized === "pretooluse" ? "PreToolUse" : normalized === "posttooluse" ? "PostToolUse" : normalized === "stop" || normalized === "subagentstop" ? "Stop" : void 0;
+    if (key === void 0) continue;
+    const rules = hookList(raw);
+    if (rules !== void 0) byEvent[key] = [...byEvent[key] ?? [], ...rules];
+  }
+  return Object.keys(byEvent).length > 0 ? byEvent : void 0;
+}
+__name(parseHooks, "parseHooks");
+function parseCacheTtl(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
+  const ttl = stringField(value.cacheTtl);
+  return ttl === "5m" || ttl === "1h" ? ttl : void 0;
+}
+__name(parseCacheTtl, "parseCacheTtl");
+function validateAgentName(name) {
+  if ([...name].length > AGENT_NAME_MAX) return `name: must be at most ${AGENT_NAME_MAX} characters`;
+  if (name.includes(":")) return 'name: must not contain ":" (plugin-scoped identifiers reserve it)';
+  if (name.startsWith("-")) return 'name: must not start with "-"';
+  return void 0;
+}
+__name(validateAgentName, "validateAgentName");
+function fallbackBody(source) {
+  const text = source.startsWith("\uFEFF") ? source.slice(1) : source;
+  const lines = text.split("\n");
+  if (lines[0]?.trim() !== "---") return text.trim();
+  for (let index = 1; index < lines.length; index += 1) {
+    if (lines[index].trim() === "---") return lines.slice(index + 1).join("\n").trim();
+  }
+  return text.trim();
+}
+__name(fallbackBody, "fallbackBody");
+function fallbackDescription(body, name) {
+  const line = body.split("\n").map((part) => part.trim()).find((part) => part.length > 0);
+  return line !== void 0 ? line.slice(0, 200) : `Plugin agent ${name}`;
+}
+__name(fallbackDescription, "fallbackDescription");
+function pluginFallbackDefinition(body, path, options) {
+  const raw = options.fallbackName !== void 0 && options.fallbackName.length > 0 ? options.fallbackName : "agent";
+  const name = `${options.scopedPrefix ?? ""}${raw}`;
+  const definition = {
+    name,
+    description: fallbackDescription(body, name),
+    prompt: body,
+    scope: "plugin",
+    sourcePath: path
+  };
+  if (options.pluginName !== void 0) definition.plugin = options.pluginName;
+  return definition;
+}
+__name(pluginFallbackDefinition, "pluginFallbackDefinition");
+function agentDefinitionFromSource(source, path, scope, options = {}) {
+  const frontmatter = parseFrontmatter(source);
+  if (frontmatter.ok === false) {
+    if (options.plugin !== true) return frontmatter;
+    return {
+      ok: true,
+      definition: pluginFallbackDefinition(fallbackBody(source), path, options),
+      warning: `frontmatter: ${frontmatter.reason}; loaded under its filename`
+    };
+  }
+  const fields = frontmatter.fields;
+  const fallbackDefinition = /* @__PURE__ */ __name((warning) => {
+    const definition2 = pluginFallbackDefinition(frontmatter.body, path, options);
+    const parsedDescription = stringField(fields.description);
+    if (parsedDescription !== void 0) definition2.description = parsedDescription;
+    return { ok: true, definition: definition2, warning };
+  }, "fallbackDefinition");
+  const rawName = stringField(fields.name) ?? "";
+  if (rawName.length === 0) {
+    if (options.plugin !== true) return { ok: false, reason: "name: required" };
+    return fallbackDefinition("name: required; loaded under its filename");
+  }
+  const nameError = validateAgentName(rawName);
+  if (nameError !== void 0) {
+    if (options.plugin !== true) return { ok: false, reason: nameError };
+    return fallbackDefinition(`${nameError}; loaded under its filename`);
+  }
+  const name = options.scopedPrefix !== void 0 ? `${options.scopedPrefix}${rawName}` : rawName;
+  const description = stringField(fields.description);
+  if (description === void 0) return { ok: false, reason: "description: required" };
+  const definition = {
+    name,
+    description,
+    prompt: frontmatter.body,
+    scope,
+    sourcePath: path
+  };
+  if (options.pluginName !== void 0) definition.plugin = options.pluginName;
+  const tools = listField(fields.tools);
+  const disallowed = listField(fields.disallowedTools);
+  const skills = listField(fields.skills);
+  if (tools !== void 0) definition.tools = tools;
+  if (disallowed !== void 0) definition.disallowedTools = disallowed;
+  const model = stringField(fields.model);
+  const permissionMode = stringField(fields.permissionMode);
+  const maxTurns = numberField(fields.maxTurns);
+  const isolation = stringField(fields.isolation);
+  const color = stringField(fields.color);
+  const effort = stringField(fields.effort);
+  if (model !== void 0) definition.model = model;
+  if (permissionMode !== void 0 && options.plugin !== true) definition.permissionMode = permissionMode;
+  if (maxTurns !== void 0) definition.maxTurns = maxTurns;
+  if (skills !== void 0) definition.skills = skills;
+  if (isolation !== void 0) definition.isolation = isolation;
+  if (color !== void 0) definition.color = color;
+  if (effort !== void 0) definition.effort = effort;
+  const background = booleanField(fields.background);
+  const omitClaudeMd = booleanField(fields.omitClaudeMd);
+  const memory = typeof fields.memory === "string" ? MEMORY_SCOPES[fields.memory] : void 0;
+  if (background !== void 0) definition.background = background;
+  if (omitClaudeMd !== void 0) definition.omitClaudeMd = omitClaudeMd;
+  if (memory !== void 0) definition.memory = memory;
+  if (options.plugin !== true) {
+    const mcpServers = parseMcpServers(fields.mcpServers);
+    const hooks = parseHooks(fields.hooks);
+    const initialPrompt = stringField(fields.initialPrompt);
+    if (mcpServers !== void 0) definition.mcpServers = mcpServers;
+    if (hooks !== void 0) definition.hooks = hooks;
+    if (initialPrompt !== void 0) definition.initialPrompt = initialPrompt;
+  }
+  const autoCompactWindow = numberField(fields.autoCompactWindow);
+  const cacheTtl = parseCacheTtl(fields.experimental);
+  if (autoCompactWindow !== void 0) definition.autoCompactWindow = autoCompactWindow;
+  if (cacheTtl !== void 0) definition.cacheTtl = cacheTtl;
+  return { ok: true, definition };
+}
+__name(agentDefinitionFromSource, "agentDefinitionFromSource");
+var BUILTIN_AGENT_DEFINITIONS = [
+  {
+    name: "explore",
+    description: "Read-only codebase exploration: find files, symbols, and call paths.",
+    prompt: "You are a read-only codebase explorer. Find the files, symbols, and call paths that answer the question. Do not edit anything. Report concrete paths with line numbers and a short summary of the call flow. Be quick by default; go deeper only when the task needs it.",
+    scope: "builtin",
+    sourcePath: "",
+    tools: ["Read", "Grep", "Glob"],
+    model: "inherit",
+    permissionMode: "plan",
+    readOnly: true,
+    oneShot: true
+  },
+  {
+    name: "plan",
+    description: "Read-only design: turn findings into an implementation plan.",
+    prompt: "You are a planning agent. Explore the codebase read-only, identify the constraints, then return a concrete implementation plan: the files to change, the ordered steps, the risks, and the tests. Do not implement.",
+    scope: "builtin",
+    sourcePath: "",
+    tools: ["Read", "Grep", "Glob"],
+    model: "inherit",
+    permissionMode: "plan",
+    readOnly: true,
+    oneShot: true
+  },
+  {
+    name: "general-purpose",
+    description: "General-purpose agent for multi-step tasks. The fallback when no subagent_type is given.",
+    prompt: "You are a general-purpose autonomous agent. You receive one self-contained task, complete it fully, and report back once at the end. Work autonomously: you cannot ask follow-up questions, so make reasonable assumptions and state them in the final report. Use the minimum set of tool calls that gets the job done correctly.",
+    scope: "builtin",
+    sourcePath: ""
+  },
+  {
+    name: "claude",
+    description: "Catch-all coding agent for a task that fits no specialized definition.",
+    prompt: "You are a general-purpose coding agent. Complete the assigned task end to end, then report what changed and how it was verified.",
+    scope: "builtin",
+    sourcePath: ""
+  },
+  {
+    name: "statusline-setup",
+    description: "Configure the status line. Used by /statusline; restricted to settings files.",
+    prompt: "You configure the Command Code status line. Read the current settings, change only the statusLine entry, and report the file you edited. Do not run shell commands.",
+    scope: "builtin",
+    sourcePath: "",
+    model: "sonnet",
+    tools: ["Read", "Edit"]
+  },
+  {
+    name: "claude-code-guide",
+    description: "Answer questions about the host's features, commands, and configuration.",
+    prompt: "You answer questions about Command Code: agents, tools, hooks, permissions, MCP, and settings. Read the local documentation first, then the official pages when the local copy is silent. Answer with the exact flag or field name.",
+    scope: "builtin",
+    sourcePath: "",
+    model: "haiku",
+    tools: ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
+  },
+  {
+    name: FORK_AGENT_TYPE,
+    description: "Fork the current conversation: full history, the main system prompt, tools, model, permissions, and prompt cache. Use it when the task needs the context already in this session.",
+    prompt: "",
+    scope: "builtin",
+    sourcePath: "",
+    fork: true
+  }
+];
+function builtinAgentDefinitions(env) {
+  if (env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_BUILTIN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_BUILTINS === "1") {
+    return [];
+  }
+  if (env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_EXPLORE_PLAN === "1") {
+    return BUILTIN_AGENT_DEFINITIONS.filter((definition) => definition.name !== "explore" && definition.name !== "plan");
+  }
+  return [...BUILTIN_AGENT_DEFINITIONS];
+}
+__name(builtinAgentDefinitions, "builtinAgentDefinitions");
+var DESCRIPTION_LIMIT_TOKENS = 15e3;
+function descriptionLimit(definitions, maxTokens = DESCRIPTION_LIMIT_TOKENS) {
+  let characters = 0;
+  for (const definition of definitions) {
+    if (definition.scope === "builtin") continue;
+    characters += String(definition.description ?? "").length;
+  }
+  const tokens = Math.ceil(characters / 4);
+  return { tokens, maxTokens, over: tokens > maxTokens };
+}
+__name(descriptionLimit, "descriptionLimit");
+function cliAgentDefinition(rawName, spec, sourcePath) {
+  const name = rawName.length > 0 ? rawName : stringField(spec.name) ?? "";
+  if (name.length === 0) return { ok: false, reason: "name: required" };
+  const nameError = validateAgentName(name);
+  if (nameError !== void 0) return { ok: false, reason: nameError };
+  const description = stringField(spec.description);
+  if (description === void 0) return { ok: false, reason: "description: required" };
+  const prompt = typeof spec.prompt === "string" ? spec.prompt : typeof spec.systemPrompt === "string" ? spec.systemPrompt : "";
+  const definition = { name, description, prompt, scope: "cli", sourcePath };
+  const tools = listField(spec.tools);
+  const disallowed = listField(spec.disallowedTools);
+  const skills = listField(spec.skills);
+  if (tools !== void 0) definition.tools = tools;
+  if (disallowed !== void 0) definition.disallowedTools = disallowed;
+  if (skills !== void 0) definition.skills = skills;
+  const model = stringField(spec.model);
+  const permissionMode = stringField(spec.permissionMode);
+  const maxTurns = numberField(spec.maxTurns);
+  const isolation = stringField(spec.isolation);
+  const effort = stringField(spec.effort);
+  if (model !== void 0) definition.model = model;
+  if (permissionMode !== void 0) definition.permissionMode = permissionMode;
+  if (maxTurns !== void 0) definition.maxTurns = maxTurns;
+  if (isolation !== void 0) definition.isolation = isolation;
+  if (effort !== void 0) definition.effort = effort;
+  const background = booleanField(spec.background);
+  const omitClaudeMd = booleanField(spec.omitClaudeMd);
+  const memory = typeof spec.memory === "string" ? MEMORY_SCOPES[spec.memory] : void 0;
+  if (background !== void 0) definition.background = background;
+  if (omitClaudeMd !== void 0) definition.omitClaudeMd = omitClaudeMd;
+  if (memory !== void 0) definition.memory = memory;
+  const mcpServers = parseMcpServers(spec.mcpServers);
+  const hooks = parseHooks(spec.hooks);
+  const initialPrompt = stringField(spec.initialPrompt);
+  const autoCompactWindow = numberField(spec.autoCompactWindow);
+  if (mcpServers !== void 0) definition.mcpServers = mcpServers;
+  if (hooks !== void 0) definition.hooks = hooks;
+  if (initialPrompt !== void 0) definition.initialPrompt = initialPrompt;
+  if (autoCompactWindow !== void 0) definition.autoCompactWindow = autoCompactWindow;
+  return { ok: true, definition };
+}
+__name(cliAgentDefinition, "cliAgentDefinition");
+function hasGitMarker(fs, dir) {
+  try {
+    fs.stat(join2(dir, ".git"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+__name(hasGitMarker, "hasGitMarker");
+function createAgentRegistry(deps) {
+  let entries = [];
+  const loggedSkips = /* @__PURE__ */ new Set();
+  const definitionWarnings = /* @__PURE__ */ new WeakMap();
+  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join2(deps.home, ".commandcode", "managed"), "managedDir");
+  function pushEntry(entry) {
+    entries.push(entry);
+    const problem = entry.warning ?? entry.reason;
+    if (problem === void 0) return;
+    const key = `${entry.sourcePath}\0${problem}`;
+    if (loggedSkips.has(key)) return;
+    loggedSkips.add(key);
+    deps.log(`${entry.sourcePath.length > 0 ? entry.sourcePath : entry.name}: ${problem}`);
+  }
+  __name(pushEntry, "pushEntry");
+  function scanFile(path, scope, options = {}) {
+    let source = "";
+    try {
+      source = deps.fs.readFile(path);
+    } catch (error) {
+      pushEntry({
+        name: "",
+        scope,
+        sourcePath: path,
+        valid: false,
+        kind: "invalid",
+        reason: `unreadable: ${String(error?.message ?? error)}`
+      });
+      return void 0;
+    }
+    const parsed = agentDefinitionFromSource(source, path, scope, options);
+    if (parsed.ok === false) {
+      pushEntry({ name: "", scope, sourcePath: path, valid: false, kind: "invalid", reason: parsed.reason });
+      return void 0;
+    }
+    if (parsed.warning !== void 0) definitionWarnings.set(parsed.definition, parsed.warning);
+    return parsed.definition;
+  }
+  __name(scanFile, "scanFile");
+  function pushDuplicate(name, scope, path, kept) {
+    pushEntry({
+      name,
+      scope,
+      sourcePath: path,
+      valid: false,
+      kind: "duplicate",
+      duplicateOf: kept,
+      reason: `duplicate name "${name}": ${kept} was read first; rename or remove this file`
+    });
+  }
+  __name(pushDuplicate, "pushDuplicate");
+  function scanDir(dir, scope, depth, found, localNames) {
+    if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
+    let names = [];
+    try {
+      names = deps.fs.readdir(dir).sort();
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (entries.length >= AGENT_SCAN_MAX) return;
+      const full = join2(dir, name);
+      if (name.toLowerCase().endsWith(".md")) {
+        const definition = scanFile(full, scope);
+        if (definition === void 0) continue;
+        const kept = localNames.get(definition.name);
+        if (kept !== void 0) {
+          pushDuplicate(definition.name, scope, full, kept);
+          continue;
+        }
+        localNames.set(definition.name, full);
+        found.push(definition);
+        continue;
+      }
+      if (deps.fs.exists(full)) scanDir(full, scope, depth + 1, found, localNames);
+    }
+  }
+  __name(scanDir, "scanDir");
+  function scanPluginDir(dir, pluginName, trail, depth, found, localNames) {
+    if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
+    let children = [];
+    try {
+      children = deps.fs.readdir(dir).sort();
+    } catch {
+      return;
+    }
+    for (const child of children) {
+      if (entries.length >= AGENT_SCAN_MAX) return;
+      const full = join2(dir, child);
+      if (child.toLowerCase().endsWith(".md")) {
+        const definition = scanFile(full, "plugin", {
+          plugin: true,
+          pluginName,
+          scopedPrefix: `${[pluginName, ...trail].join(":")}:`,
+          fallbackName: child.replace(/\.md$/i, "")
+        });
+        if (definition === void 0) continue;
+        const kept = localNames.get(definition.name);
+        if (kept !== void 0) {
+          pushDuplicate(definition.name, "plugin", full, kept);
+          continue;
+        }
+        localNames.set(definition.name, full);
+        found.push(definition);
+        continue;
+      }
+      scanPluginDir(full, pluginName, [...trail, child], depth + 1, found, localNames);
+    }
+  }
+  __name(scanPluginDir, "scanPluginDir");
+  function scanPlugins(root, found) {
+    if (!deps.fs.exists(root)) return;
+    let pluginNames = [];
+    try {
+      pluginNames = deps.fs.readdir(root).sort();
+    } catch {
+      return;
+    }
+    for (const pluginName of pluginNames) {
+      const agentsDir = join2(root, pluginName, "agents");
+      if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
+    }
+  }
+  __name(scanPlugins, "scanPlugins");
+  function projectBases() {
+    const bases = [];
+    let current = deps.cwd;
+    for (let depth = 0; depth <= 64; depth += 1) {
+      bases.push(current);
+      if (hasGitMarker(deps.fs, current)) break;
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+    return bases;
+  }
+  __name(projectBases, "projectBases");
+  function pluginRoots() {
+    const roots = [...deps.pluginRoots ?? []];
+    roots.push(join2(managedDir(), "plugins"));
+    for (const base of projectBases()) roots.push(join2(base, ".commandcode", "plugins"));
+    roots.push(join2(deps.home, ".commandcode", "plugins"));
+    return roots;
+  }
+  __name(pluginRoots, "pluginRoots");
+  function scanCli(found) {
+    const value = (deps.cli?.value ?? "").trim();
+    if (value.length === 0) return;
+    let text = value;
+    let sourcePath = "cli";
+    if (!value.startsWith("{") && !value.startsWith("[")) {
+      const file = value.startsWith("@") ? value.slice(1) : value;
+      if (deps.cli?.interactive === true) {
+        pushEntry({
+          name: "",
+          scope: "cli",
+          sourcePath: file,
+          valid: false,
+          kind: "invalid",
+          reason: "an interactive session cannot load --mod-option agents from a file; pass inline JSON"
+        });
+        return;
+      }
+      try {
+        text = deps.fs.readFile(file);
+      } catch (error) {
+        pushEntry({
+          name: "",
+          scope: "cli",
+          sourcePath: file,
+          valid: false,
+          kind: "invalid",
+          reason: `unreadable: ${String(error?.message ?? error)}`
+        });
+        return;
+      }
+      sourcePath = file;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (error) {
+      pushEntry({
+        name: "",
+        scope: "cli",
+        sourcePath,
+        valid: false,
+        kind: "invalid",
+        reason: `agents JSON: ${String(error?.message ?? error)}`
+      });
+      return;
+    }
+    const specs = [];
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          pushEntry({
+            name: "",
+            scope: "cli",
+            sourcePath,
+            valid: false,
+            kind: "invalid",
+            reason: "agents JSON: every array item must be an object"
+          });
+          continue;
+        }
+        const record = item;
+        specs.push({ name: typeof record.name === "string" ? record.name : "", spec: record });
+      }
+    } else if (parsed !== null && typeof parsed === "object") {
+      for (const [name, item] of Object.entries(parsed)) {
+        if (item === null || typeof item !== "object" || Array.isArray(item)) {
+          pushEntry({
+            name,
+            scope: "cli",
+            sourcePath,
+            valid: false,
+            kind: "invalid",
+            reason: "agents JSON: every definition must be an object"
+          });
+          continue;
+        }
+        specs.push({ name, spec: item });
+      }
+    } else {
+      pushEntry({
+        name: "",
+        scope: "cli",
+        sourcePath,
+        valid: false,
+        kind: "invalid",
+        reason: "agents JSON: expected an object of definitions or an array"
+      });
+      return;
+    }
+    const localNames = /* @__PURE__ */ new Map();
+    for (const { name, spec } of specs) {
+      const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
+      if (parsedDefinition.ok === false) {
+        pushEntry({
+          name,
+          scope: "cli",
+          sourcePath,
+          valid: false,
+          kind: "invalid",
+          reason: parsedDefinition.reason
+        });
+        continue;
+      }
+      const kept = localNames.get(parsedDefinition.definition.name);
+      if (kept !== void 0) {
+        pushDuplicate(parsedDefinition.definition.name, "cli", sourcePath, kept);
+        continue;
+      }
+      localNames.set(parsedDefinition.definition.name, sourcePath);
+      found.push(parsedDefinition.definition);
+    }
+  }
+  __name(scanCli, "scanCli");
+  function refresh() {
+    entries = [];
+    const found = [];
+    scanDir(join2(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
+    scanCli(found);
+    for (const base of projectBases()) {
+      scanDir(join2(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+    }
+    for (const dir of deps.addDirs ?? []) {
+      scanDir(join2(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+    }
+    scanDir(join2(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
+    for (const root of pluginRoots()) scanPlugins(root, found);
+    found.push(...deps.builtins);
+    const seen = /* @__PURE__ */ new Set();
+    for (const definition of found) {
+      if (seen.has(definition.name)) continue;
+      seen.add(definition.name);
+      const warning = definitionWarnings.get(definition);
+      entries.push({
+        name: definition.name,
+        scope: definition.scope,
+        sourcePath: definition.sourcePath ?? "",
+        valid: true,
+        kind: "valid",
+        ...warning !== void 0 ? { warning } : {},
+        definition
+      });
+    }
+  }
+  __name(refresh, "refresh");
+  refresh();
+  return {
+    entries: /* @__PURE__ */ __name(() => [...entries], "entries"),
+    list: /* @__PURE__ */ __name(() => entries.flatMap((entry) => entry.valid && entry.definition !== void 0 ? [entry.definition] : []), "list"),
+    get: /* @__PURE__ */ __name((name) => entries.find((entry) => entry.valid && entry.definition?.name === name)?.definition, "get"),
+    refresh
+  };
+}
+__name(createAgentRegistry, "createAgentRegistry");
+
 // src/state.ts
 var JOB_STATES = ["queued", "running", "waiting-input", "done", "failed", "canceled"];
 var STATE_ALIASES = {
@@ -188,7 +1109,7 @@ var jobStates = {
 };
 
 // src/append.ts
-import { isAbsolute, join as join2 } from "node:path";
+import { isAbsolute, join as join3 } from "node:path";
 var AUTO_COMPACT_MIN = 1e5;
 var AUTO_COMPACT_MAX = 1e6;
 function resolveAutoCompactWindow(inherited, requested, isMain) {
@@ -203,7 +1124,7 @@ function resolveAppendSystemPrompt(input) {
   const value = (input.flag || env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT || env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT || "").trim();
   const read = /* @__PURE__ */ __name((path) => {
     try {
-      return input.fs.readFile(isAbsolute(path) ? path : join2(input.cwd, path)).trim();
+      return input.fs.readFile(isAbsolute(path) ? path : join3(input.cwd, path)).trim();
     } catch {
       return "";
     }
@@ -224,11 +1145,11 @@ function resolveAppendSystemPrompt(input) {
 __name(resolveAppendSystemPrompt, "resolveAppendSystemPrompt");
 
 // src/jobs.ts
-import { join as join3 } from "node:path";
+import { join as join4 } from "node:path";
 function createJobStore(deps) {
   function readJob(id) {
     try {
-      const parsed = JSON.parse(deps.fs.readFile(join3(deps.jobsDir, `${id}.json`)));
+      const parsed = JSON.parse(deps.fs.readFile(join4(deps.jobsDir, `${id}.json`)));
       return parsed && typeof parsed.id === "string" ? parsed : void 0;
     } catch {
       return void 0;
@@ -237,7 +1158,7 @@ function createJobStore(deps) {
   __name(readJob, "readJob");
   function writeJob(record) {
     try {
-      const file = join3(deps.jobsDir, `${record.id}.json`);
+      const file = join4(deps.jobsDir, `${record.id}.json`);
       const tmp = `${file}.mod-${deps.pid}-${deps.now()}`;
       deps.fs.writeFile(tmp, JSON.stringify(record, null, 2));
       deps.fs.rename(tmp, file);
@@ -256,7 +1177,7 @@ function createJobStore(deps) {
     const jobs = [];
     for (const name of names.slice(-limit).reverse()) {
       try {
-        jobs.push(JSON.parse(deps.fs.readFile(join3(deps.jobsDir, name))));
+        jobs.push(JSON.parse(deps.fs.readFile(join4(deps.jobsDir, name))));
       } catch {
       }
     }
@@ -321,7 +1242,7 @@ __name(createLedger, "createLedger");
 var ledgerFactory = createLedger;
 
 // src/delivery.ts
-import { join as join4 } from "node:path";
+import { join as join5 } from "node:path";
 function createDelivery(deps) {
   const answeredPermissions = /* @__PURE__ */ new Set();
   let draining = false;
@@ -388,8 +1309,8 @@ ${next2}`;
     for (const name of inboxNames()) {
       if (seen.has(name)) continue;
       seen.add(name);
-      const live = join4(deps.inboxDir, name);
-      const claimed = join4(deps.claimedDir, name);
+      const live = join5(deps.inboxDir, name);
+      const claimed = join5(deps.claimedDir, name);
       try {
         deps.fs.rename(live, claimed);
       } catch {
@@ -440,7 +1361,7 @@ ${next2}`;
       try {
         deps.fs.rename(
           claim.claimed,
-          join4(deps.orphanedDir, `${deps.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
+          join5(deps.orphanedDir, `${deps.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
         );
       } catch {
       }
@@ -460,7 +1381,7 @@ ${next2}`;
   function answerLivePermissions() {
     for (const job of deps.jobs()) {
       if (job.live !== true) continue;
-      void deps.answerPendingPermission(join4(deps.controlRoot, job.id), answeredPermissions);
+      void deps.answerPendingPermission(join5(deps.controlRoot, job.id), answeredPermissions);
     }
   }
   __name(answerLivePermissions, "answerLivePermissions");
@@ -810,7 +1731,7 @@ function nonEmpty(value) {
 __name(nonEmpty, "nonEmpty");
 
 // src/worktree.ts
-import { dirname, resolve, sep } from "node:path";
+import { dirname as dirname2, resolve, sep } from "node:path";
 function gitSeam(runtime) {
   return {
     git(args, cwd) {
@@ -849,7 +1770,7 @@ function mainCheckoutRoots(seam, cwd) {
     const plain = seam.git(["rev-parse", "--git-common-dir"], topLevel);
     if (plain.code === 0) commonDir = resolve(topLevel, firstLine(plain.stdout));
   }
-  if (commonDir.length > 0 && !isInside(topLevel, commonDir)) roots.push(dirname(commonDir));
+  if (commonDir.length > 0 && !isInside(topLevel, commonDir)) roots.push(dirname2(commonDir));
   return roots;
 }
 __name(mainCheckoutRoots, "mainCheckoutRoots");
@@ -880,10 +1801,10 @@ function createJobWorktree(seam, opts) {
     };
   }
   try {
-    seam.fs.mkdir(dirname(opts.path));
+    seam.fs.mkdir(dirname2(opts.path));
   } catch (error) {
     const message = String(error?.message ?? error);
-    return { ok: false, error: `isolation: worktree cannot create ${dirname(opts.path)}: ${message}` };
+    return { ok: false, error: `isolation: worktree cannot create ${dirname2(opts.path)}: ${message}` };
   }
   const added = seam.git(["worktree", "add", "--detach", opts.path, base], roots[0]);
   if (added.code !== 0) {
@@ -914,7 +1835,7 @@ function finalizeWorktree(seam, record) {
   const changed = worktreeChanged(seam, path, record.worktreeHead);
   if (changed === void 0) return { kept: true, path, error: "git status failed; kept the worktree" };
   if (changed) return { kept: true, path };
-  const removed = seam.git(["worktree", "remove", "--force", path], record.worktreeRepo ?? dirname(path));
+  const removed = seam.git(["worktree", "remove", "--force", path], record.worktreeRepo ?? dirname2(path));
   if (removed.code !== 0) {
     return { kept: true, path, error: `git worktree remove failed: ${firstLine(removed.stderr) || `exit ${removed.code}`}` };
   }
@@ -1017,7 +1938,7 @@ function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
 __name(guardToolCall, "guardToolCall");
 
 // src/worktree-lifecycle.ts
-import { dirname as dirname2, join as join5 } from "node:path";
+import { dirname as dirname3, join as join6 } from "node:path";
 function sweepExpiredEntries(io, dir, now, options = {}) {
   let names;
   try {
@@ -1027,7 +1948,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join5(dir, name);
+    const file = join6(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -1049,7 +1970,7 @@ function createWorktreeLifecycle(ctx) {
     for (const base of [ctx.cwd, ctx.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join5(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join6(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -1070,7 +1991,7 @@ function createWorktreeLifecycle(ctx) {
     if (job?.worktreeKept === true) return;
     if (worktreeChanged(git, path) !== false) return;
     const roots = mainCheckoutRoots(git, path);
-    const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname2(path);
+    const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname3(path);
     git.git(["worktree", "remove", "--force", path], repo);
   }
   __name(discardCleanWorktree, "discardCleanWorktree");
@@ -1094,7 +2015,7 @@ function createWorktreeLifecycle(ctx) {
     const alive = ctx.alive(record.workerPid) || ctx.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join5(ctx.controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join6(ctx.controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -1111,7 +2032,7 @@ function createWorktreeLifecycle(ctx) {
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join5(ctx.jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join6(ctx.jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -1126,18 +2047,18 @@ function createWorktreeLifecycle(ctx) {
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join5(ctx.logsDir, `${id}.log`));
+        spool.remove(join6(ctx.logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join5(ctx.transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join6(ctx.transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join5(ctx.worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join6(ctx.worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, ctx.logsDir, stamp, {
@@ -1172,7 +2093,7 @@ function createWorktreeLifecycle(ctx) {
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join5(ctx.worktreesDir, name);
+      const path = join6(ctx.worktreesDir, name);
       let old = false;
       try {
         old = stamp - spool.stat(path).mtimeMs > ttlMs;
@@ -1188,7 +2109,7 @@ function createWorktreeLifecycle(ctx) {
 __name(createWorktreeLifecycle, "createWorktreeLifecycle");
 
 // src/plan.ts
-import { join as join6 } from "node:path";
+import { join as join7 } from "node:path";
 function planFromInput(input, ctx) {
   const label = String(input.description ?? input.label ?? "").trim();
   if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
@@ -1456,7 +2377,7 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
       ...intent.oneShot === true ? {} : { agentId: id },
       agentType: intent.agentType ?? "general-purpose",
       sessionName: sessionNameOf(id),
-      transcriptPath: join6(ctx.transcriptsDir, `${id}.jsonl`),
+      transcriptPath: join7(ctx.transcriptsDir, `${id}.jsonl`),
       ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
     } : {},
     ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
@@ -1478,14 +2399,14 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
 __name(recordFromPlan, "recordFromPlan");
 
 // src/spawn.ts
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 
 // src/permission.ts
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 async function answerPendingPermission(controlDir, answered, ctx) {
   let request;
   try {
-    request = JSON.parse(ctx.fs.readFile(join7(controlDir, "permission.json")));
+    request = JSON.parse(ctx.fs.readFile(join8(controlDir, "permission.json")));
   } catch {
     return;
   }
@@ -1512,7 +2433,7 @@ async function answerPendingPermission(controlDir, answered, ctx) {
   const picked = choices.find((choice) => choice.label === chosen);
   const option = picked === void 0 ? void 0 : options[picked.index];
   const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-  const file = join7(controlDir, "permission-response.json");
+  const file = join8(controlDir, "permission-response.json");
   const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
   ctx.fs.writeFile(tmp, JSON.stringify(response));
   ctx.fs.rename(tmp, file);
@@ -1666,9 +2587,9 @@ async function fire(intent, ctx) {
     };
   }
   const id = `${ctx.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const logPath = join8(ctx.logsDir, `${id}.log`);
+  const logPath = join9(ctx.logsDir, `${id}.log`);
   const startedAt = ctx.now();
-  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join8(ctx.worktreesDir, id) }) : void 0;
+  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join9(ctx.worktreesDir, id) }) : void 0;
   const owner = intent.owner ?? ctx.owner();
   const record = ctx.recordFromPlan(
     { ...intent, depth, ...ctx.workerSpec?.id !== void 0 ? { parentJobId: ctx.workerSpec.id } : {} },
@@ -1710,7 +2631,7 @@ async function fire(intent, ctx) {
   const idleMs = Number(ctx.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
   if (live) {
     try {
-      ctx.fs.mkdir(join8(ctx.controlRoot, id));
+      ctx.fs.mkdir(join9(ctx.controlRoot, id));
     } catch {
     }
   }
@@ -1734,7 +2655,7 @@ async function fire(intent, ctx) {
       background: intent.background !== false,
       // A foreground caller answers permission prompts inline; a background run
       // settles with the request instead of holding a worker that nobody watches.
-      ...intent.background === false ? { interactive: true, controlDir: join8(ctx.jobsDir, "..", "control", id) } : {},
+      ...intent.background === false ? { interactive: true, controlDir: join9(ctx.jobsDir, "..", "control", id) } : {},
       depth,
       ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
       ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
@@ -1766,8 +2687,8 @@ async function fire(intent, ctx) {
       ...roster.roster !== void 0 ? { roster: roster.roster } : {},
       ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
       ...intent.background !== void 0 ? { background: intent.background } : {},
-      ...live ? { live: true, controlDir: join8(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-      ...isAgent ? { promptMarkerPath: join8(ctx.logsDir, `${id}.mod`) } : {},
+      ...live ? { live: true, controlDir: join9(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+      ...isAgent ? { promptMarkerPath: join9(ctx.logsDir, `${id}.mod`) } : {},
       ...isolation?.ok === true ? { worktree: isolation.path, mainCheckouts: isolation.mainCheckouts } : {}
     },
     ctx.modPath
@@ -1781,7 +2702,7 @@ async function settleForeground(launched, ctx) {
   const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
   let record = ctx.readJob(launched.id);
   const answered = /* @__PURE__ */ new Set();
-  const permissionDir = join8(ctx.controlRoot, launched.id);
+  const permissionDir = join9(ctx.controlRoot, launched.id);
   for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
     if (ctx.backgrounded.has(launched.id)) {
       ctx.refreshJobs();
@@ -1808,7 +2729,7 @@ async function settleForeground(launched, ctx) {
       error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
     };
   }
-  const log = ctx.readLog(String(record.logPath ?? join8(ctx.logsDir, `${launched.id}.log`)));
+  const log = ctx.readLog(String(record.logPath ?? join9(ctx.logsDir, `${launched.id}.log`)));
   const decision = ctx.finalizeJobWorktree(record);
   const outcome = ctx.foregroundOutcome(record, log);
   if (decision?.kept !== true) return { ...launched, result: outcome };
@@ -2996,373 +3917,6 @@ function osRuntime(overrides = {}) {
   };
 }
 __name(osRuntime, "osRuntime");
-var AGENT_SCOPES = ["managed", "cli", "project", "user", "plugin", "builtin"];
-function parseYamlScalar(raw) {
-  const text = raw.trim();
-  if (text.length === 0) return { ok: true, value: void 0 };
-  if (text.startsWith("[")) {
-    if (!text.endsWith("]")) return { ok: false, reason: "unclosed flow sequence" };
-    const inner = text.slice(1, -1).trim();
-    if (inner.length === 0) return { ok: true, value: [] };
-    const items = [];
-    let current = "";
-    let quote = "";
-    for (const char of inner) {
-      if (quote.length > 0) {
-        current += char;
-        if (char === quote) quote = "";
-        continue;
-      }
-      if (char === '"' || char === "'") {
-        quote = char;
-        current += char;
-        continue;
-      }
-      if (char === ",") {
-        items.push(current.trim());
-        current = "";
-        continue;
-      }
-      current += char;
-    }
-    if (quote.length > 0) return { ok: false, reason: "unterminated quoted scalar" };
-    items.push(current.trim());
-    const values = [];
-    for (const item of items) {
-      if (item.length === 0) return { ok: false, reason: "empty flow sequence item" };
-      const parsed = parseYamlScalar(item);
-      if (parsed.ok === false) return parsed;
-      values.push(parsed.value);
-    }
-    return { ok: true, value: values };
-  }
-  if (text.startsWith("{")) {
-    if (!text.endsWith("}")) return { ok: false, reason: "unclosed flow mapping" };
-    return { ok: true, value: null };
-  }
-  if (text.startsWith('"')) {
-    if (text.length < 2 || !text.endsWith('"')) return { ok: false, reason: "unterminated double-quoted scalar" };
-    try {
-      return { ok: true, value: JSON.parse(text) };
-    } catch {
-      return { ok: false, reason: "bad escape in double-quoted scalar" };
-    }
-  }
-  if (text.startsWith("'")) {
-    if (text.length < 2 || !text.endsWith("'")) return { ok: false, reason: "unterminated single-quoted scalar" };
-    return { ok: true, value: text.slice(1, -1).replaceAll("''", "'") };
-  }
-  const comment = text.search(/\s#/);
-  const bare = (comment >= 0 ? text.slice(0, comment) : text).trim();
-  if (bare === "true") return { ok: true, value: true };
-  if (bare === "false") return { ok: true, value: false };
-  if (bare === "null" || bare === "~") return { ok: true, value: void 0 };
-  return { ok: true, value: bare };
-}
-__name(parseYamlScalar, "parseYamlScalar");
-function normalizeNestedLines(raw) {
-  const lines = raw.filter((line) => line.trim().length > 0 && !line.trim().startsWith("#")).map((line) => {
-    const indent = line.length - line.trimStart().length;
-    return { indent, text: line.slice(indent).replace(/\s+$/, "") };
-  });
-  if (lines.length === 0) return lines;
-  const margin = Math.min(...lines.map((line) => line.indent));
-  return lines.map((line) => ({ indent: line.indent - margin, text: line.text }));
-}
-__name(normalizeNestedLines, "normalizeNestedLines");
-var isSequenceLine = /* @__PURE__ */ __name((text) => text === "-" || text.startsWith("- "), "isSequenceLine");
-var MAP_LINE = /^([A-Za-z0-9_.-]+):(?:[ \t]+(.*))?$/;
-function parseYamlNode(lines, start, indent) {
-  const first = lines[start];
-  if (first === void 0) return { ok: true, value: void 0, next: start };
-  return isSequenceLine(first.text) ? parseYamlSequence(lines, start, indent) : parseYamlMapping(lines, start, indent);
-}
-__name(parseYamlNode, "parseYamlNode");
-function parseYamlSequence(lines, start, indent) {
-  const values = [];
-  let index = start;
-  while (index < lines.length) {
-    const line = lines[index];
-    if (line.indent < indent) break;
-    if (line.indent > indent) return { ok: false, reason: `unexpected indentation` };
-    if (!isSequenceLine(line.text)) break;
-    const rest = line.text === "-" ? "" : line.text.slice(2);
-    const trimmed = rest.trim();
-    if (trimmed.length === 0) {
-      const next = lines[index + 1];
-      if (next !== void 0 && next.indent > indent) {
-        const nested = parseYamlNode(lines, index + 1, next.indent);
-        if (!nested.ok) return nested;
-        values.push(nested.value);
-        index = nested.next;
-      } else {
-        values.push(null);
-        index += 1;
-      }
-      continue;
-    }
-    const map = MAP_LINE.exec(trimmed);
-    if (map !== null) {
-      const base = indent + (line.text.length - trimmed.length);
-      const itemLines = [{ indent: base, text: trimmed }];
-      let cursor = index + 1;
-      while (cursor < lines.length && lines[cursor].indent > indent) {
-        itemLines.push(lines[cursor]);
-        cursor += 1;
-      }
-      const nested = parseYamlNode(itemLines, 0, base);
-      if (!nested.ok) return nested;
-      values.push(nested.value);
-      index = cursor;
-      continue;
-    }
-    const parsed = parseYamlScalar(trimmed);
-    if (parsed.ok === false) return parsed;
-    values.push(parsed.value);
-    index += 1;
-  }
-  return { ok: true, value: values, next: index };
-}
-__name(parseYamlSequence, "parseYamlSequence");
-function parseYamlMapping(lines, start, indent) {
-  const value = {};
-  let index = start;
-  while (index < lines.length) {
-    const line = lines[index];
-    if (line.indent < indent) break;
-    if (line.indent > indent) return { ok: false, reason: "unexpected indentation" };
-    const match = MAP_LINE.exec(line.text);
-    if (match === null) return { ok: false, reason: `expected key: value, got "${line.text.slice(0, 40)}"` };
-    const key = match[1];
-    const inline = (match[2] ?? "").trim();
-    if (Object.hasOwn(value, key)) return { ok: false, reason: `duplicate key "${key}"` };
-    const next = lines[index + 1];
-    if (inline.length > 0) {
-      if (next !== void 0 && next.indent > indent) {
-        return { ok: false, reason: `unexpected indentation under "${key}"` };
-      }
-      const parsed = parseYamlScalar(inline);
-      if (parsed.ok === false) return parsed;
-      value[key] = parsed.value;
-      index += 1;
-      continue;
-    }
-    if (next !== void 0 && next.indent > indent) {
-      const nested = parseYamlNode(lines, index + 1, next.indent);
-      if (!nested.ok) return nested;
-      value[key] = nested.value;
-      index = nested.next;
-      continue;
-    }
-    value[key] = void 0;
-    index += 1;
-  }
-  return { ok: true, value, next: index };
-}
-__name(parseYamlMapping, "parseYamlMapping");
-function parseFrontmatter(source) {
-  const text = source.startsWith("\uFEFF") ? source.slice(1) : source;
-  const lines = text.split("\n");
-  if (lines[0]?.trim() !== "---") return { ok: false, reason: "frontmatter must start with --- on the first line" };
-  let close = -1;
-  for (let index = 1; index < lines.length; index += 1) {
-    if (lines[index].trim() === "---") {
-      close = index;
-      break;
-    }
-  }
-  if (close < 0) return { ok: false, reason: "frontmatter is not closed" };
-  const blocks = [];
-  for (let index = 1; index < close; index += 1) {
-    const line = lines[index];
-    const trimmed = line.trim();
-    if (trimmed.length === 0 || trimmed.startsWith("#")) {
-      if (blocks.length > 0) blocks[blocks.length - 1].lines.push("");
-      continue;
-    }
-    if (line.startsWith("	")) return { ok: false, reason: "tab indentation is not valid YAML" };
-    const indent = line.length - line.trimStart().length;
-    if (indent > 0) {
-      if (blocks.length === 0) return { ok: false, reason: "unexpected indentation" };
-      blocks[blocks.length - 1].lines.push(line);
-      continue;
-    }
-    const match = /^([A-Za-z0-9_.-]+):(.*)$/.exec(line);
-    if (match === null) return { ok: false, reason: `expected key: value, got "${line.slice(0, 40)}"` };
-    blocks.push({ key: match[1], inline: match[2].trim(), lines: [] });
-  }
-  const fields = {};
-  for (const block of blocks) {
-    if (Object.hasOwn(fields, block.key)) return { ok: false, reason: `duplicate key "${block.key}"` };
-    const blockScalar = block.inline === "|" || block.inline === "|-" || block.inline === ">" || block.inline === ">-";
-    if (blockScalar) {
-      const filled = block.lines.filter((line) => line.trim().length > 0);
-      const margin = filled.length === 0 ? 0 : Math.min(...filled.map((line) => line.length - line.trimStart().length));
-      const body = block.lines.map((line) => line.trim().length === 0 ? "" : line.slice(margin).replace(/\s+$/, ""));
-      fields[block.key] = (block.inline.startsWith(">") ? body.join(" ") : body.join("\n")).replace(/^\n+|\n+$/g, "");
-      continue;
-    }
-    const hasNested = block.lines.some((line) => line.trim().length > 0);
-    if (block.inline.length === 0 && hasNested) {
-      const parsed2 = parseYamlNode(normalizeNestedLines(block.lines), 0, 0);
-      if (parsed2.ok === false) return parsed2;
-      fields[block.key] = parsed2.value;
-      continue;
-    }
-    if (hasNested) {
-      return { ok: false, reason: `unexpected indentation under "${block.key}"` };
-    }
-    if (block.inline.length === 0) {
-      fields[block.key] = void 0;
-      continue;
-    }
-    const parsed = parseYamlScalar(block.inline);
-    if (parsed.ok === false) return parsed;
-    fields[block.key] = parsed.value;
-  }
-  return { ok: true, fields, body: lines.slice(close + 1).join("\n").replace(/^\r?\n/, "").trimEnd() };
-}
-__name(parseFrontmatter, "parseFrontmatter");
-function listField(value) {
-  if (value === void 0 || value === null) return void 0;
-  if (Array.isArray(value)) {
-    const items = value.filter((item) => typeof item === "string").map((item) => item.trim()).filter(Boolean);
-    return items.length > 0 ? items : void 0;
-  }
-  if (typeof value !== "string") return void 0;
-  const text = value.trim();
-  if (text.length === 0) return void 0;
-  if (text === "*") return ["*"];
-  return text.split(",").map((item) => item.trim()).filter(Boolean);
-}
-__name(listField, "listField");
-function stringField(value) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
-}
-__name(stringField, "stringField");
-function booleanField(value) {
-  if (typeof value === "boolean") return value;
-  if (value === "true") return true;
-  if (value === "false") return false;
-  return void 0;
-}
-__name(booleanField, "booleanField");
-function numberField(value) {
-  const numeric = typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
-  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : void 0;
-}
-__name(numberField, "numberField");
-function stringMapField(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
-  const out = {};
-  for (const [key, raw] of Object.entries(value)) {
-    if (typeof raw !== "string") continue;
-    out[key] = raw;
-  }
-  return Object.keys(out).length > 0 ? out : void 0;
-}
-__name(stringMapField, "stringMapField");
-function serverFields(value) {
-  const command = stringField(value.command);
-  const url = stringField(value.url);
-  const args = listField(value.args);
-  const env = stringMapField(value.env);
-  if (command === void 0 && url === void 0) return void 0;
-  return {
-    ...command !== void 0 ? { command } : {},
-    ...args !== void 0 ? { args } : {},
-    ...env !== void 0 ? { env } : {},
-    ...url !== void 0 ? { url } : {}
-  };
-}
-__name(serverFields, "serverFields");
-function parseMcpServers(value) {
-  const out = [];
-  if (typeof value === "string") {
-    const name = stringField(value);
-    return name === void 0 ? void 0 : [{ name }];
-  }
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      if (typeof item === "string") {
-        const name2 = stringField(item);
-        if (name2 !== void 0) out.push({ name: name2 });
-        continue;
-      }
-      if (item === null || typeof item !== "object") continue;
-      const record = item;
-      const name = stringField(record.name) ?? stringField(record.server);
-      if (name === void 0) continue;
-      out.push({ name, ...serverFields(record) });
-    }
-  } else if (value !== null && typeof value === "object") {
-    for (const [name, config] of Object.entries(value)) {
-      const clean = name.trim();
-      if (clean.length === 0) continue;
-      if (config === null || config === void 0 || config === true) {
-        out.push({ name: clean });
-        continue;
-      }
-      if (typeof config === "string") {
-        out.push({ name: clean, command: config });
-        continue;
-      }
-      if (typeof config === "object" && !Array.isArray(config)) {
-        out.push({ name: clean, ...serverFields(config) });
-      }
-    }
-  }
-  return out.length > 0 ? out : void 0;
-}
-__name(parseMcpServers, "parseMcpServers");
-function hookRule(value, inheritedMatcher) {
-  if (typeof value === "string") {
-    const command2 = value.trim();
-    return command2.length === 0 ? [] : [{ command: command2, ...inheritedMatcher !== void 0 ? { matcher: inheritedMatcher } : {} }];
-  }
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return [];
-  const record = value;
-  const matcher = stringField(record.matcher) ?? inheritedMatcher;
-  const nested = record.hooks;
-  if (nested !== void 0) {
-    return Array.isArray(nested) ? nested.flatMap((item) => hookRule(item, matcher)) : hookRule(nested, matcher);
-  }
-  const command = stringField(record.command);
-  if (command === void 0) return [];
-  const seconds = numberField(record.timeout);
-  return [
-    {
-      command,
-      ...matcher !== void 0 ? { matcher } : {},
-      ...seconds !== void 0 ? { timeoutMs: seconds * 1e3 } : {}
-    }
-  ];
-}
-__name(hookRule, "hookRule");
-function hookList(value) {
-  const rules = (Array.isArray(value) ? value : [value]).flatMap((item) => hookRule(item));
-  return rules.length > 0 ? rules : void 0;
-}
-__name(hookList, "hookList");
-function parseHooks(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
-  const byEvent = {};
-  for (const [event, raw] of Object.entries(value)) {
-    const normalized = event.replace(/[^a-z]/gi, "").toLowerCase();
-    const key = normalized === "pretooluse" ? "PreToolUse" : normalized === "posttooluse" ? "PostToolUse" : normalized === "stop" || normalized === "subagentstop" ? "Stop" : void 0;
-    if (key === void 0) continue;
-    const rules = hookList(raw);
-    if (rules !== void 0) byEvent[key] = [...byEvent[key] ?? [], ...rules];
-  }
-  return Object.keys(byEvent).length > 0 ? byEvent : void 0;
-}
-__name(parseHooks, "parseHooks");
-function parseCacheTtl(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return void 0;
-  const ttl = stringField(value.cacheTtl);
-  return ttl === "5m" || ttl === "1h" ? ttl : void 0;
-}
-__name(parseCacheTtl, "parseCacheTtl");
 function hookMatches(matcher, toolName) {
   const pattern = (matcher ?? "").trim();
   if (pattern.length === 0 || pattern === "*") return true;
@@ -3429,548 +3983,6 @@ function runHookRules(run, rules, detail) {
   return outcome;
 }
 __name(runHookRules, "runHookRules");
-function validateAgentName(name) {
-  if ([...name].length > AGENT_NAME_MAX) return `name: must be at most ${AGENT_NAME_MAX} characters`;
-  if (name.includes(":")) return 'name: must not contain ":" (plugin-scoped identifiers reserve it)';
-  if (name.startsWith("-")) return 'name: must not start with "-"';
-  return void 0;
-}
-__name(validateAgentName, "validateAgentName");
-function fallbackBody(source) {
-  const text = source.startsWith("\uFEFF") ? source.slice(1) : source;
-  const lines = text.split("\n");
-  if (lines[0]?.trim() !== "---") return text.trim();
-  for (let index = 1; index < lines.length; index += 1) {
-    if (lines[index].trim() === "---") return lines.slice(index + 1).join("\n").trim();
-  }
-  return text.trim();
-}
-__name(fallbackBody, "fallbackBody");
-function fallbackDescription(body, name) {
-  const line = body.split("\n").map((part) => part.trim()).find((part) => part.length > 0);
-  return line !== void 0 ? line.slice(0, 200) : `Plugin agent ${name}`;
-}
-__name(fallbackDescription, "fallbackDescription");
-function pluginFallbackDefinition(body, path, options) {
-  const raw = options.fallbackName !== void 0 && options.fallbackName.length > 0 ? options.fallbackName : "agent";
-  const name = `${options.scopedPrefix ?? ""}${raw}`;
-  const definition = {
-    name,
-    description: fallbackDescription(body, name),
-    prompt: body,
-    scope: "plugin",
-    sourcePath: path
-  };
-  if (options.pluginName !== void 0) definition.plugin = options.pluginName;
-  return definition;
-}
-__name(pluginFallbackDefinition, "pluginFallbackDefinition");
-function agentDefinitionFromSource(source, path, scope, options = {}) {
-  const frontmatter = parseFrontmatter(source);
-  if (frontmatter.ok === false) {
-    if (options.plugin !== true) return frontmatter;
-    return {
-      ok: true,
-      definition: pluginFallbackDefinition(fallbackBody(source), path, options),
-      warning: `frontmatter: ${frontmatter.reason}; loaded under its filename`
-    };
-  }
-  const fields = frontmatter.fields;
-  const fallbackDefinition = /* @__PURE__ */ __name((warning) => {
-    const definition2 = pluginFallbackDefinition(frontmatter.body, path, options);
-    const parsedDescription = stringField(fields.description);
-    if (parsedDescription !== void 0) definition2.description = parsedDescription;
-    return { ok: true, definition: definition2, warning };
-  }, "fallbackDefinition");
-  const rawName = stringField(fields.name) ?? "";
-  if (rawName.length === 0) {
-    if (options.plugin !== true) return { ok: false, reason: "name: required" };
-    return fallbackDefinition("name: required; loaded under its filename");
-  }
-  const nameError = validateAgentName(rawName);
-  if (nameError !== void 0) {
-    if (options.plugin !== true) return { ok: false, reason: nameError };
-    return fallbackDefinition(`${nameError}; loaded under its filename`);
-  }
-  const name = options.scopedPrefix !== void 0 ? `${options.scopedPrefix}${rawName}` : rawName;
-  const description = stringField(fields.description);
-  if (description === void 0) return { ok: false, reason: "description: required" };
-  const definition = {
-    name,
-    description,
-    prompt: frontmatter.body,
-    scope,
-    sourcePath: path
-  };
-  if (options.pluginName !== void 0) definition.plugin = options.pluginName;
-  const tools = listField(fields.tools);
-  const disallowed = listField(fields.disallowedTools);
-  const skills = listField(fields.skills);
-  if (tools !== void 0) definition.tools = tools;
-  if (disallowed !== void 0) definition.disallowedTools = disallowed;
-  const model = stringField(fields.model);
-  const permissionMode = stringField(fields.permissionMode);
-  const maxTurns = numberField(fields.maxTurns);
-  const isolation = stringField(fields.isolation);
-  const color = stringField(fields.color);
-  const effort = stringField(fields.effort);
-  if (model !== void 0) definition.model = model;
-  if (permissionMode !== void 0 && options.plugin !== true) definition.permissionMode = permissionMode;
-  if (maxTurns !== void 0) definition.maxTurns = maxTurns;
-  if (skills !== void 0) definition.skills = skills;
-  if (isolation !== void 0) definition.isolation = isolation;
-  if (color !== void 0) definition.color = color;
-  if (effort !== void 0) definition.effort = effort;
-  const background = booleanField(fields.background);
-  const omitClaudeMd = booleanField(fields.omitClaudeMd);
-  const memory = typeof fields.memory === "string" ? MEMORY_SCOPES[fields.memory] : void 0;
-  if (background !== void 0) definition.background = background;
-  if (omitClaudeMd !== void 0) definition.omitClaudeMd = omitClaudeMd;
-  if (memory !== void 0) definition.memory = memory;
-  if (options.plugin !== true) {
-    const mcpServers = parseMcpServers(fields.mcpServers);
-    const hooks = parseHooks(fields.hooks);
-    const initialPrompt = stringField(fields.initialPrompt);
-    if (mcpServers !== void 0) definition.mcpServers = mcpServers;
-    if (hooks !== void 0) definition.hooks = hooks;
-    if (initialPrompt !== void 0) definition.initialPrompt = initialPrompt;
-  }
-  const autoCompactWindow = numberField(fields.autoCompactWindow);
-  const cacheTtl = parseCacheTtl(fields.experimental);
-  if (autoCompactWindow !== void 0) definition.autoCompactWindow = autoCompactWindow;
-  if (cacheTtl !== void 0) definition.cacheTtl = cacheTtl;
-  return { ok: true, definition };
-}
-__name(agentDefinitionFromSource, "agentDefinitionFromSource");
-var BUILTIN_AGENT_DEFINITIONS = [
-  {
-    name: "explore",
-    description: "Read-only codebase exploration: find files, symbols, and call paths.",
-    prompt: "You are a read-only codebase explorer. Find the files, symbols, and call paths that answer the question. Do not edit anything. Report concrete paths with line numbers and a short summary of the call flow. Be quick by default; go deeper only when the task needs it.",
-    scope: "builtin",
-    sourcePath: "",
-    tools: ["Read", "Grep", "Glob"],
-    model: "inherit",
-    permissionMode: "plan",
-    readOnly: true,
-    oneShot: true
-  },
-  {
-    name: "plan",
-    description: "Read-only design: turn findings into an implementation plan.",
-    prompt: "You are a planning agent. Explore the codebase read-only, identify the constraints, then return a concrete implementation plan: the files to change, the ordered steps, the risks, and the tests. Do not implement.",
-    scope: "builtin",
-    sourcePath: "",
-    tools: ["Read", "Grep", "Glob"],
-    model: "inherit",
-    permissionMode: "plan",
-    readOnly: true,
-    oneShot: true
-  },
-  {
-    name: "general-purpose",
-    description: "General-purpose agent for multi-step tasks. The fallback when no subagent_type is given.",
-    prompt: "You are a general-purpose autonomous agent. You receive one self-contained task, complete it fully, and report back once at the end. Work autonomously: you cannot ask follow-up questions, so make reasonable assumptions and state them in the final report. Use the minimum set of tool calls that gets the job done correctly.",
-    scope: "builtin",
-    sourcePath: ""
-  },
-  {
-    name: "claude",
-    description: "Catch-all coding agent for a task that fits no specialized definition.",
-    prompt: "You are a general-purpose coding agent. Complete the assigned task end to end, then report what changed and how it was verified.",
-    scope: "builtin",
-    sourcePath: ""
-  },
-  {
-    name: "statusline-setup",
-    description: "Configure the status line. Used by /statusline; restricted to settings files.",
-    prompt: "You configure the Command Code status line. Read the current settings, change only the statusLine entry, and report the file you edited. Do not run shell commands.",
-    scope: "builtin",
-    sourcePath: "",
-    model: "sonnet",
-    tools: ["Read", "Edit"]
-  },
-  {
-    name: "claude-code-guide",
-    description: "Answer questions about the host's features, commands, and configuration.",
-    prompt: "You answer questions about Command Code: agents, tools, hooks, permissions, MCP, and settings. Read the local documentation first, then the official pages when the local copy is silent. Answer with the exact flag or field name.",
-    scope: "builtin",
-    sourcePath: "",
-    model: "haiku",
-    tools: ["Read", "Grep", "Glob", "WebFetch", "WebSearch"]
-  },
-  {
-    name: FORK_AGENT_TYPE,
-    description: "Fork the current conversation: full history, the main system prompt, tools, model, permissions, and prompt cache. Use it when the task needs the context already in this session.",
-    prompt: "",
-    scope: "builtin",
-    sourcePath: "",
-    fork: true
-  }
-];
-function builtinAgentDefinitions(env) {
-  if (env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_BUILTIN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_BUILTINS === "1") {
-    return [];
-  }
-  if (env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS === "1" || env.BETTER_SUBAGENTS_DISABLE_EXPLORE_PLAN === "1") {
-    return BUILTIN_AGENT_DEFINITIONS.filter((definition) => definition.name !== "explore" && definition.name !== "plan");
-  }
-  return [...BUILTIN_AGENT_DEFINITIONS];
-}
-__name(builtinAgentDefinitions, "builtinAgentDefinitions");
-var DESCRIPTION_LIMIT_TOKENS = 15e3;
-function descriptionLimit(definitions, maxTokens = DESCRIPTION_LIMIT_TOKENS) {
-  let characters = 0;
-  for (const definition of definitions) {
-    if (definition.scope === "builtin") continue;
-    characters += String(definition.description ?? "").length;
-  }
-  const tokens = Math.ceil(characters / 4);
-  return { tokens, maxTokens, over: tokens > maxTokens };
-}
-__name(descriptionLimit, "descriptionLimit");
-function cliAgentDefinition(rawName, spec, sourcePath) {
-  const name = rawName.length > 0 ? rawName : stringField(spec.name) ?? "";
-  if (name.length === 0) return { ok: false, reason: "name: required" };
-  const nameError = validateAgentName(name);
-  if (nameError !== void 0) return { ok: false, reason: nameError };
-  const description = stringField(spec.description);
-  if (description === void 0) return { ok: false, reason: "description: required" };
-  const prompt = typeof spec.prompt === "string" ? spec.prompt : typeof spec.systemPrompt === "string" ? spec.systemPrompt : "";
-  const definition = { name, description, prompt, scope: "cli", sourcePath };
-  const tools = listField(spec.tools);
-  const disallowed = listField(spec.disallowedTools);
-  const skills = listField(spec.skills);
-  if (tools !== void 0) definition.tools = tools;
-  if (disallowed !== void 0) definition.disallowedTools = disallowed;
-  if (skills !== void 0) definition.skills = skills;
-  const model = stringField(spec.model);
-  const permissionMode = stringField(spec.permissionMode);
-  const maxTurns = numberField(spec.maxTurns);
-  const isolation = stringField(spec.isolation);
-  const effort = stringField(spec.effort);
-  if (model !== void 0) definition.model = model;
-  if (permissionMode !== void 0) definition.permissionMode = permissionMode;
-  if (maxTurns !== void 0) definition.maxTurns = maxTurns;
-  if (isolation !== void 0) definition.isolation = isolation;
-  if (effort !== void 0) definition.effort = effort;
-  const background = booleanField(spec.background);
-  const omitClaudeMd = booleanField(spec.omitClaudeMd);
-  const memory = typeof spec.memory === "string" ? MEMORY_SCOPES[spec.memory] : void 0;
-  if (background !== void 0) definition.background = background;
-  if (omitClaudeMd !== void 0) definition.omitClaudeMd = omitClaudeMd;
-  if (memory !== void 0) definition.memory = memory;
-  const mcpServers = parseMcpServers(spec.mcpServers);
-  const hooks = parseHooks(spec.hooks);
-  const initialPrompt = stringField(spec.initialPrompt);
-  const autoCompactWindow = numberField(spec.autoCompactWindow);
-  if (mcpServers !== void 0) definition.mcpServers = mcpServers;
-  if (hooks !== void 0) definition.hooks = hooks;
-  if (initialPrompt !== void 0) definition.initialPrompt = initialPrompt;
-  if (autoCompactWindow !== void 0) definition.autoCompactWindow = autoCompactWindow;
-  return { ok: true, definition };
-}
-__name(cliAgentDefinition, "cliAgentDefinition");
-function createAgentRegistry(deps) {
-  let entries = [];
-  const loggedSkips = /* @__PURE__ */ new Set();
-  const definitionWarnings = /* @__PURE__ */ new WeakMap();
-  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join9(deps.home, ".commandcode", "managed"), "managedDir");
-  function pushEntry(entry) {
-    entries.push(entry);
-    const problem = entry.warning ?? entry.reason;
-    if (problem === void 0) return;
-    const key = `${entry.sourcePath}\0${problem}`;
-    if (loggedSkips.has(key)) return;
-    loggedSkips.add(key);
-    deps.log(`${entry.sourcePath.length > 0 ? entry.sourcePath : entry.name}: ${problem}`);
-  }
-  __name(pushEntry, "pushEntry");
-  function scanFile(path, scope, options = {}) {
-    let source = "";
-    try {
-      source = deps.fs.readFile(path);
-    } catch (error) {
-      pushEntry({
-        name: "",
-        scope,
-        sourcePath: path,
-        valid: false,
-        kind: "invalid",
-        reason: `unreadable: ${String(error?.message ?? error)}`
-      });
-      return void 0;
-    }
-    const parsed = agentDefinitionFromSource(source, path, scope, options);
-    if (parsed.ok === false) {
-      pushEntry({ name: "", scope, sourcePath: path, valid: false, kind: "invalid", reason: parsed.reason });
-      return void 0;
-    }
-    if (parsed.warning !== void 0) definitionWarnings.set(parsed.definition, parsed.warning);
-    return parsed.definition;
-  }
-  __name(scanFile, "scanFile");
-  function pushDuplicate(name, scope, path, kept) {
-    pushEntry({
-      name,
-      scope,
-      sourcePath: path,
-      valid: false,
-      kind: "duplicate",
-      duplicateOf: kept,
-      reason: `duplicate name "${name}": ${kept} was read first; rename or remove this file`
-    });
-  }
-  __name(pushDuplicate, "pushDuplicate");
-  function scanDir(dir, scope, depth, found, localNames) {
-    if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
-    let names = [];
-    try {
-      names = deps.fs.readdir(dir).sort();
-    } catch {
-      return;
-    }
-    for (const name of names) {
-      if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join9(dir, name);
-      if (name.toLowerCase().endsWith(".md")) {
-        const definition = scanFile(full, scope);
-        if (definition === void 0) continue;
-        const kept = localNames.get(definition.name);
-        if (kept !== void 0) {
-          pushDuplicate(definition.name, scope, full, kept);
-          continue;
-        }
-        localNames.set(definition.name, full);
-        found.push(definition);
-        continue;
-      }
-      if (deps.fs.exists(full)) scanDir(full, scope, depth + 1, found, localNames);
-    }
-  }
-  __name(scanDir, "scanDir");
-  function scanPluginDir(dir, pluginName, trail, depth, found, localNames) {
-    if (depth > AGENT_SCAN_DEPTH_MAX || entries.length >= AGENT_SCAN_MAX || !deps.fs.exists(dir)) return;
-    let children = [];
-    try {
-      children = deps.fs.readdir(dir).sort();
-    } catch {
-      return;
-    }
-    for (const child of children) {
-      if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join9(dir, child);
-      if (child.toLowerCase().endsWith(".md")) {
-        const definition = scanFile(full, "plugin", {
-          plugin: true,
-          pluginName,
-          scopedPrefix: `${[pluginName, ...trail].join(":")}:`,
-          fallbackName: child.replace(/\.md$/i, "")
-        });
-        if (definition === void 0) continue;
-        const kept = localNames.get(definition.name);
-        if (kept !== void 0) {
-          pushDuplicate(definition.name, "plugin", full, kept);
-          continue;
-        }
-        localNames.set(definition.name, full);
-        found.push(definition);
-        continue;
-      }
-      scanPluginDir(full, pluginName, [...trail, child], depth + 1, found, localNames);
-    }
-  }
-  __name(scanPluginDir, "scanPluginDir");
-  function scanPlugins(root, found) {
-    if (!deps.fs.exists(root)) return;
-    let pluginNames = [];
-    try {
-      pluginNames = deps.fs.readdir(root).sort();
-    } catch {
-      return;
-    }
-    for (const pluginName of pluginNames) {
-      const agentsDir = join9(root, pluginName, "agents");
-      if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
-    }
-  }
-  __name(scanPlugins, "scanPlugins");
-  function projectBases() {
-    const bases = [];
-    let current = deps.cwd;
-    for (let depth = 0; depth <= 64; depth += 1) {
-      bases.push(current);
-      if (hasGitMarker(deps.fs, current)) break;
-      const parent = dirname3(current);
-      if (parent === current) break;
-      current = parent;
-    }
-    return bases;
-  }
-  __name(projectBases, "projectBases");
-  function pluginRoots() {
-    const roots = [...deps.pluginRoots ?? []];
-    roots.push(join9(managedDir(), "plugins"));
-    for (const base of projectBases()) roots.push(join9(base, ".commandcode", "plugins"));
-    roots.push(join9(deps.home, ".commandcode", "plugins"));
-    return roots;
-  }
-  __name(pluginRoots, "pluginRoots");
-  function scanCli(found) {
-    const value = (deps.cli?.value ?? "").trim();
-    if (value.length === 0) return;
-    let text = value;
-    let sourcePath = "cli";
-    if (!value.startsWith("{") && !value.startsWith("[")) {
-      const file = value.startsWith("@") ? value.slice(1) : value;
-      if (deps.cli?.interactive === true) {
-        pushEntry({
-          name: "",
-          scope: "cli",
-          sourcePath: file,
-          valid: false,
-          kind: "invalid",
-          reason: "an interactive session cannot load --mod-option agents from a file; pass inline JSON"
-        });
-        return;
-      }
-      try {
-        text = deps.fs.readFile(file);
-      } catch (error) {
-        pushEntry({
-          name: "",
-          scope: "cli",
-          sourcePath: file,
-          valid: false,
-          kind: "invalid",
-          reason: `unreadable: ${String(error?.message ?? error)}`
-        });
-        return;
-      }
-      sourcePath = file;
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(text);
-    } catch (error) {
-      pushEntry({
-        name: "",
-        scope: "cli",
-        sourcePath,
-        valid: false,
-        kind: "invalid",
-        reason: `agents JSON: ${String(error?.message ?? error)}`
-      });
-      return;
-    }
-    const specs = [];
-    if (Array.isArray(parsed)) {
-      for (const item of parsed) {
-        if (item === null || typeof item !== "object" || Array.isArray(item)) {
-          pushEntry({
-            name: "",
-            scope: "cli",
-            sourcePath,
-            valid: false,
-            kind: "invalid",
-            reason: "agents JSON: every array item must be an object"
-          });
-          continue;
-        }
-        const record = item;
-        specs.push({ name: typeof record.name === "string" ? record.name : "", spec: record });
-      }
-    } else if (parsed !== null && typeof parsed === "object") {
-      for (const [name, item] of Object.entries(parsed)) {
-        if (item === null || typeof item !== "object" || Array.isArray(item)) {
-          pushEntry({
-            name,
-            scope: "cli",
-            sourcePath,
-            valid: false,
-            kind: "invalid",
-            reason: "agents JSON: every definition must be an object"
-          });
-          continue;
-        }
-        specs.push({ name, spec: item });
-      }
-    } else {
-      pushEntry({
-        name: "",
-        scope: "cli",
-        sourcePath,
-        valid: false,
-        kind: "invalid",
-        reason: "agents JSON: expected an object of definitions or an array"
-      });
-      return;
-    }
-    const localNames = /* @__PURE__ */ new Map();
-    for (const { name, spec } of specs) {
-      const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
-      if (parsedDefinition.ok === false) {
-        pushEntry({
-          name,
-          scope: "cli",
-          sourcePath,
-          valid: false,
-          kind: "invalid",
-          reason: parsedDefinition.reason
-        });
-        continue;
-      }
-      const kept = localNames.get(parsedDefinition.definition.name);
-      if (kept !== void 0) {
-        pushDuplicate(parsedDefinition.definition.name, "cli", sourcePath, kept);
-        continue;
-      }
-      localNames.set(parsedDefinition.definition.name, sourcePath);
-      found.push(parsedDefinition.definition);
-    }
-  }
-  __name(scanCli, "scanCli");
-  function refresh() {
-    entries = [];
-    const found = [];
-    scanDir(join9(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
-    scanCli(found);
-    for (const base of projectBases()) {
-      scanDir(join9(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
-    }
-    for (const dir of deps.addDirs ?? []) {
-      scanDir(join9(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
-    }
-    scanDir(join9(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
-    for (const root of pluginRoots()) scanPlugins(root, found);
-    found.push(...deps.builtins);
-    const seen = /* @__PURE__ */ new Set();
-    for (const definition of found) {
-      if (seen.has(definition.name)) continue;
-      seen.add(definition.name);
-      const warning = definitionWarnings.get(definition);
-      entries.push({
-        name: definition.name,
-        scope: definition.scope,
-        sourcePath: definition.sourcePath ?? "",
-        valid: true,
-        kind: "valid",
-        ...warning !== void 0 ? { warning } : {},
-        definition
-      });
-    }
-  }
-  __name(refresh, "refresh");
-  refresh();
-  return {
-    entries: /* @__PURE__ */ __name(() => [...entries], "entries"),
-    list: /* @__PURE__ */ __name(() => entries.flatMap((entry) => entry.valid && entry.definition !== void 0 ? [entry.definition] : []), "list"),
-    get: /* @__PURE__ */ __name((name) => entries.find((entry) => entry.valid && entry.definition?.name === name)?.definition, "get"),
-    refresh
-  };
-}
-__name(createAgentRegistry, "createAgentRegistry");
-var MEMORY_SCOPES = { user: "user", project: "project", local: "local" };
 var MEMORY_INDEX_FILE = "MEMORY.md";
 var MEMORY_INDEX_LINES_MAX = 200;
 var MEMORY_INDEX_BYTES_MAX = 25 * 1024;
@@ -3996,22 +4008,13 @@ function startupFile(fs, path) {
   return content === void 0 ? void 0 : { path, content };
 }
 __name(startupFile, "startupFile");
-function hasGitMarker(fs, dir) {
-  try {
-    fs.stat(join9(dir, ".git"));
-    return true;
-  } catch {
-    return false;
-  }
-}
-__name(hasGitMarker, "hasGitMarker");
 function projectDirsUpward(cwd, fs) {
   const dirs = [];
   let current = cwd;
   for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
     dirs.push(current);
     if (fs !== void 0 && hasGitMarker(fs, current)) break;
-    const parent = dirname3(current);
+    const parent = dirname4(current);
     if (parent === current) break;
     current = parent;
   }
@@ -4022,16 +4025,16 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join9(cwd, path);
-    let dir = dirname3(absolute);
+    const absolute = isAbsolute2(path) ? path : join10(cwd, path);
+    let dir = dirname4(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
-      if (dir === cwd || dir === dirname3(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join9(dir, "CLAUDE.md");
+      if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
+      const filePath = join10(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
       if (file !== void 0) files.push(file);
-      dir = dirname3(dir);
+      dir = dirname4(dir);
     }
   }
   return files;
@@ -4046,24 +4049,24 @@ function claudeMdHierarchy(options) {
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join9(options.home, ".commandcode", "managed", "CLAUDE.md");
+    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join10(options.home, ".commandcode", "managed", "CLAUDE.md");
     const managed = startupFile(fs, managedPath);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
     const user = startupFile(
       fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join9(options.home, ".commandcode", "CLAUDE.md")
+      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join10(options.home, ".commandcode", "CLAUDE.md")
     );
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join9(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join10(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join9(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join10(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join9(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join10(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -4075,11 +4078,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join9(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join9(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join10(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join10(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join9(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join9(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join10(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join10(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -4087,8 +4090,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join9(options.home, ".commandcode", "agent-memory") : scope === "project" ? join9(options.cwd, ".commandcode", "agent-memory") : join9(options.cwd, ".commandcode", "agent-memory-local");
-  return join9(root, name);
+  const root = scope === "user" ? join10(options.home, ".commandcode", "agent-memory") : scope === "project" ? join10(options.cwd, ".commandcode", "agent-memory") : join10(options.cwd, ".commandcode", "agent-memory-local");
+  return join10(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -4125,7 +4128,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join9(dir, MEMORY_INDEX_FILE);
+  const path = join10(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -4335,7 +4338,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join9(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join10(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -4364,11 +4367,11 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join9(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join10(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join9(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? join10(roots.home, ".commandcode", "managed"),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
@@ -4703,7 +4706,7 @@ function index_default(cmd, overrides = {}) {
     if (!workerMode) return void 0;
     try {
       const spec = JSON.parse(String(runtime.env[WORKER_SPEC_ENV] ?? ""));
-      return typeof spec.inboxDir === "string" ? dirname3(spec.inboxDir) : void 0;
+      return typeof spec.inboxDir === "string" ? dirname4(spec.inboxDir) : void 0;
     } catch {
       return void 0;
     }
@@ -4715,15 +4718,15 @@ function index_default(cmd, overrides = {}) {
     flag: readFlag(FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join9(root, "inbox");
-  const claimedDir = join9(root, "claimed");
-  const orphanedDir = join9(root, "orphaned");
-  const logsDir = join9(root, "logs");
-  const jobsDir = join9(root, "jobs");
-  const transcriptsDir = join9(root, "transcripts");
-  const worktreesDir = join9(root, "worktrees");
-  const controlRoot = join9(root, "control");
-  const ledgerPath = join9(root, "delivered.jsonl");
+  const inboxDir = join10(root, "inbox");
+  const claimedDir = join10(root, "claimed");
+  const orphanedDir = join10(root, "orphaned");
+  const logsDir = join10(root, "logs");
+  const jobsDir = join10(root, "jobs");
+  const transcriptsDir = join10(root, "transcripts");
+  const worktreesDir = join10(root, "worktrees");
+  const controlRoot = join10(root, "control");
+  const ledgerPath = join10(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -4746,7 +4749,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join9(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join10(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -4850,17 +4853,17 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join9(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join10(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join9(current, ".git"));
+        spool.stat(join10(current, ".git"));
         break;
       } catch {
       }
-      const parent = dirname3(current);
+      const parent = dirname4(current);
       if (parent === current) break;
       current = parent;
     }
@@ -5046,10 +5049,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(namedJob, "namedJob");
   function appendLive(id, from, message) {
-    const dir = join9(controlRoot, id);
+    const dir = join10(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join9(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join10(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -5081,9 +5084,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join9(inboxDir, `.tmp-${stamp}`);
+      const tmp = join10(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join9(inboxDir, stamp));
+      spool.rename(tmp, join10(inboxDir, stamp));
     } catch {
     }
   }
@@ -5208,8 +5211,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join9(controlRoot, id));
-        spool.writeFile(join9(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join10(controlRoot, id));
+        spool.writeFile(join10(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -5519,7 +5522,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join9(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join10(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5542,7 +5545,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join9(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join10(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5574,8 +5577,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join9(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join9(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join10(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join10(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5676,7 +5679,7 @@ transcript ${transcriptPath}` : "") + `${timing}
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join9(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join10(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -6196,7 +6199,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join9(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join10(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
