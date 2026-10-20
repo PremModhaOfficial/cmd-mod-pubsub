@@ -3,6 +3,13 @@
 //   - only the entry module may import `./index.ts`
 //   - runtime imports must not form a cycle
 //   - `./types.ts` is type-only
+//   - every file is a module, not a script
+//
+// The last rule matters more than it looks. A TypeScript file with no top-level
+// `import` or `export` is a SCRIPT: its declarations land in the global scope,
+// and every other file can then use them without importing. That silently
+// hides errors - a name the entry uses but never imports resolves against the
+// leaked global, so the typecheck passes on code that would not run.
 import {readdirSync, readFileSync} from 'node:fs';
 import {join, posix} from 'node:path';
 
@@ -37,6 +44,13 @@ for (const file of files) {
 	for (const match of source.matchAll(statement)) visit(match[3], isTypeOnly(match[1], match[2]));
 	for (const match of source.matchAll(sideEffect)) visit(match[1], false);
 	graph.set(file, edges);
+
+	// A file with no top-level import or export is a script, not a module: its
+	// declarations become globals and leak into every other file.
+	const hasModuleSyntax = /^\s*(?:import|export)\b/m.test(source);
+	if (!hasModuleSyntax) {
+		errors.push(`${file}: has no top-level import or export, so it is a script and its declarations leak as globals`);
+	}
 }
 
 const state = new Map();

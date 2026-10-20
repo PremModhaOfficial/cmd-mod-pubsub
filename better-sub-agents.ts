@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute2, join as join11, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute2, join as join12, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -2548,6 +2548,9 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
 }
 __name(recordFromPlan, "recordFromPlan");
 
+// src/tools.ts
+import { join as join11 } from "node:path";
+
 // src/spawn.ts
 import { join as join10 } from "node:path";
 
@@ -2889,6 +2892,541 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
   return { ...launched, result };
 }
 __name(settleForeground, "settleForeground");
+
+// src/tools.ts
+var okText = /* @__PURE__ */ __name((value) => ({ ok: true, content: [{ type: "text", text: value }] }), "okText");
+var badInput = /* @__PURE__ */ __name((error) => ({ ok: false, error }), "badInput");
+function createTools(ctx) {
+  const {
+    cmd,
+    planCtx,
+    spawnCtx,
+    runtime,
+    spool,
+    logsDir,
+    transcriptsDir,
+    readJob,
+    writeJob,
+    readRecentJobs,
+    refreshJobs,
+    enqueueSignal,
+    safeDrain,
+    cancelJob,
+    registry,
+    ledger,
+    currentOwner,
+    ownerId,
+    rosterNames,
+    namedJob,
+    liveState,
+    appendLive,
+    workerMode,
+    workerSpec,
+    sessionId,
+    forkModeEnabled,
+    listText,
+    scanOutput: scanOutput2,
+    reportText: reportText2,
+    listAgentsVisible: listAgentsVisible2
+  } = ctx;
+  function addSurface(name, description, inputSchema, run, options = {}) {
+    const readOnly = options.readOnly === true;
+    cmd.addTool({ schema: { name, description, input_schema: inputSchema }, ...readOnly ? { readOnly } : {}, run });
+    for (const alias of options.aliases ?? []) {
+      cmd.addTool({
+        schema: { name: alias, description: `[deprecated: use ${name}] ${description}`, input_schema: inputSchema },
+        ...readOnly ? { readOnly } : {},
+        run
+      });
+    }
+  }
+  __name(addSurface, "addSurface");
+  const spawnRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const planned = planFromInput(input, planCtx);
+    if (planned.ok === false) return badInput(planned.error);
+    const plan = planned.plan;
+    const launched = await fire(plan, spawnCtx);
+    if (launched.ok === false) return badInput(launched.error);
+    const spawnedAgentId = readJob(launched.id)?.agentId;
+    if (launched.result !== void 0) {
+      if (launched.result.ok === false) return badInput(launched.result.error);
+      return okText(
+        spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
+${launched.result.text}` : launched.result.text
+      );
+    }
+    const kind = plan.kind === "command" ? "shell (/bin/sh -c)" : `${plan.fork === true ? "fork" : "agent"} (${String(plan.agentType ?? "agent")})${plan.teamName !== void 0 ? ` on team ${plan.teamName}` : ""}`;
+    return okText(
+      `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
+` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
+` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
+The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
+    );
+  }, "spawnRun");
+  const listRun = /* @__PURE__ */ __name(async ({ input }) => {
+    refreshJobs();
+    const limit = Number(input.limit);
+    return okText(
+      listText({
+        state: typeof input.state === "string" && input.state.length > 0 ? input.state : void 0,
+        limit: Number.isFinite(limit) && limit > 0 ? Math.round(limit) : void 0
+      })
+    );
+  }, "listRun");
+  function readLog(file) {
+    try {
+      return spool.readFile(file);
+    } catch {
+      return "";
+    }
+  }
+  __name(readLog, "readLog");
+  function transcriptText(id, record) {
+    const file = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
+    let raw = "";
+    try {
+      raw = spool.readFile(file);
+    } catch {
+      return "";
+    }
+    const parts = [];
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const entry = JSON.parse(line);
+        const update = entry.update;
+        if (update?.sessionUpdate === "agent_message_chunk" && typeof update.content?.text === "string") {
+          parts.push(update.content.text);
+        } else if (update?.sessionUpdate === "tool_call") {
+          parts.push(`[tool] ${String(update.title ?? update.kind ?? "call")}
+`);
+        } else if (typeof entry.line === "string") {
+          parts.push(`${entry.line}
+`);
+        }
+      } catch {
+      }
+    }
+    return parts.join("");
+  }
+  __name(transcriptText, "transcriptText");
+  function outputText(id, input) {
+    const record = readJob(id);
+    if (record === void 0) return badInput(`subagent: no job ${id}`);
+    const state = canonicalState(record.state);
+    const file = String(record.logPath ?? join11(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
+    const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
+    const logText = readLog(file);
+    const log = logText.length > 0 ? logText : transcript;
+    const requested = Number(input.max_chars);
+    const maxChars = Math.min(
+      OUTPUT_MAX_CHARS_CAP,
+      Number.isFinite(requested) && requested > 0 ? Math.max(200, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT
+    );
+    const offset = Number(input.offset);
+    let body;
+    let note = "";
+    if (input.offset !== void 0 && Number.isFinite(offset) && offset >= 0) {
+      body = log.slice(offset, offset + maxChars);
+      note = `
+[chars ${offset}-${Math.min(log.length, offset + maxChars)} of ${log.length}]`;
+    } else if (log.length > maxChars) {
+      body = log.slice(-maxChars);
+      note = `
+[last ${maxChars} of ${log.length} chars]`;
+    } else {
+      body = log;
+    }
+    const facts = [
+      state,
+      record.partial === true ? "partial" : "",
+      typeof record.agentId === "string" ? `agent ${record.agentId}` : "",
+      typeof record.exitCode === "number" ? `exit ${record.exitCode}` : "",
+      typeof record.durationMs === "number" ? `${(record.durationMs / 1e3).toFixed(1)}s` : "",
+      typeof record.model === "string" && record.model.length > 0 ? record.model : "",
+      typeof record.agentType === "string" ? record.agentType : "",
+      typeof record.owner === "string" && record.owner.length > 0 ? `owner ${record.owner.slice(-6)}` : ""
+    ].filter(Boolean).join(" \xB7 ");
+    const timing = state === "queued" || state === "running" ? `
+(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1e3))}s; the result will arrive as a signal)` : "";
+    const visible = reportText2(body, String(record.kind ?? "command"));
+    return okText(
+      `${stateMarker(record.state)} ${id} "${String(record.description ?? "(unlabelled)")}" \xB7 ${facts}
+log ${file}` + (record.transcriptPath !== void 0 ? `
+transcript ${transcriptPath}` : "") + `${timing}
+
+` + (visible.length > 0 ? visible : "(no output yet)") + note
+    );
+  }
+  __name(outputText, "outputText");
+  const outputRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const id = String(input.id ?? "").trim();
+    if (id.length === 0) return badInput("id is required");
+    if (readJob(id) === void 0) return badInput(`subagent: no job ${id}`);
+    const waitMs = Number(input.wait_ms);
+    const wantsWait = input.wait === true || Number.isFinite(waitMs) && waitMs > 0;
+    if (wantsWait) {
+      const budget = Math.min(WAIT_MAX_MS, Number.isFinite(waitMs) && waitMs > 0 ? waitMs : WAIT_DEFAULT_MS);
+      const rounds = Math.ceil(budget / WAIT_POLL_MS) + 1;
+      for (let round = 0; round < rounds; round += 1) {
+        const record = readJob(id);
+        if (record === void 0 || isTerminalState(record.state)) break;
+        await runtime.sleep(WAIT_POLL_MS);
+      }
+    }
+    return outputText(id, input);
+  }, "outputRun");
+  const cancelRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const id = String(input.id ?? "").trim();
+    if (id.length === 0) return badInput("id is required");
+    const result = cancelJob(id);
+    return result.ok ? okText(result.message) : badInput(result.message);
+  }, "cancelRun");
+  const resumeRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const id = String(input.id ?? "").trim();
+    if (id.length === 0) return badInput("id is required");
+    const instruction = String(input.prompt ?? "").trim();
+    if (instruction.length === 0) return badInput("prompt is required: it is the instruction for the resumed run");
+    const record = readJob(id) ?? readRecentJobs(ACTIVE_JOB_SCAN_MAX).find((job) => typeof job.agentId === "string" && job.agentId === id);
+    if (record === void 0) return badInput(`subagent: no job or agent ${id}`);
+    const jobId = record.id;
+    const state = normalizeState(record.state);
+    if (state !== void 0 && !isTerminal(state)) return badInput(`subagent: job ${jobId} is still ${state}`);
+    if (record.prompt === void 0) {
+      return badInput(`subagent: job ${jobId} is a shell job; there is no agent session to resume`);
+    }
+    if (record.fork !== true && record.agentId === void 0) {
+      return badInput(
+        `subagent: job ${jobId} has no agent id (${String(record.agentType ?? "explore or plan")} is one-shot, or the record predates agent ids); it cannot be resumed`
+      );
+    }
+    if (liveState(record).alive) {
+      return badInput(
+        `subagent: job ${jobId} is still running; send it a live message with subagent_send` + (record.name === void 0 ? " once it finishes, or wait for its result" : `({to: "${record.name}", message}) instead`)
+      );
+    }
+    const planned = planFromRecord(record, instruction, "resume", planCtx);
+    if (planned.ok === false) return badInput(planned.error);
+    const launched = await fire(planned.plan, spawnCtx);
+    if (launched.ok === false) return badInput(launched.error);
+    const resumedAgentId = readJob(launched.id)?.agentId;
+    return launchedToolResult(
+      launched,
+      resumedAgentId,
+      `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
+` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
+` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
+` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
+    );
+  }, "resumeRun");
+  function agentsToolText(scope) {
+    registry.refresh();
+    const wanted = String(scope ?? "").trim().toLowerCase();
+    const entries = registry.entries().filter((entry) => wanted.length === 0 || entry.scope === wanted);
+    if (entries.length === 0) return `no${wanted.length > 0 ? ` ${wanted}` : ""} agent definitions`;
+    const lines = entries.map((entry) => {
+      const state = entry.valid ? "valid" : `invalid: ${entry.reason ?? "unknown"}`;
+      const model = entry.definition?.model !== void 0 ? ` model=${entry.definition.model}` : "";
+      const tools = entry.definition?.tools !== void 0 ? ` tools=${entry.definition.tools.join(",")}` : "";
+      const source = entry.sourcePath.length > 0 ? ` \xB7 ${entry.sourcePath}` : "";
+      return `  ${entry.name.length > 0 ? entry.name : "(unnamed)"} \xB7 ${entry.scope} \xB7 ${state}${model}${tools}${source}`;
+    });
+    return `${entries.length} definition(s)${wanted.length > 0 ? ` in ${wanted}` : ""}:
+${lines.join("\n")}`;
+  }
+  __name(agentsToolText, "agentsToolText");
+  function listAgentsText() {
+    const lines = [`${ROSTER_MAIN} \u2014 this conversation`];
+    for (const name of rosterNames()) {
+      const record = namedJob(name);
+      if (record === void 0) continue;
+      lines.push(`${name} \u2014 ${canonicalState(record.state)} (job ${record.id})`);
+    }
+    return lines.join("\n");
+  }
+  __name(listAgentsText, "listAgentsText");
+  const noteRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const title = typeof input.title === "string" ? input.title : "";
+    if (title.length === 0) return badInput("title is required");
+    const body = typeof input.body === "string" ? input.body : "";
+    const owner = currentOwner();
+    const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    enqueueSignal({
+      id,
+      owner,
+      description: title,
+      kind: "note",
+      state: "note",
+      exitCode: null,
+      title,
+      body,
+      sessionId: sessionId()
+    });
+    safeDrain();
+    refreshJobs();
+    return okText(ledger.has(id) ? "delivered" : "queued for this session");
+  }, "noteRun");
+  function launchedToolResult(launched, agentId, asyncText) {
+    if (launched.result !== void 0) {
+      if (launched.result.ok === false) return badInput(launched.result.error);
+      return okText(agentId !== void 0 ? `agent id ${agentId}
+${launched.result.text}` : launched.result.text);
+    }
+    return okText(asyncText);
+  }
+  __name(launchedToolResult, "launchedToolResult");
+  async function sendToRecord(record, message, from) {
+    const label = String(record.name ?? record.id);
+    const { alive, busy } = liveState(record);
+    if (record.fork !== true && record.agentId === void 0 && record.live !== true) {
+      return badInput(`subagent: ${label} is one-shot (no agent id); it cannot be messaged`);
+    }
+    if (alive) {
+      if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${label}: its control queue is not writable`);
+      return okText(
+        `${busy ? `queued for ${label}'s next safe point` : `sent to idle ${label}; it starts a turn`} (job ${record.id}).
+The reply arrives here as its own message signal.`
+      );
+    }
+    const planned = planFromRecord(record, message, "message", planCtx);
+    if (planned.ok === false) return badInput(planned.error);
+    const launched = await fire(planned.plan, spawnCtx);
+    if (launched.ok === false) return badInput(launched.error);
+    return launchedToolResult(
+      launched,
+      readJob(launched.id)?.agentId,
+      `resumed ${label} as ${launched.id} "${String(record.description ?? record.id)} (message)", pid ${launched.pid}.
+The reply arrives here as its own signal.`
+    );
+  }
+  __name(sendToRecord, "sendToRecord");
+  const sendLiveRun = /* @__PURE__ */ __name(async ({ input }) => {
+    const to = String(input.to ?? "").trim();
+    const message = typeof input.message === "string" ? input.message : "";
+    if (to.length === 0) return badInput("to is required: a named agent or main");
+    if (message.trim().length === 0) return badInput("message is required and must not be empty");
+    const from = workerMode ? String(workerSpec()?.name ?? "worker") : ROSTER_MAIN;
+    if (to === ROSTER_MAIN) {
+      const id = `live-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+      const scan = scanOutput2(message);
+      enqueueSignal({
+        id,
+        owner: workerMode ? workerSpec()?.owner : ownerId(),
+        description: `message from ${from}`,
+        kind: "message",
+        state: "note",
+        exitCode: null,
+        title: `message from ${from}`,
+        body: scan.text,
+        sessionId: workerMode ? workerSpec()?.sessionId : sessionId(),
+        ...workerMode ? { scanned: true, scanMatches: scan.matches } : {}
+      });
+      if (!workerMode) {
+        safeDrain();
+        refreshJobs();
+      }
+      return okText(`sent a message to ${ROSTER_MAIN} from ${from}`);
+    }
+    const record = namedJob(to);
+    if (record === void 0) {
+      const names = rosterNames();
+      return badInput(
+        `no agent named "${to}"${names.length > 0 ? `; addressable: ${names.join(", ")}` : "; no named agents in this session"}`
+      );
+    }
+    return sendToRecord(record, message, from);
+  }, "sendLiveRun");
+  function register() {
+    addSurface(
+      "subagent_spawn",
+      "Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode. Pass `team_name` to join an agent team as a foreground teammate. Pass `subagent_type: fork` to inherit the main conversation." + (forkModeEnabled ? " Fork mode is on: agent jobs run in the background and `run_in_background` is not accepted." : ""),
+      {
+        type: "object",
+        properties: (() => {
+          const properties = {
+            description: { type: "string", description: "Short name for this job, used in the signal title." },
+            label: { type: "string", description: "Alias for description." },
+            name: { type: "string", description: "Address this agent later with subagent_send. A named agent appears in its siblings' roster." },
+            team_name: { type: "string", description: "Join this agent team. A teammate runs in the foreground and keeps the task and cron tools." },
+            prompt: { type: "string", description: "Prompt for a detached headless Command Code agent." },
+            command: { type: "string", description: "Shell command to run detached under /bin/sh -c." },
+            agent_type: { type: "string", description: "Deprecated alias for subagent_type. Use subagent_type." },
+            subagent_type: {
+              type: "string",
+              description: "Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins."
+            },
+            model: { type: "string", description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model." },
+            effort: { type: "string", description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort." },
+            tools: { type: "string", description: "Comma-separated tool list (or an array). Only these tools remain; overrides the definition." },
+            disallowed_tools: { type: "string", description: "Comma-separated tool list (or an array) to remove. Wins over tools." },
+            max_turns: { type: "number", description: "Cap the agent conversation turns." },
+            permission_mode: {
+              type: "string",
+              description: "Permission mode for an agent job: default, acceptEdits, auto, dontAsk, bypassPermissions, plan, or manual. The main session's mode wins when it is acceptEdits, auto, or bypassPermissions; bypassPermissions otherwise requires the main session to be in it."
+            },
+            timeout_ms: { type: "number", description: "Kill the job after this many milliseconds and report a timeout." },
+            run_in_background: {
+              type: "boolean",
+              description: "false waits for the run and returns its result in this call; true (or omitted) returns immediately and delivers the result as a signal. A definition pinned to background, or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, can override this."
+            },
+            cwd: { type: "string", description: "Working directory. Defaults to the mod workspace root." }
+          };
+          if (forkModeEnabled) delete properties.run_in_background;
+          return properties;
+        })(),
+        required: []
+      },
+      spawnRun,
+      { aliases: ["pubsub_fire"] }
+    );
+    addSurface(
+      "subagent_list",
+      "List spawned jobs with their lifecycle states, subagent_type, agent name, model, elapsed time and owner, and count the signals still waiting for this session.",
+      {
+        type: "object",
+        properties: {
+          state: { type: "string", description: "Only jobs in this state (queued, running, waiting-input, done, failed, canceled)." },
+          limit: { type: "number", description: "Show at most this many jobs." }
+        },
+        required: []
+      },
+      listRun,
+      { readOnly: true, aliases: ["pubsub_list"] }
+    );
+    addSurface(
+      "subagent_output",
+      "Read one job: its state, exit code, duration and owner, plus a bounded slice of its log. By default the tail; `offset` reads from a character offset, `max_chars` bounds the slice.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Job id from subagent_spawn or subagent_list." },
+          wait: { type: "boolean", description: "Block briefly until the job finishes (bounded, 10s by default)." },
+          wait_ms: { type: "number", description: "How long to wait, capped at 60s." },
+          offset: { type: "number", description: "Character offset into the log." },
+          max_chars: { type: "number", description: "Maximum characters to return." }
+        },
+        required: ["id"]
+      },
+      outputRun,
+      { readOnly: true }
+    );
+    addSurface(
+      "subagent_cancel",
+      "Cancel a queued or running subagent job by id (SIGTERM, then SIGKILL after 1s). The firing session receives one canceled signal.",
+      {
+        type: "object",
+        properties: { id: { type: "string", description: "Job id from subagent_list or subagent_spawn." } },
+        required: ["id"]
+      },
+      cancelRun,
+      { aliases: ["pubsub_cancel"] }
+    );
+    addSurface(
+      "subagent_resume",
+      "Resume a finished agent job in its own worker session and continue it with a new instruction. The resumed run is a new job with its own signal.",
+      {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Job id of the finished agent job." },
+          prompt: { type: "string", description: "The instruction for the resumed run." }
+        },
+        required: ["id", "prompt"]
+      },
+      resumeRun
+    );
+    addSurface(
+      "subagent_agents",
+      "List the available agent definitions: scope, model, tools, validity, and the file that provides each one. Pass `scope` to filter to project, user, or builtin.",
+      {
+        type: "object",
+        properties: {
+          scope: { type: "string", description: "Only definitions from this scope (project, user, builtin)." }
+        },
+        required: []
+      },
+      async ({ input }) => okText(agentsToolText(typeof input.scope === "string" ? input.scope : void 0)),
+      { readOnly: true }
+    );
+    const canMessageAcrossSessions = crossSessionEnabled(runtime.env);
+    if (listAgentsVisible2({ background: workerMode ? workerSpec()?.background === true : false, crossSessionMessaging: canMessageAcrossSessions })) {
+      addSurface(
+        "ListAgents",
+        "List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.",
+        { type: "object", properties: {}, required: [] },
+        async () => okText(listAgentsText()),
+        { readOnly: true }
+      );
+    }
+    if (workerSpec() !== void 0) {
+      addSurface(
+        "SubagentHandback",
+        "Hand your final report back to the conversation that receives this run's result. The report is delivered as its own message; end the turn afterwards. The wrapper suppresses the duplicate end-of-turn result.",
+        {
+          type: "object",
+          properties: {
+            report: { type: "string", description: "The final report for the parent conversation." }
+          },
+          required: ["report"]
+        },
+        async ({ input }) => {
+          const report = String(input.report ?? "").trim();
+          if (report.length === 0) return badInput("report is required and must not be empty");
+          const id = String(workerSpec()?.id ?? "");
+          const record = id.length === 0 ? void 0 : readJob(id);
+          if (record === void 0) return badInput(`subagent: no job ${id || "(worker)"}`);
+          const now = runtime.now();
+          const scan = scanOutput2(report);
+          record.handbackAt = now;
+          record.updatedAt = now;
+          writeJob(record);
+          enqueueSignal(
+            signalOf({ ...record, id: `${id}-handback-${now.toString(36)}` }, {
+              state: "done",
+              finishedAt: now,
+              durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
+              body: scan.text,
+              scanned: true,
+              scanMatches: scan.matches,
+              title: `${String(record.description ?? id)} handback`
+            })
+          );
+          refreshJobs();
+          return okText(`handed the report back (job ${id}); it reaches the parent as one message`);
+        }
+      );
+    }
+    addSurface(
+      "subagent_send",
+      'Send a live message to a named agent (or "main"). A running agent queues it and answers at its next safe point; an idle agent starts a turn; a finished agent resumes its session with full context. The reply arrives later as its own message signal, so do not wait for it here.',
+      {
+        type: "object",
+        properties: {
+          to: { type: "string", description: 'A named agent, or "main" for this conversation.' },
+          message: { type: "string", description: "The message to deliver. The target acts on it in its own session." }
+        },
+        required: ["to", "message"]
+      },
+      sendLiveRun
+    );
+    addSurface(
+      "pubsub_send",
+      "[deprecated: live messaging moved to subagent_send] Publish a note into the agent loop of THIS session. It is delivered as a visible user turn. This is not live messaging to another agent.",
+      {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "One line, shown in the signal header." },
+          body: { type: "string", description: "The detail." }
+        },
+        required: ["title"]
+      },
+      noteRun
+    );
+  }
+  __name(register, "register");
+  return { register, outputText, sendToRecord };
+}
+__name(createTools, "createTools");
 
 // src/index.ts
 function scanOutput(text) {
@@ -4175,11 +4713,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join11(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join12(cwd, path);
     let dir = dirname4(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join11(dir, "CLAUDE.md");
+      const filePath = join12(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -4207,13 +4745,13 @@ function claudeMdHierarchy(options) {
     const user = startupFile(fs, policy.user);
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join11(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join12(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join11(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join12(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join11(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join12(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -4225,11 +4763,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join11(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join11(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join12(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join12(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join11(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join11(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join12(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join12(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -4237,8 +4775,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join11(options.home, ".commandcode", "agent-memory") : scope === "project" ? join11(options.cwd, ".commandcode", "agent-memory") : join11(options.cwd, ".commandcode", "agent-memory-local");
-  return join11(root, name);
+  const root = scope === "user" ? join12(options.home, ".commandcode", "agent-memory") : scope === "project" ? join12(options.cwd, ".commandcode", "agent-memory") : join12(options.cwd, ".commandcode", "agent-memory-local");
+  return join12(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -4275,7 +4813,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join11(dir, MEMORY_INDEX_FILE);
+  const path = join12(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -4480,7 +5018,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join11(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join12(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -4509,7 +5047,7 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join11(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join12(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
@@ -4833,15 +5371,15 @@ function index_default(cmd, overrides = {}) {
     flag: optionValue(cmd, FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join11(root, "inbox");
-  const claimedDir = join11(root, "claimed");
-  const orphanedDir = join11(root, "orphaned");
-  const logsDir = join11(root, "logs");
-  const jobsDir = join11(root, "jobs");
-  const transcriptsDir = join11(root, "transcripts");
-  const worktreesDir = join11(root, "worktrees");
-  const controlRoot = join11(root, "control");
-  const ledgerPath = join11(root, "delivered.jsonl");
+  const inboxDir = join12(root, "inbox");
+  const claimedDir = join12(root, "claimed");
+  const orphanedDir = join12(root, "orphaned");
+  const logsDir = join12(root, "logs");
+  const jobsDir = join12(root, "jobs");
+  const transcriptsDir = join12(root, "transcripts");
+  const worktreesDir = join12(root, "worktrees");
+  const controlRoot = join12(root, "control");
+  const ledgerPath = join12(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -4864,7 +5402,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: optionValue(cmd, CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join11(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join12(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -4968,13 +5506,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join11(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join12(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join11(current, ".git"));
+        spool.stat(join12(current, ".git"));
         break;
       } catch {
       }
@@ -5164,10 +5702,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(namedJob, "namedJob");
   function appendLive(id, from, message) {
-    const dir = join11(controlRoot, id);
+    const dir = join12(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join11(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join12(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -5199,9 +5737,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join11(inboxDir, `.tmp-${stamp}`);
+      const tmp = join12(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join11(inboxDir, stamp));
+      spool.rename(tmp, join12(inboxDir, stamp));
     } catch {
     }
   }
@@ -5326,8 +5864,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join11(controlRoot, id));
-        spool.writeFile(join11(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join12(controlRoot, id));
+        spool.writeFile(join12(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -5529,20 +6067,14 @@ function index_default(cmd, overrides = {}) {
       }
     }, "render")
   });
-  const okText = /* @__PURE__ */ __name((value) => ({ ok: true, content: [{ type: "text", text: value }] }), "okText");
-  const badInput = /* @__PURE__ */ __name((error) => ({ ok: false, error }), "badInput");
-  function addSurface(name, description, inputSchema, run, options = {}) {
-    const readOnly = options.readOnly === true;
-    cmd.addTool({ schema: { name, description, input_schema: inputSchema }, ...readOnly ? { readOnly } : {}, run });
-    for (const alias of options.aliases ?? []) {
-      cmd.addTool({
-        schema: { name: alias, description: `[deprecated: use ${name}] ${description}`, input_schema: inputSchema },
-        ...readOnly ? { readOnly } : {},
-        run
-      });
+  function readLog(file) {
+    try {
+      return spool.readFile(file);
+    } catch {
+      return "";
     }
   }
-  __name(addSurface, "addSurface");
+  __name(readLog, "readLog");
   const planCtx = {
     fs: spool,
     env: runtime.env,
@@ -5619,486 +6151,40 @@ function index_default(cmd, overrides = {}) {
     answerPendingPermission: /* @__PURE__ */ __name((controlDir, answered) => answerPendingPermission(controlDir, answered, permissionCtx), "answerPendingPermission"),
     backgrounded: backgroundedForegrounds
   };
-  const spawnRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const planned = planFromInput(input, planCtx);
-    if (planned.ok === false) return badInput(planned.error);
-    const plan = planned.plan;
-    const launched = await fire(plan, spawnCtx);
-    if (launched.ok === false) return badInput(launched.error);
-    const spawnedAgentId = readJob(launched.id)?.agentId;
-    if (launched.result !== void 0) {
-      if (launched.result.ok === false) return badInput(launched.result.error);
-      return okText(
-        spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-${launched.result.text}` : launched.result.text
-      );
-    }
-    const kind = plan.kind === "command" ? "shell (/bin/sh -c)" : `${plan.fork === true ? "fork" : "agent"} (${String(plan.agentType ?? "agent")})${plan.teamName !== void 0 ? ` on team ${plan.teamName}` : ""}`;
-    return okText(
-      `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
-` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
-The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
-    );
-  }, "spawnRun");
-  const listRun = /* @__PURE__ */ __name(async ({ input }) => {
-    refreshJobs();
-    const limit = Number(input.limit);
-    return okText(
-      listText({
-        state: typeof input.state === "string" && input.state.length > 0 ? input.state : void 0,
-        limit: Number.isFinite(limit) && limit > 0 ? Math.round(limit) : void 0
-      })
-    );
-  }, "listRun");
-  function readLog(file) {
-    try {
-      return spool.readFile(file);
-    } catch {
-      return "";
-    }
-  }
-  __name(readLog, "readLog");
-  function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
-    let raw = "";
-    try {
-      raw = spool.readFile(file);
-    } catch {
-      return "";
-    }
-    const parts = [];
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line);
-        const update = entry.update;
-        if (update?.sessionUpdate === "agent_message_chunk" && typeof update.content?.text === "string") {
-          parts.push(update.content.text);
-        } else if (update?.sessionUpdate === "tool_call") {
-          parts.push(`[tool] ${String(update.title ?? update.kind ?? "call")}
-`);
-        } else if (typeof entry.line === "string") {
-          parts.push(`${entry.line}
-`);
-        }
-      } catch {
-      }
-    }
-    return parts.join("");
-  }
-  __name(transcriptText, "transcriptText");
-  function outputText(id, input) {
-    const record = readJob(id);
-    if (record === void 0) return badInput(`subagent: no job ${id}`);
-    const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join11(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
-    const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
-    const logText = readLog(file);
-    const log = logText.length > 0 ? logText : transcript;
-    const requested = Number(input.max_chars);
-    const maxChars = Math.min(
-      OUTPUT_MAX_CHARS_CAP,
-      Number.isFinite(requested) && requested > 0 ? Math.max(200, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT
-    );
-    const offset = Number(input.offset);
-    let body;
-    let note = "";
-    if (input.offset !== void 0 && Number.isFinite(offset) && offset >= 0) {
-      body = log.slice(offset, offset + maxChars);
-      note = `
-[chars ${offset}-${Math.min(log.length, offset + maxChars)} of ${log.length}]`;
-    } else if (log.length > maxChars) {
-      body = log.slice(-maxChars);
-      note = `
-[last ${maxChars} of ${log.length} chars]`;
-    } else {
-      body = log;
-    }
-    const facts = [
-      state,
-      record.partial === true ? "partial" : "",
-      typeof record.agentId === "string" ? `agent ${record.agentId}` : "",
-      typeof record.exitCode === "number" ? `exit ${record.exitCode}` : "",
-      typeof record.durationMs === "number" ? `${(record.durationMs / 1e3).toFixed(1)}s` : "",
-      typeof record.model === "string" && record.model.length > 0 ? record.model : "",
-      typeof record.agentType === "string" ? record.agentType : "",
-      typeof record.owner === "string" && record.owner.length > 0 ? `owner ${record.owner.slice(-6)}` : ""
-    ].filter(Boolean).join(" \xB7 ");
-    const timing = state === "queued" || state === "running" ? `
-(running ${Math.max(0, Math.round((runtime.now() - Number(record.startedAt ?? runtime.now())) / 1e3))}s; the result will arrive as a signal)` : "";
-    const visible = reportText(body, String(record.kind ?? "command"));
-    return okText(
-      `${stateMarker(record.state)} ${id} "${String(record.description ?? "(unlabelled)")}" \xB7 ${facts}
-log ${file}` + (record.transcriptPath !== void 0 ? `
-transcript ${transcriptPath}` : "") + `${timing}
-
-` + (visible.length > 0 ? visible : "(no output yet)") + note
-    );
-  }
-  __name(outputText, "outputText");
-  const outputRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const id = String(input.id ?? "").trim();
-    if (id.length === 0) return badInput("id is required");
-    if (readJob(id) === void 0) return badInput(`subagent: no job ${id}`);
-    const waitMs = Number(input.wait_ms);
-    const wantsWait = input.wait === true || Number.isFinite(waitMs) && waitMs > 0;
-    if (wantsWait) {
-      const budget = Math.min(WAIT_MAX_MS, Number.isFinite(waitMs) && waitMs > 0 ? waitMs : WAIT_DEFAULT_MS);
-      const rounds = Math.ceil(budget / WAIT_POLL_MS) + 1;
-      for (let round = 0; round < rounds; round += 1) {
-        const record = readJob(id);
-        if (record === void 0 || isTerminalState(record.state)) break;
-        await runtime.sleep(WAIT_POLL_MS);
-      }
-    }
-    return outputText(id, input);
-  }, "outputRun");
-  const cancelRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const id = String(input.id ?? "").trim();
-    if (id.length === 0) return badInput("id is required");
-    const result = cancelJob(id);
-    return result.ok ? okText(result.message) : badInput(result.message);
-  }, "cancelRun");
-  const resumeRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const id = String(input.id ?? "").trim();
-    if (id.length === 0) return badInput("id is required");
-    const instruction = String(input.prompt ?? "").trim();
-    if (instruction.length === 0) return badInput("prompt is required: it is the instruction for the resumed run");
-    const record = readJob(id) ?? readRecentJobs(ACTIVE_JOB_SCAN_MAX).find((job) => typeof job.agentId === "string" && job.agentId === id);
-    if (record === void 0) return badInput(`subagent: no job or agent ${id}`);
-    const jobId = record.id;
-    const state = normalizeState(record.state);
-    if (state !== void 0 && !isTerminal(state)) return badInput(`subagent: job ${jobId} is still ${state}`);
-    if (record.prompt === void 0) {
-      return badInput(`subagent: job ${jobId} is a shell job; there is no agent session to resume`);
-    }
-    if (record.fork !== true && record.agentId === void 0) {
-      return badInput(
-        `subagent: job ${jobId} has no agent id (${String(record.agentType ?? "explore or plan")} is one-shot, or the record predates agent ids); it cannot be resumed`
-      );
-    }
-    if (liveState(record).alive) {
-      return badInput(
-        `subagent: job ${jobId} is still running; send it a live message with subagent_send` + (record.name === void 0 ? " once it finishes, or wait for its result" : `({to: "${record.name}", message}) instead`)
-      );
-    }
-    const planned = planFromRecord(record, instruction, "resume", planCtx);
-    if (planned.ok === false) return badInput(planned.error);
-    const launched = await fire(planned.plan, spawnCtx);
-    if (launched.ok === false) return badInput(launched.error);
-    const resumedAgentId = readJob(launched.id)?.agentId;
-    return launchedToolResult(
-      launched,
-      resumedAgentId,
-      `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
-` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
-` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
-    );
-  }, "resumeRun");
-  function agentsToolText(scope) {
-    registry.refresh();
-    const wanted = String(scope ?? "").trim().toLowerCase();
-    const entries = registry.entries().filter((entry) => wanted.length === 0 || entry.scope === wanted);
-    if (entries.length === 0) return `no${wanted.length > 0 ? ` ${wanted}` : ""} agent definitions`;
-    const lines = entries.map((entry) => {
-      const state = entry.valid ? "valid" : `invalid: ${entry.reason ?? "unknown"}`;
-      const model = entry.definition?.model !== void 0 ? ` model=${entry.definition.model}` : "";
-      const tools = entry.definition?.tools !== void 0 ? ` tools=${entry.definition.tools.join(",")}` : "";
-      const source = entry.sourcePath.length > 0 ? ` \xB7 ${entry.sourcePath}` : "";
-      return `  ${entry.name.length > 0 ? entry.name : "(unnamed)"} \xB7 ${entry.scope} \xB7 ${state}${model}${tools}${source}`;
-    });
-    return `${entries.length} definition(s)${wanted.length > 0 ? ` in ${wanted}` : ""}:
-${lines.join("\n")}`;
-  }
-  __name(agentsToolText, "agentsToolText");
-  function listAgentsText() {
-    const lines = [`${ROSTER_MAIN} \u2014 this conversation`];
-    for (const name of rosterNames()) {
-      const record = namedJob(name);
-      if (record === void 0) continue;
-      lines.push(`${name} \u2014 ${canonicalState(record.state)} (job ${record.id})`);
-    }
-    return lines.join("\n");
-  }
-  __name(listAgentsText, "listAgentsText");
-  const noteRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const title = typeof input.title === "string" ? input.title : "";
-    if (title.length === 0) return badInput("title is required");
-    const body = typeof input.body === "string" ? input.body : "";
-    const owner = currentOwner();
-    const id = `direct-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    enqueueSignal({
-      id,
-      owner,
-      description: title,
-      kind: "note",
-      state: "note",
-      exitCode: null,
-      title,
-      body,
-      sessionId
-    });
-    safeDrain();
-    refreshJobs();
-    return okText(ledger.has(id) ? "delivered" : "queued for this session");
-  }, "noteRun");
-  function launchedToolResult(launched, agentId, asyncText) {
-    if (launched.result !== void 0) {
-      if (launched.result.ok === false) return badInput(launched.result.error);
-      return okText(agentId !== void 0 ? `agent id ${agentId}
-${launched.result.text}` : launched.result.text);
-    }
-    return okText(asyncText);
-  }
-  __name(launchedToolResult, "launchedToolResult");
-  async function sendToRecord(record, message, from) {
-    const label = String(record.name ?? record.id);
-    const { alive, busy } = liveState(record);
-    if (record.fork !== true && record.agentId === void 0 && record.live !== true) {
-      return badInput(`subagent: ${label} is one-shot (no agent id); it cannot be messaged`);
-    }
-    if (alive) {
-      if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${label}: its control queue is not writable`);
-      return okText(
-        `${busy ? `queued for ${label}'s next safe point` : `sent to idle ${label}; it starts a turn`} (job ${record.id}).
-The reply arrives here as its own message signal.`
-      );
-    }
-    const planned = planFromRecord(record, message, "message", planCtx);
-    if (planned.ok === false) return badInput(planned.error);
-    const launched = await fire(planned.plan, spawnCtx);
-    if (launched.ok === false) return badInput(launched.error);
-    return launchedToolResult(
-      launched,
-      readJob(launched.id)?.agentId,
-      `resumed ${label} as ${launched.id} "${String(record.description ?? record.id)} (message)", pid ${launched.pid}.
-The reply arrives here as its own signal.`
-    );
-  }
-  __name(sendToRecord, "sendToRecord");
-  const sendLiveRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const to = String(input.to ?? "").trim();
-    const message = typeof input.message === "string" ? input.message : "";
-    if (to.length === 0) return badInput("to is required: a named agent or main");
-    if (message.trim().length === 0) return badInput("message is required and must not be empty");
-    const from = workerMode ? String(workerSpec?.name ?? "worker") : ROSTER_MAIN;
-    if (to === ROSTER_MAIN) {
-      const id = `live-${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-      const scan = scanOutput(message);
-      enqueueSignal({
-        id,
-        owner: workerMode ? workerSpec?.owner : ownerId(),
-        description: `message from ${from}`,
-        kind: "message",
-        state: "note",
-        exitCode: null,
-        title: `message from ${from}`,
-        body: scan.text,
-        sessionId: workerMode ? workerSpec?.sessionId : sessionId,
-        ...workerMode ? { scanned: true, scanMatches: scan.matches } : {}
-      });
-      if (!workerMode) {
-        safeDrain();
-        refreshJobs();
-      }
-      return okText(`sent a message to ${ROSTER_MAIN} from ${from}`);
-    }
-    const record = namedJob(to);
-    if (record === void 0) {
-      const names = rosterNames();
-      return badInput(
-        `no agent named "${to}"${names.length > 0 ? `; addressable: ${names.join(", ")}` : "; no named agents in this session"}`
-      );
-    }
-    return sendToRecord(record, message, from);
-  }, "sendLiveRun");
-  addSurface(
-    "subagent_spawn",
-    "Start a subagent. With `run_in_background: false` the call waits and returns the result; otherwise it returns immediately and the result arrives later as a separate message on its own - do not poll for it, and do not wait. Pass `prompt` for a headless Command Code agent, or `command` for a shell command. A definition with `background: true` or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS can override the requested mode. Pass `team_name` to join an agent team as a foreground teammate. Pass `subagent_type: fork` to inherit the main conversation." + (forkModeEnabled ? " Fork mode is on: agent jobs run in the background and `run_in_background` is not accepted." : ""),
-    {
-      type: "object",
-      properties: (() => {
-        const properties = {
-          description: { type: "string", description: "Short name for this job, used in the signal title." },
-          label: { type: "string", description: "Alias for description." },
-          name: { type: "string", description: "Address this agent later with subagent_send. A named agent appears in its siblings' roster." },
-          team_name: { type: "string", description: "Join this agent team. A teammate runs in the foreground and keeps the task and cron tools." },
-          prompt: { type: "string", description: "Prompt for a detached headless Command Code agent." },
-          command: { type: "string", description: "Shell command to run detached under /bin/sh -c." },
-          agent_type: { type: "string", description: "Deprecated alias for subagent_type. Use subagent_type." },
-          subagent_type: {
-            type: "string",
-            description: "Agent definition to run, by name. Omit for 'general-purpose'. A project or user definition in .commandcode/agents/ overrides the built-ins."
-          },
-          model: { type: "string", description: "Model for an agent job. Overrides the definition's model; 'inherit' means the session model." },
-          effort: { type: "string", description: "Reasoning effort for an agent job: low, medium, high, xhigh, or max. Overrides the definition's effort." },
-          tools: { type: "string", description: "Comma-separated tool list (or an array). Only these tools remain; overrides the definition." },
-          disallowed_tools: { type: "string", description: "Comma-separated tool list (or an array) to remove. Wins over tools." },
-          max_turns: { type: "number", description: "Cap the agent conversation turns." },
-          permission_mode: {
-            type: "string",
-            description: "Permission mode for an agent job: default, acceptEdits, auto, dontAsk, bypassPermissions, plan, or manual. The main session's mode wins when it is acceptEdits, auto, or bypassPermissions; bypassPermissions otherwise requires the main session to be in it."
-          },
-          timeout_ms: { type: "number", description: "Kill the job after this many milliseconds and report a timeout." },
-          run_in_background: {
-            type: "boolean",
-            description: "false waits for the run and returns its result in this call; true (or omitted) returns immediately and delivers the result as a signal. A definition pinned to background, or CLAUDE_CODE_DISABLE_BACKGROUND_TASKS, can override this."
-          },
-          cwd: { type: "string", description: "Working directory. Defaults to the mod workspace root." }
-        };
-        if (forkModeEnabled) delete properties.run_in_background;
-        return properties;
-      })(),
-      required: []
-    },
-    spawnRun,
-    { aliases: ["pubsub_fire"] }
-  );
-  addSurface(
-    "subagent_list",
-    "List spawned jobs with their lifecycle states, subagent_type, agent name, model, elapsed time and owner, and count the signals still waiting for this session.",
-    {
-      type: "object",
-      properties: {
-        state: { type: "string", description: "Only jobs in this state (queued, running, waiting-input, done, failed, canceled)." },
-        limit: { type: "number", description: "Show at most this many jobs." }
-      },
-      required: []
-    },
-    listRun,
-    { readOnly: true, aliases: ["pubsub_list"] }
-  );
-  addSurface(
-    "subagent_output",
-    "Read one job: its state, exit code, duration and owner, plus a bounded slice of its log. By default the tail; `offset` reads from a character offset, `max_chars` bounds the slice.",
-    {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "Job id from subagent_spawn or subagent_list." },
-        wait: { type: "boolean", description: "Block briefly until the job finishes (bounded, 10s by default)." },
-        wait_ms: { type: "number", description: "How long to wait, capped at 60s." },
-        offset: { type: "number", description: "Character offset into the log." },
-        max_chars: { type: "number", description: "Maximum characters to return." }
-      },
-      required: ["id"]
-    },
-    outputRun,
-    { readOnly: true }
-  );
-  addSurface(
-    "subagent_cancel",
-    "Cancel a queued or running subagent job by id (SIGTERM, then SIGKILL after 1s). The firing session receives one canceled signal.",
-    {
-      type: "object",
-      properties: { id: { type: "string", description: "Job id from subagent_list or subagent_spawn." } },
-      required: ["id"]
-    },
-    cancelRun,
-    { aliases: ["pubsub_cancel"] }
-  );
-  addSurface(
-    "subagent_resume",
-    "Resume a finished agent job in its own worker session and continue it with a new instruction. The resumed run is a new job with its own signal.",
-    {
-      type: "object",
-      properties: {
-        id: { type: "string", description: "Job id of the finished agent job." },
-        prompt: { type: "string", description: "The instruction for the resumed run." }
-      },
-      required: ["id", "prompt"]
-    },
-    resumeRun
-  );
-  addSurface(
-    "subagent_agents",
-    "List the available agent definitions: scope, model, tools, validity, and the file that provides each one. Pass `scope` to filter to project, user, or builtin.",
-    {
-      type: "object",
-      properties: {
-        scope: { type: "string", description: "Only definitions from this scope (project, user, builtin)." }
-      },
-      required: []
-    },
-    async ({ input }) => okText(agentsToolText(typeof input.scope === "string" ? input.scope : void 0)),
-    { readOnly: true }
-  );
-  const canMessageAcrossSessions = crossSessionEnabled(runtime.env);
-  if (listAgentsVisible({ background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging: canMessageAcrossSessions })) {
-    addSurface(
-      "ListAgents",
-      "List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.",
-      { type: "object", properties: {}, required: [] },
-      async () => okText(listAgentsText()),
-      { readOnly: true }
-    );
-  }
-  if (workerSpec !== void 0) {
-    addSurface(
-      "SubagentHandback",
-      "Hand your final report back to the conversation that receives this run's result. The report is delivered as its own message; end the turn afterwards. The wrapper suppresses the duplicate end-of-turn result.",
-      {
-        type: "object",
-        properties: {
-          report: { type: "string", description: "The final report for the parent conversation." }
-        },
-        required: ["report"]
-      },
-      async ({ input }) => {
-        const report = String(input.report ?? "").trim();
-        if (report.length === 0) return badInput("report is required and must not be empty");
-        const id = String(workerSpec?.id ?? "");
-        const record = id.length === 0 ? void 0 : readJob(id);
-        if (record === void 0) return badInput(`subagent: no job ${id || "(worker)"}`);
-        const now = runtime.now();
-        const scan = scanOutput(report);
-        record.handbackAt = now;
-        record.updatedAt = now;
-        writeJob(record);
-        enqueueSignal(
-          signalOf({ ...record, id: `${id}-handback-${now.toString(36)}` }, {
-            state: "done",
-            finishedAt: now,
-            durationMs: Math.max(0, now - Number(record.startedAt ?? now)),
-            body: scan.text,
-            scanned: true,
-            scanMatches: scan.matches,
-            title: `${String(record.description ?? id)} handback`
-          })
-        );
-        refreshJobs();
-        return okText(`handed the report back (job ${id}); it reaches the parent as one message`);
-      }
-    );
-  }
-  addSurface(
-    "subagent_send",
-    'Send a live message to a named agent (or "main"). A running agent queues it and answers at its next safe point; an idle agent starts a turn; a finished agent resumes its session with full context. The reply arrives later as its own message signal, so do not wait for it here.',
-    {
-      type: "object",
-      properties: {
-        to: { type: "string", description: 'A named agent, or "main" for this conversation.' },
-        message: { type: "string", description: "The message to deliver. The target acts on it in its own session." }
-      },
-      required: ["to", "message"]
-    },
-    sendLiveRun
-  );
-  addSurface(
-    "pubsub_send",
-    "[deprecated: live messaging moved to subagent_send] Publish a note into the agent loop of THIS session. It is delivered as a visible user turn. This is not live messaging to another agent.",
-    {
-      type: "object",
-      properties: {
-        title: { type: "string", description: "One line, shown in the signal header." },
-        body: { type: "string", description: "The detail." }
-      },
-      required: ["title"]
-    },
-    noteRun
-  );
+  const tools = createTools({
+    cmd,
+    planCtx,
+    spawnCtx,
+    runtime,
+    spool,
+    logsDir,
+    transcriptsDir,
+    readJob,
+    writeJob,
+    readRecentJobs,
+    refreshJobs,
+    enqueueSignal,
+    safeDrain,
+    cancelJob,
+    registry,
+    ledger,
+    currentOwner,
+    ownerId,
+    rosterNames,
+    namedJob,
+    liveState,
+    appendLive,
+    workerMode,
+    workerSpec: /* @__PURE__ */ __name(() => workerSpec, "workerSpec"),
+    sessionId: /* @__PURE__ */ __name(() => sessionId, "sessionId"),
+    forkModeEnabled,
+    listText,
+    scanOutput,
+    reportText,
+    listAgentsVisible
+  });
+  tools.register();
+  const { outputText, sendToRecord } = tools;
   function agentsText(filter) {
     registry.refresh();
     const entries = registry.entries();
@@ -6314,7 +6400,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join11(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join12(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
