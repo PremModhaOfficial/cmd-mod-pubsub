@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join as join4, resolve as resolve2 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join5, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -319,6 +319,251 @@ function createLedger(deps) {
 }
 __name(createLedger, "createLedger");
 var ledgerFactory = createLedger;
+
+// src/delivery.ts
+import { join as join4 } from "node:path";
+function createDelivery(deps) {
+  const answeredPermissions = /* @__PURE__ */ new Set();
+  let draining = false;
+  let lastJobsSignature = "";
+  function markDelivered(id) {
+    const job = deps.readJob(id);
+    if (job === void 0) return;
+    job.deliveredAt = deps.now();
+    job.updatedAt = job.deliveredAt;
+    deps.writeJob(job);
+  }
+  __name(markDelivered, "markDelivered");
+  function formatSignalMessage(message) {
+    const state = canonicalState(message.state ?? message.kind ?? "signal");
+    const worktree = deps.finalizeWorktree(deps.readJob(String(message.id ?? "")));
+    const kept = worktree?.kept === true ? `
+worktree kept at ${worktree.path}${worktree.error === void 0 ? "" : ` (${worktree.error})`}` : "";
+    const facts = [
+      `job ${String(message.id ?? "unknown")}`,
+      typeof message.agentId === "string" ? `agent ${message.agentId}` : "",
+      String(message.kind ?? "signal"),
+      state,
+      message.partial === true ? "partial" : "",
+      message.exitCode === null || message.exitCode === void 0 ? "" : `exit ${message.exitCode}`,
+      typeof message.durationMs === "number" ? `${(message.durationMs / 1e3).toFixed(1)}s` : ""
+    ].filter(Boolean).join(" \xB7 ");
+    const log = typeof message.logPath === "string" ? `
+log ${message.logPath}` : "";
+    const boundary = message.compactBoundary === void 0 ? "" : `
+compact_boundary: ${message.compactBoundary.trigger} at ${message.compactBoundary.preTokens} tokens`;
+    const body = typeof message.body === "string" ? message.body.trim() : "";
+    const title = String(message.title ?? message.description ?? message.id ?? "(signal)");
+    const request = message.permissionRequest;
+    const options = request === void 0 ? "" : request.options.map((option) => option.name ?? option.kind ?? option.optionId).filter(Boolean).join(", ");
+    const ask = state === "waiting-input" ? request !== void 0 ? `
+
+Approval required: ${request.title}` + (options.length > 0 ? `
+options: ${options}` : "") : typeof message.question === "string" && message.question.length > 0 ? `
+
+${message.question}` : "" : "";
+    const next2 = state === "waiting-input" ? typeof message.agentId === "string" ? `The job is resumable: subagent_resume {id: "${message.agentId}", prompt} continues it. Nothing else arrives until then.` : "The job is not resumable (no agent id); fire a follow-up job. Nothing else arrives until then." : state === "canceled" ? "The job was canceled; nothing else will arrive for it." : message.partial === true && typeof message.agentId === "string" ? `The result is partial: resume it with subagent_resume ${message.agentId}.` : "This result arrived automatically. Read it now and use it in your current work; do not poll for it and do not wait for it.";
+    return `[subagent] ${title}
+${facts}${log}${boundary}${kept}` + (body.length > 0 ? `
+
+${body}` : "") + ask + `
+
+${next2}`;
+  }
+  __name(formatSignalMessage, "formatSignalMessage");
+  function deliver(message) {
+    deps.sendUserMessage(formatSignalMessage(message), { deliverAs: deps.deliverAs() });
+    deps.showEntry("subagent", message);
+  }
+  __name(deliver, "deliver");
+  function inboxNames() {
+    try {
+      return deps.fs.readdir(deps.inboxDir).filter((name) => name.endsWith(".json"));
+    } catch {
+      return [];
+    }
+  }
+  __name(inboxNames, "inboxNames");
+  function next(seen) {
+    for (const name of inboxNames()) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      const live = join4(deps.inboxDir, name);
+      const claimed = join4(deps.claimedDir, name);
+      try {
+        deps.fs.rename(live, claimed);
+      } catch {
+        continue;
+      }
+      let signal;
+      try {
+        signal = JSON.parse(deps.fs.readFile(claimed));
+      } catch {
+        signal = void 0;
+      }
+      if (signal === void 0 || typeof signal.id !== "string" || signal.id.length === 0) {
+        deps.fs.remove(claimed);
+        continue;
+      }
+      const claim = { name, signal, live, claimed };
+      if (deps.ledger.has(signal.id)) {
+        settle(claim, "accepted");
+        continue;
+      }
+      const owner = deps.ownerVerdict(signal.owner);
+      if (owner === "orphan") {
+        settle(claim, "quarantined");
+        continue;
+      }
+      if (owner !== "mine") {
+        settle(claim, "held");
+        continue;
+      }
+      const settledJob = deps.readJob(signal.id);
+      if (settledJob !== void 0 && settledJob.background === false) {
+        markDelivered(signal.id);
+        settle(claim, "accepted");
+        continue;
+      }
+      return claim;
+    }
+    return void 0;
+  }
+  __name(next, "next");
+  function settle(claim, outcome) {
+    if (outcome === "accepted") {
+      deps.ledger.accept(claim.signal.id);
+      deps.fs.remove(claim.claimed);
+      return;
+    }
+    if (outcome === "quarantined") {
+      try {
+        deps.fs.rename(
+          claim.claimed,
+          join4(deps.orphanedDir, `${deps.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
+        );
+      } catch {
+      }
+      return;
+    }
+    try {
+      deps.fs.rename(claim.claimed, claim.live);
+    } catch {
+      try {
+        deps.fs.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
+        deps.fs.remove(claim.claimed);
+      } catch {
+      }
+    }
+  }
+  __name(settle, "settle");
+  function answerLivePermissions() {
+    for (const job of deps.jobs()) {
+      if (job.live !== true) continue;
+      void deps.answerPendingPermission(join4(deps.controlRoot, job.id), answeredPermissions);
+    }
+  }
+  __name(answerLivePermissions, "answerLivePermissions");
+  function drain() {
+    if (draining) return;
+    draining = true;
+    const seen = /* @__PURE__ */ new Set();
+    try {
+      answerLivePermissions();
+      for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
+        const claim = next(seen);
+        if (claim === void 0) return;
+        if (!deps.hasSession()) {
+          settle(claim, "held");
+          continue;
+        }
+        try {
+          deliver(claim.signal);
+        } catch {
+          settle(claim, "held");
+          continue;
+        }
+        markDelivered(claim.signal.id);
+        settle(claim, "accepted");
+      }
+    } finally {
+      draining = false;
+    }
+  }
+  __name(drain, "drain");
+  const safeDrain = /* @__PURE__ */ __name(() => {
+    try {
+      drain();
+    } catch {
+    }
+  }, "safeDrain");
+  function claimPending(limit) {
+    const seen = /* @__PURE__ */ new Set();
+    const claims = [];
+    while (claims.length < limit) {
+      const claim = next(seen);
+      if (claim === void 0) break;
+      claims.push(claim);
+    }
+    return claims;
+  }
+  __name(claimPending, "claimPending");
+  function countPending() {
+    const seen = /* @__PURE__ */ new Set();
+    let count = 0;
+    while (count < PENDING_SCAN_MAX) {
+      const claim = next(seen);
+      if (claim === void 0) break;
+      count += 1;
+      settle(claim, "held");
+    }
+    return count;
+  }
+  __name(countPending, "countPending");
+  function countOrphaned() {
+    try {
+      return deps.fs.readdir(deps.orphanedDir).length;
+    } catch {
+      return 0;
+    }
+  }
+  __name(countOrphaned, "countOrphaned");
+  function refreshJobs() {
+    const jobs = deps.readRecentJobs(LIST_SCAN_MAX);
+    deps.setJobs(jobs);
+    deps.sweepSubagentStopHooks();
+    deps.updateStatus();
+    const signature = jobs.map((job) => `${job.id}:${canonicalState(job.state)}`).join("|");
+    if (signature !== lastJobsSignature) {
+      lastJobsSignature = signature;
+      deps.markJobsTick();
+    }
+  }
+  __name(refreshJobs, "refreshJobs");
+  function sweepClaimed() {
+    deps.sweep(deps.claimedDir, CLAIMED_TTL_MS);
+  }
+  __name(sweepClaimed, "sweepClaimed");
+  function sweepOrphaned() {
+    if (deps.workerMode) return;
+    deps.sweep(deps.orphanedDir, ORPHANED_TTL_MS);
+  }
+  __name(sweepOrphaned, "sweepOrphaned");
+  return {
+    drain,
+    safeDrain,
+    claimPending,
+    settle,
+    markDelivered,
+    formatSignalMessage,
+    countPending,
+    countOrphaned,
+    refreshJobs,
+    sweepClaimed,
+    sweepOrphaned
+  };
+}
+__name(createDelivery, "createDelivery");
 
 // src/signals.ts
 function signalOf(record, result) {
@@ -1983,7 +2228,7 @@ function parseYamlScalar(raw) {
     for (const item of items) {
       if (item.length === 0) return { ok: false, reason: "empty flow sequence item" };
       const parsed = parseYamlScalar(item);
-      if (!parsed.ok) return parsed;
+      if (parsed.ok === false) return parsed;
       values.push(parsed.value);
     }
     return { ok: true, value: values };
@@ -2069,7 +2314,7 @@ function parseYamlSequence(lines, start, indent) {
       continue;
     }
     const parsed = parseYamlScalar(trimmed);
-    if (!parsed.ok) return parsed;
+    if (parsed.ok === false) return parsed;
     values.push(parsed.value);
     index += 1;
   }
@@ -2094,7 +2339,7 @@ function parseYamlMapping(lines, start, indent) {
         return { ok: false, reason: `unexpected indentation under "${key}"` };
       }
       const parsed = parseYamlScalar(inline);
-      if (!parsed.ok) return parsed;
+      if (parsed.ok === false) return parsed;
       value[key] = parsed.value;
       index += 1;
       continue;
@@ -2157,7 +2402,7 @@ function parseFrontmatter(source) {
     const hasNested = block.lines.some((line) => line.trim().length > 0);
     if (block.inline.length === 0 && hasNested) {
       const parsed2 = parseYamlNode(normalizeNestedLines(block.lines), 0, 0);
-      if (!parsed2.ok) return parsed2;
+      if (parsed2.ok === false) return parsed2;
       fields[block.key] = parsed2.value;
       continue;
     }
@@ -2169,7 +2414,7 @@ function parseFrontmatter(source) {
       continue;
     }
     const parsed = parseYamlScalar(block.inline);
-    if (!parsed.ok) return parsed;
+    if (parsed.ok === false) return parsed;
     fields[block.key] = parsed.value;
   }
   return { ok: true, fields, body: lines.slice(close + 1).join("\n").replace(/^\r?\n/, "").trimEnd() };
@@ -2419,7 +2664,7 @@ function pluginFallbackDefinition(body, path, options) {
 __name(pluginFallbackDefinition, "pluginFallbackDefinition");
 function agentDefinitionFromSource(source, path, scope, options = {}) {
   const frontmatter = parseFrontmatter(source);
-  if (!frontmatter.ok) {
+  if (frontmatter.ok === false) {
     if (options.plugin !== true) return frontmatter;
     return {
       ok: true,
@@ -2627,7 +2872,7 @@ function createAgentRegistry(deps) {
   let entries = [];
   const loggedSkips = /* @__PURE__ */ new Set();
   const definitionWarnings = /* @__PURE__ */ new WeakMap();
-  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join4(deps.home, ".commandcode", "managed"), "managedDir");
+  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join5(deps.home, ".commandcode", "managed"), "managedDir");
   function pushEntry(entry) {
     entries.push(entry);
     const problem = entry.warning ?? entry.reason;
@@ -2654,7 +2899,7 @@ function createAgentRegistry(deps) {
       return void 0;
     }
     const parsed = agentDefinitionFromSource(source, path, scope, options);
-    if (!parsed.ok) {
+    if (parsed.ok === false) {
       pushEntry({ name: "", scope, sourcePath: path, valid: false, kind: "invalid", reason: parsed.reason });
       return void 0;
     }
@@ -2684,7 +2929,7 @@ function createAgentRegistry(deps) {
     }
     for (const name of names) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join4(dir, name);
+      const full = join5(dir, name);
       if (name.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, scope);
         if (definition === void 0) continue;
@@ -2711,7 +2956,7 @@ function createAgentRegistry(deps) {
     }
     for (const child of children) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join4(dir, child);
+      const full = join5(dir, child);
       if (child.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, "plugin", {
           plugin: true,
@@ -2742,7 +2987,7 @@ function createAgentRegistry(deps) {
       return;
     }
     for (const pluginName of pluginNames) {
-      const agentsDir = join4(root, pluginName, "agents");
+      const agentsDir = join5(root, pluginName, "agents");
       if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
     }
   }
@@ -2762,9 +3007,9 @@ function createAgentRegistry(deps) {
   __name(projectBases, "projectBases");
   function pluginRoots() {
     const roots = [...deps.pluginRoots ?? []];
-    roots.push(join4(managedDir(), "plugins"));
-    for (const base of projectBases()) roots.push(join4(base, ".commandcode", "plugins"));
-    roots.push(join4(deps.home, ".commandcode", "plugins"));
+    roots.push(join5(managedDir(), "plugins"));
+    for (const base of projectBases()) roots.push(join5(base, ".commandcode", "plugins"));
+    roots.push(join5(deps.home, ".commandcode", "plugins"));
     return roots;
   }
   __name(pluginRoots, "pluginRoots");
@@ -2861,7 +3106,7 @@ function createAgentRegistry(deps) {
     const localNames = /* @__PURE__ */ new Map();
     for (const { name, spec } of specs) {
       const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
-      if (!parsedDefinition.ok) {
+      if (parsedDefinition.ok === false) {
         pushEntry({
           name,
           scope: "cli",
@@ -2885,15 +3130,15 @@ function createAgentRegistry(deps) {
   function refresh() {
     entries = [];
     const found = [];
-    scanDir(join4(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join5(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
     scanCli(found);
     for (const base of projectBases()) {
-      scanDir(join4(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join5(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
     for (const dir of deps.addDirs ?? []) {
-      scanDir(join4(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join5(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
-    scanDir(join4(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join5(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
     for (const root of pluginRoots()) scanPlugins(root, found);
     found.push(...deps.builtins);
     const seen = /* @__PURE__ */ new Set();
@@ -2950,7 +3195,7 @@ function startupFile(fs, path) {
 __name(startupFile, "startupFile");
 function hasGitMarker(fs, dir) {
   try {
-    fs.stat(join4(dir, ".git"));
+    fs.stat(join5(dir, ".git"));
     return true;
   } catch {
     return false;
@@ -2974,11 +3219,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join4(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join5(cwd, path);
     let dir = dirname2(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname2(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join4(dir, "CLAUDE.md");
+      const filePath = join5(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -2998,24 +3243,24 @@ function claudeMdHierarchy(options) {
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join4(options.home, ".commandcode", "managed", "CLAUDE.md");
+    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join5(options.home, ".commandcode", "managed", "CLAUDE.md");
     const managed = startupFile(fs, managedPath);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
     const user = startupFile(
       fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join4(options.home, ".commandcode", "CLAUDE.md")
+      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join5(options.home, ".commandcode", "CLAUDE.md")
     );
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join4(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join5(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join4(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join5(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join4(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join5(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -3027,11 +3272,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join4(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join4(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join5(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join5(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join4(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join4(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join5(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join5(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -3039,8 +3284,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join4(options.home, ".commandcode", "agent-memory") : scope === "project" ? join4(options.cwd, ".commandcode", "agent-memory") : join4(options.cwd, ".commandcode", "agent-memory-local");
-  return join4(root, name);
+  const root = scope === "user" ? join5(options.home, ".commandcode", "agent-memory") : scope === "project" ? join5(options.cwd, ".commandcode", "agent-memory") : join5(options.cwd, ".commandcode", "agent-memory-local");
+  return join5(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -3077,7 +3322,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join4(dir, MEMORY_INDEX_FILE);
+  const path = join5(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -3289,7 +3534,7 @@ function resolveLaunch(input = {}) {
     ...input.background !== void 0 ? { background: input.background } : {},
     ...input.team !== void 0 ? { team: input.team } : {}
   });
-  if (!tools.ok) return tools;
+  if (tools.ok === false) return tools;
   const model = resolveModel({
     ...input.requestedModel !== void 0 ? { requested: input.requestedModel } : {},
     ...input.definitionModel !== void 0 ? { definition: input.definitionModel } : {},
@@ -3317,7 +3562,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join4(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join5(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -3346,11 +3591,11 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join4(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join5(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join4(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? join5(roots.home, ".commandcode", "managed"),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
@@ -3650,7 +3895,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join4(dir, name);
+    const file = join5(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -3755,15 +4000,15 @@ function index_default(cmd, overrides = {}) {
     flag: readFlag(FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join4(root, "inbox");
-  const claimedDir = join4(root, "claimed");
-  const orphanedDir = join4(root, "orphaned");
-  const logsDir = join4(root, "logs");
-  const jobsDir = join4(root, "jobs");
-  const transcriptsDir = join4(root, "transcripts");
-  const worktreesDir = join4(root, "worktrees");
-  const controlRoot = join4(root, "control");
-  const ledgerPath = join4(root, "delivered.jsonl");
+  const inboxDir = join5(root, "inbox");
+  const claimedDir = join5(root, "claimed");
+  const orphanedDir = join5(root, "orphaned");
+  const logsDir = join5(root, "logs");
+  const jobsDir = join5(root, "jobs");
+  const transcriptsDir = join5(root, "transcripts");
+  const worktreesDir = join5(root, "worktrees");
+  const controlRoot = join5(root, "control");
+  const ledgerPath = join5(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -3786,7 +4031,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join4(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join5(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -3890,13 +4135,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join4(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join5(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join4(current, ".git"));
+        spool.stat(join5(current, ".git"));
         break;
       } catch {
       }
@@ -3965,7 +4210,6 @@ function index_default(cmd, overrides = {}) {
   }, "renderSignalRow");
   cmd.addRenderer("subagent", renderSignalRow);
   cmd.addRenderer("pubsub", renderSignalRow);
-  let draining = false;
   const ledger = createLedger({
     fs: spool,
     path: ledgerPath,
@@ -3990,48 +4234,55 @@ function index_default(cmd, overrides = {}) {
     return decision;
   }
   __name(finalizeJobWorktree, "finalizeJobWorktree");
-  function formatSignalMessage(message) {
-    const state = canonicalState(message.state ?? message.kind ?? "signal");
-    const worktree = finalizeJobWorktree(readJob(String(message.id ?? "")));
-    const kept = worktree?.kept === true ? `
-worktree kept at ${worktree.path}${worktree.error === void 0 ? "" : ` (${worktree.error})`}` : "";
-    const facts = [
-      `job ${String(message.id ?? "unknown")}`,
-      typeof message.agentId === "string" ? `agent ${message.agentId}` : "",
-      String(message.kind ?? "signal"),
-      state,
-      message.partial === true ? "partial" : "",
-      message.exitCode === null || message.exitCode === void 0 ? "" : `exit ${message.exitCode}`,
-      typeof message.durationMs === "number" ? `${(message.durationMs / 1e3).toFixed(1)}s` : ""
-    ].filter(Boolean).join(" \xB7 ");
-    const log = typeof message.logPath === "string" ? `
-log ${message.logPath}` : "";
-    const boundary = message.compactBoundary === void 0 ? "" : `
-compact_boundary: ${message.compactBoundary.trigger} at ${message.compactBoundary.preTokens} tokens`;
-    const body = typeof message.body === "string" ? message.body.trim() : "";
-    const title = String(message.title ?? message.description ?? message.id ?? "(signal)");
-    const request = message.permissionRequest;
-    const options = request === void 0 ? "" : request.options.map((option) => option.name ?? option.kind ?? option.optionId).filter(Boolean).join(", ");
-    const ask = state === "waiting-input" ? request !== void 0 ? `
-
-Approval required: ${request.title}` + (options.length > 0 ? `
-options: ${options}` : "") : typeof message.question === "string" && message.question.length > 0 ? `
-
-${message.question}` : "" : "";
-    const next2 = state === "waiting-input" ? typeof message.agentId === "string" ? `The job is resumable: subagent_resume {id: "${message.agentId}", prompt} continues it. Nothing else arrives until then.` : "The job is not resumable (no agent id); fire a follow-up job. Nothing else arrives until then." : state === "canceled" ? "The job was canceled; nothing else will arrive for it." : message.partial === true && typeof message.agentId === "string" ? `The result is partial: resume it with subagent_resume ${message.agentId}.` : "This result arrived automatically. Read it now and use it in your current work; do not poll for it and do not wait for it.";
-    return `[subagent] ${title}
-${facts}${log}${boundary}${kept}` + (body.length > 0 ? `
-
-${body}` : "") + ask + `
-
-${next2}`;
-  }
-  __name(formatSignalMessage, "formatSignalMessage");
   const { readJob, writeJob, readRecentJobs } = createJobStore({
     fs: spool,
     jobsDir,
     pid: runtime.pid,
     now: /* @__PURE__ */ __name(() => runtime.now(), "now")
+  });
+  const {
+    safeDrain,
+    claimPending,
+    settle,
+    markDelivered,
+    formatSignalMessage,
+    countPending,
+    countOrphaned,
+    refreshJobs,
+    sweepClaimed,
+    sweepOrphaned
+  } = createDelivery({
+    fs: spool,
+    inboxDir,
+    claimedDir,
+    orphanedDir,
+    controlRoot,
+    ledger,
+    now: /* @__PURE__ */ __name(() => runtime.now(), "now"),
+    readJob,
+    writeJob,
+    readRecentJobs,
+    finalizeWorktree: finalizeJobWorktree,
+    ownerVerdict,
+    workerMode,
+    hasSession: /* @__PURE__ */ __name(() => cmd.session !== void 0, "hasSession"),
+    deliverAs,
+    sendUserMessage: /* @__PURE__ */ __name((text, options) => cmd.sendUserMessage(text, options), "sendUserMessage"),
+    showEntry: /* @__PURE__ */ __name((type, data) => cmd.showEntry(type, data), "showEntry"),
+    answerPendingPermission,
+    jobs: /* @__PURE__ */ __name(() => jobCache, "jobs"),
+    setJobs: /* @__PURE__ */ __name((jobs) => {
+      jobCache = jobs;
+    }, "setJobs"),
+    sweepSubagentStopHooks,
+    updateStatus,
+    markJobsTick: /* @__PURE__ */ __name(() => {
+      try {
+        cmd.state.set("jobsTick", runtime.now());
+      } catch {
+      }
+    }, "markJobsTick"),
+    sweep: /* @__PURE__ */ __name((dir, ttlMs) => sweepExpiredEntries(spool, dir, runtime.now(), { ttlMs }), "sweep")
   });
   function applyPatch(id, patch, fallback, stamp) {
     const current = readJob(id) ?? fallback;
@@ -4074,7 +4325,7 @@ ${next2}`;
     const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join4(controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join5(controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -4082,10 +4333,10 @@ ${next2}`;
   }
   __name(liveState, "liveState");
   function appendLive(id, from, message) {
-    const dir = join4(controlRoot, id);
+    const dir = join5(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join4(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join5(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -4117,173 +4368,18 @@ ${next2}`;
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join4(inboxDir, `.tmp-${stamp}`);
+      const tmp = join5(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join4(inboxDir, stamp));
+      spool.rename(tmp, join5(inboxDir, stamp));
     } catch {
     }
   }
   __name(enqueueSignal, "enqueueSignal");
-  function markDelivered(id) {
-    const job = readJob(id);
-    if (job === void 0) return;
-    job.deliveredAt = runtime.now();
-    job.updatedAt = job.deliveredAt;
-    writeJob(job);
-  }
-  __name(markDelivered, "markDelivered");
-  function deliver(message) {
-    cmd.sendUserMessage(formatSignalMessage(message), { deliverAs: deliverAs() });
-    cmd.showEntry("subagent", message);
-  }
-  __name(deliver, "deliver");
-  function inboxNames() {
-    try {
-      return spool.readdir(inboxDir).filter((name) => name.endsWith(".json"));
-    } catch {
-      return [];
-    }
-  }
-  __name(inboxNames, "inboxNames");
-  function next(seen) {
-    for (const name of inboxNames()) {
-      if (seen.has(name)) continue;
-      seen.add(name);
-      const live = join4(inboxDir, name);
-      const claimed = join4(claimedDir, name);
-      try {
-        spool.rename(live, claimed);
-      } catch {
-        continue;
-      }
-      let signal;
-      try {
-        signal = JSON.parse(spool.readFile(claimed));
-      } catch {
-        signal = void 0;
-      }
-      if (signal === void 0 || typeof signal.id !== "string" || signal.id.length === 0) {
-        spool.remove(claimed);
-        continue;
-      }
-      const claim = { name, signal, live, claimed };
-      if (ledger.has(signal.id)) {
-        settle(claim, "accepted");
-        continue;
-      }
-      const owner = ownerVerdict(signal.owner);
-      if (owner === "orphan") {
-        settle(claim, "quarantined");
-        continue;
-      }
-      if (owner !== "mine") {
-        settle(claim, "held");
-        continue;
-      }
-      const settledJob = readJob(signal.id);
-      if (settledJob !== void 0 && settledJob.background === false) {
-        markDelivered(signal.id);
-        settle(claim, "accepted");
-        continue;
-      }
-      return claim;
-    }
-    return void 0;
-  }
-  __name(next, "next");
-  function settle(claim, outcome) {
-    if (outcome === "accepted") {
-      ledger.accept(claim.signal.id);
-      spool.remove(claim.claimed);
-      return;
-    }
-    if (outcome === "quarantined") {
-      try {
-        spool.rename(
-          claim.claimed,
-          join4(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
-        );
-      } catch {
-      }
-      return;
-    }
-    try {
-      spool.rename(claim.claimed, claim.live);
-    } catch {
-      try {
-        spool.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
-        spool.remove(claim.claimed);
-      } catch {
-      }
-    }
-  }
-  __name(settle, "settle");
-  const answeredPermissions = /* @__PURE__ */ new Set();
-  function answerLivePermissions() {
-    for (const job of jobCache) {
-      if (job.live !== true) continue;
-      void answerPendingPermission(join4(controlRoot, job.id), answeredPermissions);
-    }
-  }
-  __name(answerLivePermissions, "answerLivePermissions");
-  function drain() {
-    if (draining) return;
-    draining = true;
-    const seen = /* @__PURE__ */ new Set();
-    try {
-      answerLivePermissions();
-      for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-        const claim = next(seen);
-        if (claim === void 0) return;
-        if (cmd.session === void 0) {
-          settle(claim, "held");
-          continue;
-        }
-        try {
-          deliver(claim.signal);
-        } catch {
-          settle(claim, "held");
-          continue;
-        }
-        markDelivered(claim.signal.id);
-        settle(claim, "accepted");
-      }
-    } finally {
-      draining = false;
-    }
-  }
-  __name(drain, "drain");
-  const safeDrain = /* @__PURE__ */ __name(() => {
-    try {
-      drain();
-    } catch {
-    }
-  }, "safeDrain");
-  function claimPending(limit) {
-    const seen = /* @__PURE__ */ new Set();
-    const claims = [];
-    while (claims.length < limit) {
-      const claim = next(seen);
-      if (claim === void 0) break;
-      claims.push(claim);
-    }
-    return claims;
-  }
-  __name(claimPending, "claimPending");
-  function sweepClaimed() {
-    sweepExpiredEntries(spool, claimedDir, runtime.now(), { ttlMs: CLAIMED_TTL_MS });
-  }
-  __name(sweepClaimed, "sweepClaimed");
-  function sweepOrphaned() {
-    if (workerMode) return;
-    sweepExpiredEntries(spool, orphanedDir, runtime.now(), { ttlMs: ORPHANED_TTL_MS });
-  }
-  __name(sweepOrphaned, "sweepOrphaned");
   function cleanupPeriodDays() {
     for (const base of [runtime.cwd, runtime.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join4(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join5(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -4318,7 +4414,7 @@ ${next2}`;
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join4(jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join5(jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -4333,18 +4429,18 @@ ${next2}`;
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join4(logsDir, `${id}.log`));
+        spool.remove(join5(logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join4(transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join5(transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join4(worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join5(worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, logsDir, now, {
@@ -4379,7 +4475,7 @@ ${next2}`;
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join4(worktreesDir, name);
+      const path = join5(worktreesDir, name);
       let old = false;
       try {
         old = now - spool.stat(path).mtimeMs > ttlMs;
@@ -4418,28 +4514,7 @@ ${next2}`;
   }
   __name(reconcileJobs, "reconcileJobs");
   let jobCache = [];
-  let lastJobsSignature = "";
   let lastStatus = "";
-  function countPending() {
-    const seen = /* @__PURE__ */ new Set();
-    let count = 0;
-    while (count < PENDING_SCAN_MAX) {
-      const claim = next(seen);
-      if (claim === void 0) break;
-      count += 1;
-      settle(claim, "held");
-    }
-    return count;
-  }
-  __name(countPending, "countPending");
-  function countOrphaned() {
-    try {
-      return spool.readdir(orphanedDir).length;
-    } catch {
-      return 0;
-    }
-  }
-  __name(countOrphaned, "countOrphaned");
   function updateStatus() {
     try {
       const ui = cmd.ui;
@@ -4482,20 +4557,6 @@ ${next2}`;
     }
   }
   __name(sweepSubagentStopHooks, "sweepSubagentStopHooks");
-  function refreshJobs() {
-    jobCache = readRecentJobs(LIST_SCAN_MAX);
-    sweepSubagentStopHooks();
-    updateStatus();
-    const signature = jobCache.map((job) => `${job.id}:${canonicalState(job.state)}`).join("|");
-    if (signature !== lastJobsSignature) {
-      lastJobsSignature = signature;
-      try {
-        cmd.state.set("jobsTick", runtime.now());
-      } catch {
-      }
-    }
-  }
-  __name(refreshJobs, "refreshJobs");
   function listText(filter = {}) {
     const all = readRecentJobs(LIST_SCAN_MAX);
     const wanted = filter.state === void 0 ? void 0 : canonicalState(filter.state);
@@ -4545,8 +4606,8 @@ ${next2}`;
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join4(controlRoot, id));
-        spool.writeFile(join4(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join5(controlRoot, id));
+        spool.writeFile(join5(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -4631,7 +4692,7 @@ ${next2}`;
         ...intent.oneShot === true ? {} : { agentId: id },
         agentType: intent.agentType ?? "general-purpose",
         sessionName: sessionNameOf(id),
-        transcriptPath: join4(transcriptsDir, `${id}.jsonl`),
+        transcriptPath: join5(transcriptsDir, `${id}.jsonl`),
         ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
       } : {},
       ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
@@ -4720,9 +4781,9 @@ ${next2}`;
       };
     }
     const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const logPath = join4(logsDir, `${id}.log`);
+    const logPath = join5(logsDir, `${id}.log`);
     const startedAt = runtime.now();
-    const isolation2 = intent.isolation === "worktree" ? createJobWorktree({ git: git.git, fs: spool }, { cwd: intent.cwd, path: join4(worktreesDir, id) }) : void 0;
+    const isolation2 = intent.isolation === "worktree" ? createJobWorktree({ git: git.git, fs: spool }, { cwd: intent.cwd, path: join5(worktreesDir, id) }) : void 0;
     const owner = intent.owner ?? currentOwner();
     const record = makeRecord(
       { ...intent, depth, ...workerSpec?.id !== void 0 ? { parentJobId: workerSpec.id } : {} },
@@ -4739,7 +4800,7 @@ ${next2}`;
       record.cwd = isolation2.path;
     }
     writeJob(record);
-    if (isolation2 !== void 0 && !isolation2.ok) {
+    if (isolation2 !== void 0 && isolation2.ok === false) {
       failJob(record, isolation2.error);
       return { ok: false, error: isolation2.error };
     }
@@ -4757,7 +4818,7 @@ ${next2}`;
     const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
     if (live) {
       try {
-        spool.mkdir(join4(controlRoot, id));
+        spool.mkdir(join5(controlRoot, id));
       } catch {
       }
     }
@@ -4781,7 +4842,7 @@ ${next2}`;
         background: intent.background !== false,
         // A foreground caller answers permission prompts inline; a background run
         // settles with the request instead of holding a worker that nobody watches.
-        ...intent.background === false ? { interactive: true, controlDir: join4(jobsDir, "..", "control", id) } : {},
+        ...intent.background === false ? { interactive: true, controlDir: join5(jobsDir, "..", "control", id) } : {},
         depth,
         ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
         ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
@@ -4813,21 +4874,21 @@ ${next2}`;
         ...roster.roster !== void 0 ? { roster: roster.roster } : {},
         ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
         ...intent.background !== void 0 ? { background: intent.background } : {},
-        ...live ? { live: true, controlDir: join4(controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-        ...isAgent ? { promptMarkerPath: join4(logsDir, `${id}.mod`) } : {},
+        ...live ? { live: true, controlDir: join5(controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+        ...isAgent ? { promptMarkerPath: join5(logsDir, `${id}.mod`) } : {},
         ...isolation2?.ok === true ? { worktree: isolation2.path, mainCheckouts: isolation2.mainCheckouts } : {}
       },
       MOD_PATH
     );
     const launched = startWorker(record, spec);
-    if (!launched.ok || intent.background !== false) return launched;
+    if (launched.ok === false || intent.background !== false) return launched;
     return settleForeground(launched);
   }
   __name(fire, "fire");
   async function answerPendingPermission(controlDir, answered) {
     let request;
     try {
-      request = JSON.parse(spool.readFile(join4(controlDir, "permission.json")));
+      request = JSON.parse(spool.readFile(join5(controlDir, "permission.json")));
     } catch {
       return;
     }
@@ -4854,7 +4915,7 @@ ${next2}`;
     const picked = choices.find((choice) => choice.label === chosen);
     const option = picked === void 0 ? void 0 : options[picked.index];
     const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-    const file = join4(controlDir, "permission-response.json");
+    const file = join5(controlDir, "permission-response.json");
     const tmp = `${file}.mod-${process.pid}-${runtime.now()}`;
     spool.writeFile(tmp, JSON.stringify(response));
     spool.rename(tmp, file);
@@ -4864,7 +4925,7 @@ ${next2}`;
     const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
     let record = readJob(launched.id);
     const answered = /* @__PURE__ */ new Set();
-    const permissionDir = join4(controlRoot, launched.id);
+    const permissionDir = join5(controlRoot, launched.id);
     for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
       if (backgroundedForegrounds.has(launched.id)) {
         refreshJobs();
@@ -4891,16 +4952,14 @@ ${next2}`;
         error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
       };
     }
-    const log = readLog(String(record.logPath ?? join4(logsDir, `${launched.id}.log`)));
+    const log = readLog(String(record.logPath ?? join5(logsDir, `${launched.id}.log`)));
     const decision = finalizeJobWorktree(record);
     const outcome = foregroundOutcome(record, log);
     if (decision?.kept !== true) return { ...launched, result: outcome };
     const note = `
 worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decision.error})`}`;
-    return {
-      ...launched,
-      result: outcome.ok ? { ...outcome, text: `${outcome.text}${note}` } : { ...outcome, error: `${outcome.error}${note}` }
-    };
+    const result = outcome.ok === true ? { ok: true, text: `${outcome.text}${note}`, partial: outcome.partial } : { ok: false, error: `${outcome.error}${note}` };
+    return { ...launched, result };
   }
   __name(settleForeground, "settleForeground");
   function visibleTaskRows() {
@@ -5112,7 +5171,7 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
     let definition;
     if (prompt !== void 0) {
       const resolved = resolveAgentDefinition(subagentType ?? aliasType);
-      if (!resolved.ok) return { ok: false, error: resolved.error };
+      if (resolved.ok === false) return { ok: false, error: resolved.error };
       definition = resolved.definition;
     }
     const forkRequested = definition?.fork === true;
@@ -5124,7 +5183,7 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
       ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
       forkMode
     });
-    if (!teamPolicy.ok) return { ok: false, error: teamPolicy.error };
+    if (teamPolicy.ok === false) return { ok: false, error: teamPolicy.error };
     const requestedTools = prompt === void 0 || forkRequested ? void 0 : listField(input.tools) ?? definition?.tools;
     const requestedDisallowed = prompt === void 0 || forkRequested ? void 0 : listField(input.disallowed_tools) ?? definition?.disallowedTools;
     let permissionMode;
@@ -5133,7 +5192,7 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
         permissionMode = mainPermissionMode ?? "default";
       } else {
         const modeResolution = resolvePermissionMode(requestedMode ?? definition?.permissionMode, mainPermissionMode);
-        if (!modeResolution.ok) return { ok: false, error: modeResolution.error };
+        if (modeResolution.ok === false) return { ok: false, error: modeResolution.error };
         permissionMode = modeResolution.mode;
       }
     }
@@ -5172,7 +5231,7 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
       ...teammate ? { team: true } : {},
       mcpServers: mcpNames
     });
-    if (!launch.ok) return { ok: false, error: launch.error };
+    if (launch.ok === false) return { ok: false, error: launch.error };
     if (forkRequested && (sessionId === void 0 || sessionId.length === 0)) {
       return { ok: false, error: "a fork needs the main session id; the session has not bound yet" };
     }
@@ -5221,13 +5280,13 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
   __name(planFromInput, "planFromInput");
   const spawnRun = /* @__PURE__ */ __name(async ({ input }) => {
     const planned = planFromInput(input);
-    if (!planned.ok) return badInput(planned.error);
+    if (planned.ok === false) return badInput(planned.error);
     const plan = planned.plan;
     const launched = await fire(plan);
-    if (!launched.ok) return badInput(launched.error);
+    if (launched.ok === false) return badInput(launched.error);
     const spawnedAgentId = readJob(launched.id)?.agentId;
     if (launched.result !== void 0) {
-      if (!launched.result.ok) return badInput(launched.result.error);
+      if (launched.result.ok === false) return badInput(launched.result.error);
       return okText(
         spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
 ${launched.result.text}` : launched.result.text
@@ -5237,7 +5296,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join4(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join5(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5260,7 +5319,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join4(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join5(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5292,8 +5351,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join4(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join4(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join5(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join5(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5479,16 +5538,16 @@ transcript ${transcriptPath}` : "") + `${timing}
       );
     }
     const planned = planFromRecord(record, instruction, "resume");
-    if (!planned.ok) return badInput(planned.error);
+    if (planned.ok === false) return badInput(planned.error);
     const launched = await fire(planned.plan);
-    if (!launched.ok) return badInput(launched.error);
+    if (launched.ok === false) return badInput(launched.error);
     const resumedAgentId = readJob(launched.id)?.agentId;
     return launchedToolResult(
       launched,
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join4(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join5(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -5541,7 +5600,7 @@ ${lines.join("\n")}`;
   }, "noteRun");
   function launchedToolResult(launched, agentId, asyncText) {
     if (launched.result !== void 0) {
-      if (!launched.result.ok) return badInput(launched.result.error);
+      if (launched.result.ok === false) return badInput(launched.result.error);
       return okText(agentId !== void 0 ? `agent id ${agentId}
 ${launched.result.text}` : launched.result.text);
     }
@@ -5562,9 +5621,9 @@ The reply arrives here as its own message signal.`
       );
     }
     const planned = planFromRecord(record, message, "message");
-    if (!planned.ok) return badInput(planned.error);
+    if (planned.ok === false) return badInput(planned.error);
     const launched = await fire(planned.plan);
-    if (!launched.ok) return badInput(launched.error);
+    if (launched.ok === false) return badInput(launched.error);
     return launchedToolResult(
       launched,
       readJob(launched.id)?.agentId,
@@ -5961,7 +6020,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
       fork: true,
       mainSessionId: sessionId
     });
-    if (!launched.ok) return { message: `subtask: ${launched.error}` };
+    if (launched.ok === false) return { message: `subtask: ${launched.error}` };
     return {
       message: `subtask: started fork ${launched.id} from the main conversation, pid ${launched.pid}.
 /tasks open ${launched.id} reads it; /tasks send ${launched.id} <message> steers it.`
@@ -6005,7 +6064,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join4(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join5(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));

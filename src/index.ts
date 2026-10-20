@@ -69,14 +69,12 @@ import {
 	AGENT_SCAN_MAX,
 	BACKGROUND_DISABLE_ENV,
 	BACKGROUND_DISABLE_ENV_ALIAS,
-	CLAIMED_TTL_MS,
 	CLEANUP_PERIOD_SETTING,
 	CLI_AGENTS_OPTION,
 	CONTROL_POLL_MS,
 	DELIVERED_LEDGER_KEEP,
 	DELIVERED_LEDGER_MAX,
 	DRAIN_INTERVAL_MS,
-	FILES_PER_DRAIN_MAX,
 	FOREGROUND_PERMISSION_TIMEOUT_MS,
 	FOREGROUND_POLL_MS,
 	FOREGROUND_WAIT_MAX_MS,
@@ -98,13 +96,11 @@ import {
 	MAX_DEPTH_ENV,
 	MAX_DEPTH_ENV_ALIAS,
 	MOD_PATH,
-	ORPHANED_TTL_MS,
 	OUTPUT_MAX_CHARS_CAP,
 	OUTPUT_MAX_CHARS_DEFAULT,
 	OWNER_TYPE,
 	OWNER_TYPE_LEGACY,
 	PANE_ROWS_MAX,
-	PENDING_SCAN_MAX,
 	PERMISSION_TIMEOUT_MS,
 	PLUGIN_DIRS_OPTION,
 	PUBSUB_DIR_DEFAULT,
@@ -142,8 +138,9 @@ import {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 import {createJobStore} from './jobs.ts';
 import type {JobRecord} from './jobs.ts';
 import {createLedger} from './ledger.ts';
+import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
-import type {Claim, Ownership, Settled} from './signals.ts';
+import type {Ownership} from './signals.ts';
 import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
 import {
 	createJobWorktree,
@@ -1583,7 +1580,7 @@ function parseYamlScalar(raw: string): {ok: true; value: unknown} | {ok: false; 
 		for (const item of items) {
 			if (item.length === 0) return {ok: false, reason: 'empty flow sequence item'};
 			const parsed = parseYamlScalar(item);
-			if (!parsed.ok) return parsed;
+			if (parsed.ok === false) return parsed;
 			values.push(parsed.value);
 		}
 		return {ok: true, value: values};
@@ -1690,7 +1687,7 @@ function parseYamlSequence(lines: NestedLine[], start: number, indent: number): 
 			continue;
 		}
 		const parsed = parseYamlScalar(trimmed);
-		if (!parsed.ok) return parsed;
+		if (parsed.ok === false) return parsed;
 		values.push(parsed.value);
 		index += 1;
 	}
@@ -1715,7 +1712,7 @@ function parseYamlMapping(lines: NestedLine[], start: number, indent: number): N
 				return {ok: false, reason: `unexpected indentation under "${key}"`};
 			}
 			const parsed = parseYamlScalar(inline);
-			if (!parsed.ok) return parsed;
+			if (parsed.ok === false) return parsed;
 			value[key] = parsed.value;
 			index += 1;
 			continue;
@@ -1789,7 +1786,7 @@ export function parseFrontmatter(source: string): FrontmatterResult {
 		const hasNested = block.lines.some(line => line.trim().length > 0);
 		if (block.inline.length === 0 && hasNested) {
 			const parsed = parseYamlNode(normalizeNestedLines(block.lines), 0, 0);
-			if (!parsed.ok) return parsed;
+			if (parsed.ok === false) return parsed;
 			fields[block.key] = parsed.value;
 			continue;
 		}
@@ -1801,7 +1798,7 @@ export function parseFrontmatter(source: string): FrontmatterResult {
 			continue;
 		}
 		const parsed = parseYamlScalar(block.inline);
-		if (!parsed.ok) return parsed;
+		if (parsed.ok === false) return parsed;
 		fields[block.key] = parsed.value;
 	}
 
@@ -2126,7 +2123,7 @@ export function agentDefinitionFromSource(
 	options: AgentDefinitionOptions = {},
 ): AgentDefinitionResult {
 	const frontmatter = parseFrontmatter(source);
-	if (!frontmatter.ok) {
+	if (frontmatter.ok === false) {
 		if (options.plugin !== true) return frontmatter;
 		// A plugin contract differs from a project one: the file still loads under
 		// its filename, and the parse failure is reported instead of hidden.
@@ -2410,7 +2407,7 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 			return undefined;
 		}
 		const parsed = agentDefinitionFromSource(source, path, scope, options);
-		if (!parsed.ok) {
+		if (parsed.ok === false) {
 			pushEntry({name: '', scope, sourcePath: path, valid: false, kind: 'invalid', reason: parsed.reason});
 			return undefined;
 		}
@@ -2646,7 +2643,7 @@ export function createAgentRegistry(deps: AgentRegistryDeps): AgentRegistry {
 		const localNames = new Map<string, string>();
 		for (const {name, spec} of specs) {
 			const parsedDefinition = cliAgentDefinition(name, spec, sourcePath);
-			if (!parsedDefinition.ok) {
+			if (parsedDefinition.ok === false) {
 				pushEntry({
 					name,
 					scope: 'cli',
@@ -3401,7 +3398,7 @@ export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResoluti
 		...(input.background !== undefined ? {background: input.background} : {}),
 		...(input.team !== undefined ? {team: input.team} : {}),
 	});
-	if (!tools.ok) return tools;
+	if (tools.ok === false) return tools;
 	const model = resolveModel({
 		...(input.requestedModel !== undefined ? {requested: input.requestedModel} : {}),
 		...(input.definitionModel !== undefined ? {definition: input.definitionModel} : {}),
@@ -3481,7 +3478,7 @@ export interface McpTrustRoots {
 // session already trusts: the workspace, home, the managed directory, or an
 // --add-dir. A plugin is never trusted with an inline server.
 export function agentFolderTrusted(
-	definition: {readonly scope?: string; readonly path?: string},
+	definition: {readonly scope?: string; readonly sourcePath?: string},
 	roots: McpTrustRoots,
 ): boolean {
 	if (definition.scope === 'plugin') return false;
@@ -4434,10 +4431,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	cmd.addRenderer('subagent', renderSignalRow);
 	cmd.addRenderer('pubsub', renderSignalRow);
 
-	// One writer at a time. A tick that finds this flag set returns immediately rather
-	// than racing the previous tick over the same files.
-	let draining = false;
-
 	// A signal claimed twice (a lost claimed/ file replayed, or an onStop drain racing a
 	// timer tick) must not land twice. The guard is durable, so a restart cannot replay
 	// what a previous process already delivered.
@@ -4474,57 +4467,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return decision;
 	}
 
-	// A2A-style envelope: the job identity and state travel WITH the result, so the
-	// model can tell which worker finished, whether it passed, and where the full log is.
-	function formatSignalMessage(message: Signal): string {
-		const state = canonicalState(message.state ?? message.kind ?? 'signal');
-		const worktree = finalizeJobWorktree(readJob(String(message.id ?? '')));
-		const kept =
-			worktree?.kept === true
-				? `\nworktree kept at ${worktree.path}${worktree.error === undefined ? '' : ` (${worktree.error})`}`
-				: '';
-		const facts = [
-			`job ${String(message.id ?? 'unknown')}`,
-			typeof message.agentId === 'string' ? `agent ${message.agentId}` : '',
-			String(message.kind ?? 'signal'),
-			state,
-			message.partial === true ? 'partial' : '',
-			message.exitCode === null || message.exitCode === undefined ? '' : `exit ${message.exitCode}`,
-			typeof message.durationMs === 'number' ? `${(message.durationMs / 1000).toFixed(1)}s` : '',
-		].filter(Boolean).join(' · ');
-		const log = typeof message.logPath === 'string' ? `\nlog ${message.logPath}` : '';
-		const boundary =
-			message.compactBoundary === undefined
-				? ''
-				: `\ncompact_boundary: ${message.compactBoundary.trigger} at ${message.compactBoundary.preTokens} tokens`;
-		const body = typeof message.body === 'string' ? message.body.trim() : '';
-		const title = String(message.title ?? message.description ?? message.id ?? '(signal)');
-		// The worker names the agent (the title) and carries the request: the parent
-		// does not have to read the log to know what is being asked.
-		const request = message.permissionRequest;
-		const options = request === undefined ? '' : request.options.map(option => option.name ?? option.kind ?? option.optionId).filter(Boolean).join(', ');
-		const ask =
-			state === 'waiting-input'
-				? request !== undefined
-					? `\n\nApproval required: ${request.title}` + (options.length > 0 ? `\noptions: ${options}` : '')
-					: typeof message.question === 'string' && message.question.length > 0
-						? `\n\n${message.question}`
-						: ''
-				: '';
-		const next =
-			state === 'waiting-input'
-				? typeof message.agentId === 'string'
-					? `The job is resumable: subagent_resume {id: "${message.agentId}", prompt} continues it. Nothing else arrives until then.`
-					: 'The job is not resumable (no agent id); fire a follow-up job. Nothing else arrives until then.'
-				: state === 'canceled'
-					? 'The job was canceled; nothing else will arrive for it.'
-					: message.partial === true && typeof message.agentId === 'string'
-						? `The result is partial: resume it with subagent_resume ${message.agentId}.`
-						: 'This result arrived automatically. Read it now and use it in your current work; ' +
-							'do not poll for it and do not wait for it.';
-		return `[subagent] ${title}\n${facts}${log}${boundary}${kept}` + (body.length > 0 ? `\n\n${body}` : '') + ask + `\n\n${next}`;
-	}
-
 	// The durable record store. The spool and the jobs path arrive explicitly, so
 	// the store names no ambient state and every read, write and scan agrees.
 	const {readJob, writeJob, readRecentJobs} = createJobStore({
@@ -4532,6 +4474,55 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		jobsDir,
 		pid: runtime.pid,
 		now: () => runtime.now(),
+	});
+
+	// The drain, the signal envelope and the refresh tick live in their own module.
+	// It receives every seam it touches instead of closing over this file, so the
+	// names it returns are the ones the rest of the entry calls.
+	const {
+		safeDrain,
+		claimPending,
+		settle,
+		markDelivered,
+		formatSignalMessage,
+		countPending,
+		countOrphaned,
+		refreshJobs,
+		sweepClaimed,
+		sweepOrphaned,
+	} = createDelivery({
+		fs: spool,
+		inboxDir,
+		claimedDir,
+		orphanedDir,
+		controlRoot,
+		ledger,
+		now: () => runtime.now(),
+		readJob,
+		writeJob,
+		readRecentJobs,
+		finalizeWorktree: finalizeJobWorktree,
+		ownerVerdict,
+		workerMode,
+		hasSession: () => cmd.session !== undefined,
+		deliverAs,
+		sendUserMessage: (text, options) => cmd.sendUserMessage(text, options),
+		showEntry: (type, data) => cmd.showEntry(type, data),
+		answerPendingPermission,
+		jobs: () => jobCache,
+		setJobs: jobs => {
+			jobCache = jobs;
+		},
+		sweepSubagentStopHooks,
+		updateStatus,
+		markJobsTick: () => {
+			try {
+				cmd.state.set('jobsTick', runtime.now());
+			} catch {
+				/* pre-bind or a host without state */
+			}
+		},
+		sweep: (dir, ttlMs) => sweepExpiredEntries(spool, dir, runtime.now(), {ttlMs}),
 	});
 
 	// One state-change choke point for the parent. The durable record is the source of
@@ -4649,199 +4640,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		} catch {
 			/* a durable signal is best effort; the job record still has the result */
 		}
-	}
-
-	function markDelivered(id: string): void {
-		const job = readJob(id);
-		if (job === undefined) return;
-		job.deliveredAt = runtime.now();
-		job.updatedAt = job.deliveredAt;
-		writeJob(job);
-	}
-
-	// `queueMessage` only steers a run that is already going - it never STARTS one,
-	// so an idle session would leave the result unread until someone asked for it.
-	// `sendUserMessage` starts the turn when idle and queues behind the active turn
-	// otherwise. This is the A2A delivery path.
-	function deliver(message: Signal): void {
-		cmd.sendUserMessage(formatSignalMessage(message), {deliverAs: deliverAs()});
-		cmd.showEntry('subagent', message);
-	}
-
-	// ------------------------------------------------------------------ spool
-	//
-	// One file in inbox/ is one undelivered signal, and rename() is the claim: it is
-	// atomic, so exactly one drainer wins a file even with several sessions on one
-	// spool. next() and settle() are the only two operations on a claimed file, so
-	// drain, onStop and the pending count cannot disagree about a signal - and in
-	// particular a signal this session does not own is put back, never deleted.
-
-	function inboxNames(): string[] {
-		try {
-			return spool.readdir(inboxDir).filter(name => name.endsWith('.json'));
-		} catch {
-			return [];
-		}
-	}
-
-	// Claim the next signal this session may deliver. Everything else - torn, already
-	// delivered, untagged, foreign, or not classifiable yet - is settled right here,
-	// so the caller only ever sees its own work. `seen` bounds one pass.
-	function next(seen: Set<string>): Claim | undefined {
-		for (const name of inboxNames()) {
-			if (seen.has(name)) continue;
-			seen.add(name);
-			const live = join(inboxDir, name);
-			const claimed = join(claimedDir, name);
-			try {
-				spool.rename(live, claimed);
-			} catch {
-				/* another drainer won it */
-				continue;
-			}
-			let signal: Signal | undefined;
-			try {
-				signal = JSON.parse(spool.readFile(claimed)) as Signal;
-			} catch {
-				signal = undefined;
-			}
-			if (signal === undefined || typeof signal.id !== 'string' || signal.id.length === 0) {
-				spool.remove(claimed);
-				continue;
-			}
-			const claim: Claim = {name, signal, live, claimed};
-			if (ledger.has(signal.id)) {
-				// Delivered once already (a replayed claimed/ file): drop this copy.
-				settle(claim, 'accepted');
-				continue;
-			}
-			const owner = ownerVerdict(signal.owner);
-			if (owner === 'orphan') {
-				settle(claim, 'quarantined');
-				continue;
-			}
-			if (owner !== 'mine') {
-				settle(claim, 'held');
-				continue;
-			}
-			// A foreground run already returned this exact result inside the tool call.
-			// Its durable signal is the same result, so accept it here: delivering it
-			// again would report the work twice.
-			const settledJob = readJob(signal.id);
-			if (settledJob !== undefined && settledJob.background === false) {
-				markDelivered(signal.id);
-				settle(claim, 'accepted');
-				continue;
-			}
-			return claim;
-		}
-		return undefined;
-	}
-
-	function settle(claim: Claim, outcome: Settled): void {
-		if (outcome === 'accepted') {
-			ledger.accept(claim.signal.id);
-			spool.remove(claim.claimed);
-			return;
-		}
-		if (outcome === 'quarantined') {
-			try {
-				spool.rename(
-					claim.claimed,
-					join(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`),
-				);
-			} catch {
-				/* leave it in claimed/; sweepClaimed bounds it. Never delete a signal here. */
-			}
-			return;
-		}
-		// Held: put it back for its owner. If the rename cannot happen, write the
-		// signal back into inbox/ instead of deleting the only durable copy.
-		try {
-			spool.rename(claim.claimed, claim.live);
-		} catch {
-			try {
-				spool.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
-				spool.remove(claim.claimed);
-			} catch {
-				/* it stays in claimed/ and is swept later. Never deleted. */
-			}
-		}
-	}
-
-	const answeredPermissions = new Set<string>();
-
-	// A live background worker can ask for approval too; its request emits no signal,
-	// so the drain is where the parent answers it. Fire-and-forget: the worker's own
-	// wait is bounded and the UI promise settles later.
-	function answerLivePermissions(): void {
-		for (const job of jobCache) {
-			if (job.live !== true) continue;
-			void answerPendingPermission(join(controlRoot, job.id), answeredPermissions);
-		}
-	}
-
-	function drain(): void {
-		if (draining) return;
-		draining = true;
-		const seen = new Set<string>();
-		try {
-			answerLivePermissions();
-			for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-				const claim = next(seen);
-				if (claim === undefined) return;
-				// No bound session is a state, not an exception: sending here would
-				// degrade to a silent queue push in a headless run. Hold it instead.
-				if (cmd.session === undefined) {
-					settle(claim, 'held');
-					continue;
-				}
-				try {
-					deliver(claim.signal);
-				} catch {
-					settle(claim, 'held');
-					continue;
-				}
-				markDelivered(claim.signal.id);
-				settle(claim, 'accepted');
-			}
-		} finally {
-			draining = false;
-		}
-	}
-
-	// A failed drain must never take the session down with it.
-	const safeDrain = (): void => {
-		try {
-			drain();
-		} catch {
-			/* the next tick tries again */
-		}
-	};
-
-	// Claim up to `limit` signals without delivering them; the caller decides how they
-	// reach the model (onStop continues the run with them as the reason). An unsettled
-	// claim stays in claimed/ and is swept later.
-	function claimPending(limit: number): Claim[] {
-		const seen = new Set<string>();
-		const claims: Claim[] = [];
-		while (claims.length < limit) {
-			const claim = next(seen);
-			if (claim === undefined) break;
-			claims.push(claim);
-		}
-		return claims;
-	}
-
-	// claimed/ is a rename target, not an archive. Sweep files abandoned by a drain
-	// that died between claim and remove so a long-lived spool cannot grow forever.
-	function sweepClaimed(): void {
-		sweepExpiredEntries(spool, claimedDir, runtime.now(), {ttlMs: CLAIMED_TTL_MS});
-	}
-
-	function sweepOrphaned(): void {
-		if (workerMode) return;
-		sweepExpiredEntries(spool, orphanedDir, runtime.now(), {ttlMs: ORPHANED_TTL_MS});
 	}
 
 	// Retention. A finished job keeps its record, its log and its transcript for
@@ -5024,30 +4822,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	}
 
 	let jobCache: JobRecord[] = [];
-	let lastJobsSignature = '';
 	let lastStatus = '';
-
-	// How many signals are waiting for this session. It claims through the same
-	// next()/settle() pair the drain uses, so the count cannot drift from delivery.
-	function countPending(): number {
-		const seen = new Set<string>();
-		let count = 0;
-		while (count < PENDING_SCAN_MAX) {
-			const claim = next(seen);
-			if (claim === undefined) break;
-			count += 1;
-			settle(claim, 'held');
-		}
-		return count;
-	}
-
-	function countOrphaned(): number {
-		try {
-			return spool.readdir(orphanedDir).length;
-		} catch {
-			return 0;
-		}
-	}
 
 	function updateStatus(): void {
 		try {
@@ -5093,21 +4868,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				input: {id: job.id, state},
 			});
 			writeJob({...job, subagentStopHook: true, updatedAt: runtime.now()});
-		}
-	}
-
-	function refreshJobs(): void {
-		jobCache = readRecentJobs(LIST_SCAN_MAX);
-		sweepSubagentStopHooks();
-		updateStatus();
-		const signature = jobCache.map(job => `${job.id}:${canonicalState(job.state)}`).join('|');
-		if (signature !== lastJobsSignature) {
-			lastJobsSignature = signature;
-			try {
-				cmd.state.set('jobsTick', runtime.now());
-			} catch {
-				/* pre-bind or a host without state */
-			}
 		}
 	}
 
@@ -5485,7 +5245,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			record.cwd = isolation.path;
 		}
 		writeJob(record);
-		if (isolation !== undefined && !isolation.ok) {
+		if (isolation !== undefined && isolation.ok === false) {
 			failJob(record, isolation.error);
 			return {ok: false, error: isolation.error};
 		}
@@ -5579,7 +5339,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			MOD_PATH,
 		);
 		const launched = startWorker(record, spec);
-		if (!launched.ok || intent.background !== false) return launched;
+		if (launched.ok === false || intent.background !== false) return launched;
 		return settleForeground(launched);
 	}
 
@@ -5632,7 +5392,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// Foreground is a bounded wait on the same durable record a background job
 	// leaves behind. Completion is the record, never the process: a worker that died
 	// after writing its result must still return it.
-	async function settleForeground(launched: {readonly id: string; readonly pid: number}): Promise<Launch> {
+	async function settleForeground(launched: {
+		readonly ok: true;
+		readonly id: string;
+		readonly pid: number;
+	}): Promise<Launch> {
 		const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
 		let record = readJob(launched.id);
 		const answered = new Set<string>();
@@ -5676,10 +5440,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const outcome = foregroundOutcome(record, log);
 		if (decision?.kept !== true) return {...launched, result: outcome};
 		const note = `\nworktree kept at ${decision.path}${decision.error === undefined ? '' : ` (${decision.error})`}`;
-		return {
-			...launched,
-			result: outcome.ok ? {...outcome, text: `${outcome.text}${note}`} : {...outcome, error: `${outcome.error}${note}`},
-		};
+		const result: ForegroundResult =
+			outcome.ok === true
+				? {ok: true, text: `${outcome.text}${note}`, partial: outcome.partial}
+				: {ok: false, error: `${outcome.error}${note}`};
+		return {...launched, result};
 	}
 
 	// ------------------------------------------------------------------ dashboard
@@ -5935,7 +5700,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			// Omitted type resolves to general-purpose, or fails with the documented
 			// error when no general-purpose agent exists.
 			const resolved = resolveAgentDefinition(subagentType ?? aliasType);
-			if (!resolved.ok) return {ok: false, error: resolved.error};
+			if (resolved.ok === false) return {ok: false, error: resolved.error};
 			definition = resolved.definition;
 		}
 		const forkRequested = definition?.fork === true;
@@ -5949,7 +5714,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			...(requestedBackground !== undefined ? {requested: requestedBackground} : {}),
 			forkMode,
 		});
-		if (!teamPolicy.ok) return {ok: false, error: teamPolicy.error};
+		if (teamPolicy.ok === false) return {ok: false, error: teamPolicy.error};
 		const requestedTools =
 			prompt === undefined || forkRequested ? undefined : (listField(input.tools) ?? definition?.tools);
 		const requestedDisallowed =
@@ -5964,7 +5729,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				permissionMode = mainPermissionMode ?? 'default';
 			} else {
 				const modeResolution = resolvePermissionMode(requestedMode ?? definition?.permissionMode, mainPermissionMode);
-				if (!modeResolution.ok) return {ok: false, error: modeResolution.error};
+				if (modeResolution.ok === false) return {ok: false, error: modeResolution.error};
 				permissionMode = modeResolution.mode;
 			}
 		}
@@ -6020,7 +5785,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					...(teammate ? {team: true} : {}),
 					mcpServers: mcpNames,
 				});
-		if (!launch.ok) return {ok: false, error: launch.error};
+		if (launch.ok === false) return {ok: false, error: launch.error};
 		if (forkRequested && (sessionId === undefined || sessionId.length === 0)) {
 			return {ok: false, error: 'a fork needs the main session id; the session has not bound yet'};
 		}
@@ -6082,16 +5847,16 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	const spawnRun = async ({input}: {input: Record<string, unknown>}): Promise<ToolResult> => {
 		const planned = planFromInput(input);
-		if (!planned.ok) return badInput(planned.error);
+		if (planned.ok === false) return badInput(planned.error);
 		const plan = planned.plan;
 		const launched = await fire(plan);
-		if (!launched.ok) return badInput(launched.error);
+		if (launched.ok === false) return badInput(launched.error);
 		// A one-shot (Explore/Plan) has no agent id: the record is the only handle.
 		const spawnedAgentId = readJob(launched.id)?.agentId;
 		// A foreground run returns its result here; a background run returns the moment
 		// the worker is detached.
 		if (launched.result !== undefined) {
-			if (!launched.result.ok) return badInput(launched.result.error);
+			if (launched.result.ok === false) return badInput(launched.result.error);
 			return okText(
 				spawnedAgentId !== undefined ? `agent id ${spawnedAgentId}\n${launched.result.text}` : launched.result.text,
 			);
@@ -6415,9 +6180,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// fresh session (the definition body still applies). A fork resumes its fork
 		// session instead; forking again would lose the context it already has.
 		const planned = planFromRecord(record, instruction, 'resume');
-		if (!planned.ok) return badInput(planned.error);
+		if (planned.ok === false) return badInput(planned.error);
 		const launched = await fire(planned.plan);
-		if (!launched.ok) return badInput(launched.error);
+		if (launched.ok === false) return badInput(launched.error);
 		const resumedAgentId = readJob(launched.id)?.agentId;
 		return launchedToolResult(
 			launched,
@@ -6489,7 +6254,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		asyncText: string,
 	): ToolResult {
 		if (launched.result !== undefined) {
-			if (!launched.result.ok) return badInput(launched.result.error);
+			if (launched.result.ok === false) return badInput(launched.result.error);
 			return okText(agentId !== undefined ? `agent id ${agentId}\n${launched.result.text}` : launched.result.text);
 		}
 		return okText(asyncText);
@@ -6512,9 +6277,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			);
 		}
 		const planned = planFromRecord(record, message, 'message');
-		if (!planned.ok) return badInput(planned.error);
+		if (planned.ok === false) return badInput(planned.error);
 		const launched = await fire(planned.plan);
-		if (!launched.ok) return badInput(launched.error);
+		if (launched.ok === false) return badInput(launched.error);
 		return launchedToolResult(
 			launched,
 			readJob(launched.id)?.agentId,
@@ -6974,7 +6739,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			fork: true,
 			mainSessionId: sessionId,
 		});
-		if (!launched.ok) return {message: `subtask: ${launched.error}`};
+		if (launched.ok === false) return {message: `subtask: ${launched.error}`};
 		return {
 			message:
 				`subtask: started fork ${launched.id} from the main conversation, pid ${launched.pid}.\n` +
