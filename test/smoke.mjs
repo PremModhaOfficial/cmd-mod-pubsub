@@ -6203,6 +6203,108 @@ process.stdin.on('data', (data) => {
 	assert.ok(existsSync(join(grepSpoolRoot, 'jobs')), 'the worker resolves jobs under the spec root');
 	ok('greptile: the worker uses the parent spool root');
 
+	// 113. Greptile: one permission request reaches the human once ------------
+	// The foreground wait and the delivery drain both poll the same control dir.
+	// Before the fix each had its own "already asked" set, so the drain opened a
+	// second dialog for a request the foreground wait was already showing.
+	//
+	// Both pollers have to run: the foreground wait polls through the runtime's
+	// sleep, and the drain polls on the clock tick.
+	const onceDir = mkdtempSync(join(tmpdir(), 'subagent-perm-once-'));
+	const onceSpecs = [];
+	let onceSleeps = 0;
+	const onceCase = modeCase(onceDir, {
+		spawn(_command, _args, options) {
+			onceSpecs.push(JSON.parse(options.env.SUBAGENT_SPEC));
+			return makeChild();
+		},
+		async sleep() {
+			if (onceSpecs.length === 0) return;
+			const controlDir = join(onceDir, 'control', onceSpecs[0].id);
+			if (onceSleeps === 0) {
+				mkdirSync(controlDir, {recursive: true});
+				writeFileSync(
+					join(controlDir, 'permission.json'),
+					JSON.stringify({
+						requestId: 21,
+						title: 'Write file',
+						options: [
+							{optionId: 'allow-once', kind: 'allow_once', name: 'Allow'},
+							{optionId: 'reject-once', kind: 'reject_once', name: 'Reject'},
+						],
+					}),
+				);
+				onceSleeps = 1;
+				// The drain polls the same control dir on the clock tick. Ticking it
+				// here, while the foreground wait is between polls, is exactly the
+				// race the two pollers had.
+				onceCase.bundle.tickClock();
+				return;
+			}
+			if (existsSync(join(controlDir, 'permission-response.json'))) {
+				settleJob(onceDir, onceSpecs[0], {state: 'done', log: 'AFTER APPROVAL'});
+			}
+		},
+	});
+	onceCase.bundle.setSelectAnswer(() => 'Allow');
+	await toolOf(onceCase.bundle, 'subagent_spawn').run({
+		input: {description: 'once', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(
+		onceCase.bundle.selectCalls.length,
+		1,
+		`one request must reach the human once, not once per poller (asked ${onceCase.bundle.selectCalls.length} times)`,
+	);
+	ok('greptile: one permission request reaches the human once');
+
+	// 114. Greptile: an approval does not cross conversations ---------------
+	// The jobs cache spans every session in the spool. A live job owned by
+	// another conversation must not have its approval request shown here.
+	const crossDir = mkdtempSync(join(tmpdir(), 'subagent-perm-cross-'));
+	const crossCase = modeCase(crossDir);
+	const foreignId = 'foreign-live-job';
+	const foreignControl = join(crossDir, 'control', foreignId);
+	mkdirSync(foreignControl, {recursive: true});
+	writeFileSync(
+		join(foreignControl, 'permission.json'),
+		JSON.stringify({
+			requestId: 31,
+			title: 'Another session',
+			options: [{optionId: 'allow-once', kind: 'allow_once', name: 'Allow'}],
+		}),
+	);
+	writeFileSync(
+		join(crossDir, 'jobs', `${foreignId}.json`),
+		JSON.stringify({
+			id: foreignId,
+			kind: 'agent',
+			live: true,
+			owner: 'a-different-session',
+			cwd: crossDir,
+			logPath: join(crossDir, 'logs', `${foreignId}.log`),
+			inboxDir: join(crossDir, 'inbox'),
+			jobsDir: join(crossDir, 'jobs'),
+			startedAt: MODE_NOW,
+			sessionId: 'other-session',
+		}),
+	);
+	crossCase.bundle.setSelectAnswer(() => 'Allow');
+	// A refresh pulls the shared spool into the jobs cache, and the drain then
+	// polls every live job it finds there. The refresh tick runs after the drain
+	// tick, so the cache is filled first and the drain sees the foreign job.
+	crossCase.bundle.tickClock();
+	crossCase.bundle.tickClock();
+	assert.equal(
+		crossCase.bundle.selectCalls.length,
+		0,
+		`another conversation's approval must not be shown here (asked ${crossCase.bundle.selectCalls.length} times)`,
+	);
+	assert.ok(
+		!existsSync(join(foreignControl, 'permission-response.json')),
+		'another conversation\'s request is not answered here',
+	);
+	ok('greptile: an approval does not cross conversations');
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);

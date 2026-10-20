@@ -145,6 +145,9 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 	const promptSubmits = [];
 	const stateValues = new Map();
 	let selectAnswer = () => undefined;
+	// Every question put to the human, so a test can prove one request reached
+	// the human once.
+	const selectCalls = [];
 
 	const api = {
 		// ---- registration
@@ -232,7 +235,10 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 				openPaneCalls.push(id);
 				return true;
 			},
-			select: async ({options}) => selectAnswer(options),
+			select: async ({title, options}) => {
+				selectCalls.push({title, options});
+				return selectAnswer(options);
+			},
 			notify(message, level) {
 				notifyCalls.push({message, level});
 			},
@@ -266,6 +272,15 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		userMessages,
 		notifyCalls,
 		promptSubmits,
+		selectCalls,
+		/**
+		 * Run every registered clock tick once, in registration order. A test that
+		 * needs the drain to happen - the one that polls the spool on a timer -
+		 * calls this instead of waiting for real time.
+		 */
+		tickClock() {
+			for (const {fn} of everyTicks) fn();
+		},
 		setSelectAnswer(answer) {
 			selectAnswer = answer;
 		},

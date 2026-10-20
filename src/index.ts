@@ -3018,6 +3018,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 
 	// The permission handshake reads only the spool, the clock, and the human; the
 	// two callers (the drain and the foreground wait) share one context.
+	//
+	// They also share one set of requests already put to the human. The drain
+	// polls every 400ms and the foreground wait polls the same control dir, so a
+	// request must reach the human once, not once per poller.
+	const askedPermissions = new Set<string>();
 	const permissionCtx: PermissionContext = {
 		fs: spool,
 		now: () => runtime.now(),
@@ -3060,6 +3065,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		sendUserMessage: (text, options) => cmd.sendUserMessage(text, options),
 		showEntry: (type, data) => cmd.showEntry(type, data),
 		answerPendingPermission: (controlDir, answered) => answerPermission(controlDir, answered, permissionCtx),
+		askedPermissions,
 		jobs: () => jobCache,
 		setJobs: jobs => {
 			jobCache = jobs;
@@ -3655,6 +3661,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			cmd.session?.appendCustomEntry(entry as never);
 		},
 		answerPendingPermission: (controlDir, answered) => answerPermission(controlDir, answered, permissionCtx),
+		askedPermissions,
 		backgrounded: backgroundedForegrounds,
 	};
 

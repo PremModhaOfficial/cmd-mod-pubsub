@@ -1244,7 +1244,7 @@ var ledgerFactory = createLedger;
 // src/delivery.ts
 import { join as join5 } from "node:path";
 function createDelivery(deps) {
-  const answeredPermissions = /* @__PURE__ */ new Set();
+  const answeredPermissions = deps.askedPermissions;
   let draining = false;
   let lastJobsSignature = "";
   function markDelivered(id) {
@@ -1381,6 +1381,7 @@ ${next2}`;
   function answerLivePermissions() {
     for (const job of deps.jobs()) {
       if (job.live !== true) continue;
+      if (deps.ownerVerdict(job.owner) !== "mine") continue;
       void deps.answerPendingPermission(join5(deps.controlRoot, job.id), answeredPermissions);
     }
   }
@@ -2556,7 +2557,7 @@ import { join as join10 } from "node:path";
 
 // src/permission.ts
 import { join as join9 } from "node:path";
-async function answerPendingPermission(controlDir, answered, ctx) {
+async function answerPendingPermission(controlDir, asked, ctx) {
   let request;
   try {
     request = JSON.parse(ctx.fs.readFile(join9(controlDir, "permission.json")));
@@ -2564,7 +2565,7 @@ async function answerPendingPermission(controlDir, answered, ctx) {
     return;
   }
   const key = String(request.requestId ?? "");
-  if (key.length === 0 || answered.has(key)) return;
+  if (key.length === 0 || asked.has(key)) return;
   const options = request.options ?? [];
   const choices = options.map((option2, index) => ({
     label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
@@ -2572,6 +2573,7 @@ async function answerPendingPermission(controlDir, answered, ctx) {
   }));
   const ui = ctx.ui;
   if (typeof ui.select !== "function") return;
+  asked.add(key);
   let chosen;
   try {
     chosen = await ui.select({
@@ -2582,7 +2584,6 @@ async function answerPendingPermission(controlDir, answered, ctx) {
     return;
   }
   if (typeof chosen !== "string") return;
-  answered.add(key);
   const picked = choices.find((choice) => choice.label === chosen);
   const option = picked === void 0 ? void 0 : options[picked.index];
   const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
@@ -2854,7 +2855,7 @@ __name(fire, "fire");
 async function settleForeground(launched, ctx) {
   const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
   let record = ctx.readJob(launched.id);
-  const answered = /* @__PURE__ */ new Set();
+  const answered = ctx.askedPermissions;
   const permissionDir = join10(ctx.controlRoot, launched.id);
   for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
     if (ctx.backgrounded.has(launched.id)) {
@@ -5612,6 +5613,7 @@ function index_default(cmd, overrides = {}) {
     readJob,
     writeJob
   });
+  const askedPermissions = /* @__PURE__ */ new Set();
   const permissionCtx = {
     fs: spool,
     now: /* @__PURE__ */ __name(() => runtime.now(), "now"),
@@ -5650,6 +5652,7 @@ function index_default(cmd, overrides = {}) {
     sendUserMessage: /* @__PURE__ */ __name((text, options) => cmd.sendUserMessage(text, options), "sendUserMessage"),
     showEntry: /* @__PURE__ */ __name((type, data) => cmd.showEntry(type, data), "showEntry"),
     answerPendingPermission: /* @__PURE__ */ __name((controlDir, answered) => answerPendingPermission(controlDir, answered, permissionCtx), "answerPendingPermission"),
+    askedPermissions,
     jobs: /* @__PURE__ */ __name(() => jobCache, "jobs"),
     setJobs: /* @__PURE__ */ __name((jobs) => {
       jobCache = jobs;
@@ -6149,6 +6152,7 @@ function index_default(cmd, overrides = {}) {
       cmd.session?.appendCustomEntry(entry);
     }, "appendJobEntry"),
     answerPendingPermission: /* @__PURE__ */ __name((controlDir, answered) => answerPendingPermission(controlDir, answered, permissionCtx), "answerPendingPermission"),
+    askedPermissions,
     backgrounded: backgroundedForegrounds
   };
   const tools = createTools({

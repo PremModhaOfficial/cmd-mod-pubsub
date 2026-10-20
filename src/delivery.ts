@@ -51,6 +51,12 @@ export interface DeliveryDeps {
 	readonly sendUserMessage: (text: string, options: {deliverAs: 'steer' | 'follow-up'}) => void;
 	readonly showEntry: (type: string, data: unknown) => void;
 	readonly answerPendingPermission: (controlDir: string, answered: Set<string>) => Promise<void>;
+	/**
+	 * The permission requests already put to the human. The entry owns this set
+	 * because the foreground wait and the delivery drain both ask: they share one
+	 * set so a request reaches the human once, not once per poller.
+	 */
+	readonly askedPermissions: Set<string>;
 	/** The session's record cache: refreshed here, read by the status line and hooks. */
 	readonly jobs: () => readonly JobRecord[];
 	readonly setJobs: (jobs: JobRecord[]) => void;
@@ -78,9 +84,9 @@ export interface Delivery {
 }
 
 export function createDelivery(deps: DeliveryDeps): Delivery {
-	// Permission requests already answered in this process, so repeatedly polling the
-	// same control dir cannot ask the human twice.
-	const answeredPermissions = new Set<string>();
+	// Permission requests already put to the human in this process, shared with the
+	// foreground wait, so repeatedly polling the same control dir cannot ask twice.
+	const answeredPermissions = deps.askedPermissions;
 
 	// One writer at a time. A tick that finds this flag set returns immediately rather
 	// than racing the previous tick over the same files.
@@ -252,9 +258,15 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// A live background worker can ask for approval too; its request emits no signal,
 	// so the drain is where the parent answers it. Fire-and-forget: the worker's own
 	// wait is bounded and the UI promise settles later.
+	//
+	// The jobs cache spans every session in the spool, so a job owned by another
+	// conversation is polled only to answer its approval request there. The owner
+	// check is the same one the signal path uses: mine answers, foreign is left
+	// alone, orphan and pending are not this session's to answer.
 	function answerLivePermissions(): void {
 		for (const job of deps.jobs()) {
 			if (job.live !== true) continue;
+			if (deps.ownerVerdict(job.owner) !== 'mine') continue;
 			void deps.answerPendingPermission(join(deps.controlRoot, job.id), answeredPermissions);
 		}
 	}

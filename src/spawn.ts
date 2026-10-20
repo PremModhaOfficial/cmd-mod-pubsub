@@ -186,6 +186,12 @@ export interface SpawnContext {
 	): void;
 	appendJobEntry(entry: {customType: string; data: Record<string, unknown>}): void;
 	answerPendingPermission(controlDir: string, answered: Set<string>): Promise<void>;
+	/**
+	 * The permission requests already put to the human, across every path that
+	 * asks: the foreground wait and the delivery drain share this one set, so a
+	 * request reaches the human once instead of once per poller.
+	 */
+	readonly askedPermissions: Set<string>;
 	readonly backgrounded: {has(id: string): boolean};
 }
 
@@ -510,7 +516,9 @@ async function settleForeground(
 ): Promise<Launch> {
 	const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
 	let record = ctx.readJob(launched.id);
-	const answered = new Set<string>();
+	// The shared set: the delivery drain polls the same control dir, and one
+	// request must reach the human once.
+	const answered = ctx.askedPermissions;
 	const permissionDir = join(ctx.controlRoot, launched.id);
 	for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
 		if (ctx.backgrounded.has(launched.id)) {

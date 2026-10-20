@@ -29,9 +29,14 @@ export interface PermissionContext {
 // request to its control dir and waits, bounded. This process owns the human, so
 // it puts the request to them and writes the answer back. No answer (headless,
 // dismissed) leaves the worker's own bound in charge instead of inventing one.
+//
+// The `asked` set is shared by every caller in this process: the foreground wait
+// and the delivery drain both poll the same control dir, and a request must
+// reach the human once. The key is reserved BEFORE the dialog opens, so a
+// second poll cannot open a competing dialog for the same request.
 export async function answerPendingPermission(
 	controlDir: string,
-	answered: Set<string>,
+	asked: Set<string>,
 	ctx: PermissionContext,
 ): Promise<void> {
 	let request: PermissionRequest;
@@ -41,7 +46,7 @@ export async function answerPendingPermission(
 		return;
 	}
 	const key = String(request.requestId ?? '');
-	if (key.length === 0 || answered.has(key)) return;
+	if (key.length === 0 || asked.has(key)) return;
 	const options = request.options ?? [];
 	const choices = options.map((option, index) => ({
 		label: option.name || option.kind || option.optionId || `option ${index + 1}`,
@@ -51,6 +56,10 @@ export async function answerPendingPermission(
 		select?: (ask: {title: string; options: Array<{label: string}>}) => Promise<string | undefined>;
 	};
 	if (typeof ui.select !== 'function') return;
+	// Reserve before asking. The dialog is open for as long as the human takes to
+	// answer it, and the drain polls every 400ms; without the reservation the same
+	// request would open a second dialog and two answers would race.
+	asked.add(key);
 	let chosen: string | undefined;
 	try {
 		chosen = await ui.select({
@@ -62,7 +71,6 @@ export async function answerPendingPermission(
 		return;
 	}
 	if (typeof chosen !== 'string') return;
-	answered.add(key);
 	const picked = choices.find(choice => choice.label === chosen);
 	const option = picked === undefined ? undefined : options[picked.index];
 	const response =
