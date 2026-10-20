@@ -243,14 +243,33 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		}
 		// Held: put it back for its owner. If the rename cannot happen, write the
 		// signal back into inbox/ instead of deleting the only durable copy.
+		//
+		// The write is atomic. Writing straight to the visible inbox name let
+		// another session's drain claim the file while the write was still going:
+		// it read half a JSON, treated it as invalid and deleted it, and this
+		// writer then deleted the claimed copy too - the result was gone. The
+		// temporary name does not end in ".json", so the inbox scan ignores it,
+		// and the rename publishes it whole.
 		try {
 			deps.fs.rename(claim.claimed, claim.live);
 		} catch {
+			const tmp = `${claim.live}.restoring`;
 			try {
-				deps.fs.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
-				deps.fs.remove(claim.claimed);
+				deps.fs.writeFile(tmp, JSON.stringify(claim.signal, null, 2));
 			} catch {
 				/* it stays in claimed/ and is swept later. Never deleted. */
+				return;
+			}
+			try {
+				deps.fs.rename(tmp, claim.live);
+			} catch {
+				/* the temporary copy is a durable record; the owner can still claim it */
+				return;
+			}
+			try {
+				deps.fs.remove(claim.claimed);
+			} catch {
+				/* the copy is published; the claimed original is swept later */
 			}
 		}
 	}

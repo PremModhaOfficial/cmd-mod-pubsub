@@ -301,6 +301,109 @@ try {
 	);
 	ok("onStop never deletes a foreign session's signal");
 
+	// 11b. A held signal is put back atomically ----------------------------
+	// The restore fallback wrote the signal straight to its visible inbox
+	// name. Another session's drain could claim that file while the write was
+	// still going, read a half-written JSON, treat it as invalid and delete
+	// it - and the writer then deleted the claimed copy too, so the result
+	// was gone. The file is now written under a name the inbox scan ignores
+	// and renamed into place, so a reader only ever sees a whole signal.
+	const atomicDir = mkdtempSync(join(tmpdir(), 'pubsub-atomic-'));
+	const atomicSessionA = makeSession();
+	const atomicSessionB = makeSession();
+	// The restore rename fails, so the write-and-rename fallback runs.
+	const atomicFails = {
+		rename(from, to) {
+			if (from.startsWith(join(atomicDir, 'claimed')) && to.startsWith(join(atomicDir, 'inbox'))) {
+				throw new Error('EXDEV');
+			}
+			return renameSync(from, to);
+		},
+	};
+	const atomicA = makeApi({spoolDir: atomicDir, session: atomicSessionA, runtime: makeRuntime().runtime});
+	const atomicB = makeApi({
+		spoolDir: atomicDir,
+		session: atomicSessionB,
+		runtime: makeRuntime({fs: atomicFails}).runtime,
+	});
+	mod(atomicA.api, atomicA.runtime);
+	mod(atomicB.api, atomicB.runtime);
+	// The owner is published when the mod starts, so it is read after that.
+	const atomicOwner = ownerEntries(atomicSessionA)[0];
+	writeFileSync(
+		join(atomicDir, 'inbox', `${Date.now()}-atomic-1.json`),
+		JSON.stringify({id: 'atomic-1', owner: atomicOwner, description: 'atomic', kind: 'command', state: 'done', title: 'atomic done', body: 'ok'}),
+	);
+	atomicB.registeredHooks.onStop();
+	// The signal is back in the inbox. Nothing else is: no half-written file,
+	// and no leftover temporary copy.
+	const atomicInbox = readdirSync(join(atomicDir, 'inbox'));
+	assert.equal(
+		atomicInbox.filter((name) => name.includes('atomic-1')).length,
+		1,
+		'the held signal is back in the inbox exactly once',
+	);
+	assert.equal(
+		atomicInbox.filter((name) => !name.endsWith('.json')).length,
+		0,
+		`the restore leaves no temporary file in the inbox: ${JSON.stringify(atomicInbox)}`,
+	);
+	assert.equal(
+		JSON.parse(readFileSync(join(atomicDir, 'inbox', atomicInbox.find((name) => name.includes('atomic-1'))), 'utf8')).id,
+		'atomic-1',
+		'the restored signal is whole',
+	);
+	ok('a held signal is put back atomically');
+
+	// 11c. The restore never exposes a half-written signal ------------------
+	// The bug was a race, not a wrong outcome: the signal always came back, but
+	// the old code wrote it straight to its visible inbox name. Another
+	// session's drain could claim that file mid-write, read half a JSON, treat
+	// it as invalid and delete it. The write has to be invisible until it is
+	// whole, so the test watches the inbox WHILE the write happens.
+	const race2Dir = mkdtempSync(join(tmpdir(), 'pubsub-atomic-race-'));
+	const race2SessionA = makeSession();
+	const race2SessionB = makeSession();
+	const seenDuringWrite = [];
+	const race2Fails = {
+		rename(from, to) {
+			if (from.startsWith(join(race2Dir, 'claimed')) && to.startsWith(join(race2Dir, 'inbox'))) {
+				throw new Error('EXDEV');
+			}
+			return renameSync(from, to);
+		},
+		writeFile(file, data) {
+			// Write the first half, then look. A reader must not be able to see a
+			// partial file at any point during the write.
+			writeFileSync(file, data.slice(0, Math.max(1, Math.floor(data.length / 2))));
+			seenDuringWrite.push(...readdirSync(join(race2Dir, 'inbox')));
+			writeFileSync(file, data);
+		},
+	};
+	const race2A = makeApi({spoolDir: race2Dir, session: race2SessionA, runtime: makeRuntime().runtime});
+	const race2B = makeApi({
+		spoolDir: race2Dir,
+		session: race2SessionB,
+		runtime: makeRuntime({fs: race2Fails}).runtime,
+	});
+	mod(race2A.api, race2A.runtime);
+	mod(race2B.api, race2B.runtime);
+	const race2Owner = ownerEntries(race2SessionA)[0];
+	const race2Name = `${Date.now()}-atomic-race.json`;
+	writeFileSync(
+		join(race2Dir, 'inbox', race2Name),
+		JSON.stringify({id: 'atomic-race', owner: race2Owner, description: 'race', kind: 'command', state: 'done', title: 'done', body: 'ok'}),
+	);
+	race2B.registeredHooks.onStop();
+	// While the restore was writing, the inbox held no CLAIMABLE file for that
+	// signal. A reader claims what ends in ".json"; the temporary copy does not
+	// end that way, so it is never claimed and never deleted mid-write.
+	assert.ok(
+		!seenDuringWrite.some((name) => name.endsWith('.json') && name.includes('atomic-race')),
+		`a half-written signal is never claimable: ${JSON.stringify(seenDuringWrite)}`,
+	);
+	ok('a held signal is never visible half-written');
+
 	// The pending count reads the same spool, so it cannot disagree with delivery.
 	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'subagents');
 	const raceCommandB = raceB.commandDefs.find((def) => def.name === 'subagents');

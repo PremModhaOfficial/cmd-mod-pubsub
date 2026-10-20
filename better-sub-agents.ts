@@ -1394,8 +1394,18 @@ ${next2}`;
     try {
       deps.fs.rename(claim.claimed, claim.live);
     } catch {
+      const tmp = `${claim.live}.restoring`;
       try {
-        deps.fs.writeFile(claim.live, JSON.stringify(claim.signal, null, 2));
+        deps.fs.writeFile(tmp, JSON.stringify(claim.signal, null, 2));
+      } catch {
+        return;
+      }
+      try {
+        deps.fs.rename(tmp, claim.live);
+      } catch {
+        return;
+      }
+      try {
         deps.fs.remove(claim.claimed);
       } catch {
       }
