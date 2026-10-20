@@ -399,7 +399,14 @@ export function planFromInput(
 				: {}),
 			systemPrompt: forkRequested ? undefined : ctx.systemPromptFor(definition?.prompt),
 			appendSystemPrompt: ctx.appendPromptText,
+			// The flag says the worker's tool set must be enforced, and the worker
+			// refuses to run when the mod did not load in the ACP child. It is true
+			// whenever the tool set is a restriction: the caller's `tools`, the
+			// definition's `tools`, or either `disallowedTools` list. The caller's
+			// list was missing, so a run narrowed by the caller alone was not
+			// flagged, and the worker ran with an allowlist it never enforced.
 			restrictedTools:
+				requestedTools !== undefined ||
 				definition?.tools !== undefined ||
 				definition?.disallowedTools !== undefined ||
 				requestedDisallowed !== undefined,
@@ -523,19 +530,29 @@ export function planFromRecord(
 			agentType: record.agentType,
 			systemPrompt: mode === 'message' ? resumeDefinition?.prompt : ctx.systemPromptFor(resumeDefinition?.prompt),
 			appendSystemPrompt: ctx.appendPromptText,
+			// The flag says the worker's tool set must be enforced, and the worker
+			// refuses to run when the mod did not load in the ACP child. The record
+			// knows whether a restriction was applied - a plain agent has a resolved
+			// tool list too, so the list alone cannot say "restricted". A record
+			// from before the flag was saved falls back to the definition's lists.
 			restrictedTools:
-				resumeDefinition?.tools !== undefined || resumeDefinition?.disallowedTools !== undefined,
+				record.restrictedTools === true ||
+				(record.restrictedTools === undefined &&
+					(resumeDefinition?.tools !== undefined || resumeDefinition?.disallowedTools !== undefined)),
 			hooks: resumeDefinition?.hooks,
 			startup: ctx.startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
-			// The definition's deny list travels with the resume. The restricted flag
-			// above is set from it, but the flag is not the list: without the list
-			// the worker enforces an empty deny set and the resumed agent keeps the
-			// tool its definition took away.
-			...(resumeDefinition?.disallowedTools !== undefined
-				? {disallowedTools: resumeDefinition.disallowedTools}
-				: {}),
+			// The deny list is the one the RUN resolved, not the definition's. A
+			// definition can deny Bash while the spawn overrode that with
+			// `disallowed_tools: Write`; the first run could use Bash, and the
+			// saved tool list includes it. Restoring the definition's list here
+			// would block Bash on the resume and the work could not continue.
+			...(record.disallowedTools !== undefined
+				? {disallowedTools: record.disallowedTools}
+				: resumeDefinition?.disallowedTools !== undefined
+					? {disallowedTools: resumeDefinition.disallowedTools}
+					: {}),
 			...(mode === 'message'
 				? record.mcpServers !== undefined
 					? {mcpServers: record.mcpServers}
@@ -614,6 +631,12 @@ export function recordFromPlan(
 		...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 		...(intent.model !== undefined ? {model: intent.model} : {}),
 		...(intent.tools !== undefined ? {tools: intent.tools} : {}),
+		// The deny list the run resolved, so a resume restores the same one. The
+		// definition's list is not the same thing: a spawn may override it.
+		...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
+		// Whether a restriction was applied. A plain agent has a resolved tool list
+		// too, so the list alone cannot say "restricted" on a follow-up.
+		...(intent.restrictedTools === true ? {restrictedTools: true} : {}),
 		...(intent.mcpServers !== undefined ? {mcpServers: intent.mcpServers} : {}),
 		...(intent.autoCompactWindow !== undefined ? {autoCompactWindow: intent.autoCompactWindow} : {}),
 		...(intent.cacheTtl !== undefined ? {cacheTtl: intent.cacheTtl} : {}),

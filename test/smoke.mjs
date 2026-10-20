@@ -6611,11 +6611,12 @@ process.stdin.on('data', (data) => {
 	);
 	ok("a definition's denied tools reach the worker");
 
-	// 121. A resumed agent keeps the definition's denied tools ---------------
-	// The spawn path carries the definition's deny list. The resume path sets
-	// the restricted flag from the definition but never writes the list, so a
-	// resumed agent gets an empty deny list and keeps the tool its definition
-	// took away.
+	// 121. A resumed agent keeps the deny list the RUN resolved -------------
+	// The deny list the run resolved is the caller's override when there is one,
+	// else the definition's. A resume must restore that same list. Restoring the
+	// definition's list instead would block a tool the first run was allowed:
+	// a definition that denies Bash, overridden with `disallowed_tools: Write`,
+	// could use Bash, and its saved tool list includes it.
 	const denyResumeDir = mkdtempSync(join(tmpdir(), 'subagent-deny-resume-'));
 	const denyResumeRuntime = makeRuntime({now: () => fixedNow});
 	const denyResumeApi = makeApi({
@@ -6634,6 +6635,7 @@ process.stdin.on('data', (data) => {
 		input: {description: 'denied', prompt: 'work', subagent_type: 'restricted'},
 	});
 	const denyFirstSpec = JSON.parse(denyResumeRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(denyFirstSpec.disallowedTools, ['Bash'], "the definition's deny list reaches the first run");
 	// The job finishes, and the resume continues it.
 	const denyRecordPath = join(denyResumeDir, 'jobs', `${denyFirstSpec.id}.json`);
 	writeFileSync(
@@ -6652,9 +6654,130 @@ process.stdin.on('data', (data) => {
 	assert.deepEqual(
 		denyResumedSpec.disallowedTools,
 		['Bash'],
-		"a resumed agent keeps the definition's denied tools",
+		"a resumed agent keeps the deny list the run resolved",
 	);
-	ok("a resumed agent keeps the definition's denied tools");
+	ok('a resumed agent keeps the deny list the run resolved');
+
+	// 123. A follow-up keeps the CALLER's deny list, not the definition's ----
+	// The definition denies Bash. The spawn overrides that with
+	// `disallowed_tools: Write`, so the first run may use Bash, and the saved
+	// tool list includes it. Restoring the definition's list on the resume
+	// would block Bash, and the work that needed it could not continue.
+	const overrideDir = mkdtempSync(join(tmpdir(), 'subagent-deny-override-'));
+	const overrideRuntime = makeRuntime({now: () => fixedNow});
+	const overrideApi = makeApi({
+		spoolDir: overrideDir,
+		session: makeSession(),
+		runtime: overrideRuntime.runtime,
+	});
+	mkdirSync(join(overrideDir, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(overrideDir, '.commandcode', 'agents', 'restricted.md'),
+		'---\nname: restricted\ndescription: A definition that may not run Bash.\ndisallowedTools: Bash\n---\n\nA definition that may not run Bash.\n',
+	);
+	overrideApi.api.setFlag('add_dir', overrideDir);
+	mod(overrideApi.api, overrideRuntime.runtime);
+	await toolOf(overrideApi, 'subagent_spawn').run({
+		input: {description: 'override', prompt: 'work', subagent_type: 'restricted', disallowed_tools: 'Write'},
+	});
+	const overrideSpec = JSON.parse(overrideRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(
+		overrideSpec.disallowedTools,
+		['Write'],
+		"the caller's deny list overrides the definition's for that run",
+	);
+	const overrideRecordPath = join(overrideDir, 'jobs', `${overrideSpec.id}.json`);
+	writeFileSync(
+		overrideRecordPath,
+		JSON.stringify({
+			...JSON.parse(readFileSync(overrideRecordPath, 'utf8')),
+			state: 'done',
+			exitCode: 0,
+			finishedAt: fixedNow,
+			durationMs: 10,
+			acpSessionId: 'acp-session-override',
+		}),
+	);
+	await toolOf(overrideApi, 'subagent_resume').run({input: {id: overrideSpec.id, prompt: 'continue'}});
+	const overrideResumed = JSON.parse(overrideRuntime.spawnCalls[1].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(
+		overrideResumed.disallowedTools,
+		['Write'],
+		"the follow-up keeps the run's deny list, not the definition's",
+	);
+	ok("a follow-up keeps the caller's deny list, not the definition's");
+
+	// 122. A resumed agent stays restricted when the CALLER narrowed the tools
+	// ---------------------------------------------------------------------
+	// The "restricted" flag tells the worker its tool set must be enforced, and
+	// the worker refuses to run if the mod did not load in the ACP child. The
+	// resume path computed the flag from the definition only, so a run narrowed
+	// by the CALLER's `tools` argument - not the definition's - lost the flag on
+	// the resume. The worker then ran with an allowlist it never checked.
+	const callerToolsDir = mkdtempSync(join(tmpdir(), 'subagent-caller-tools-'));
+	const callerToolsRuntime = makeRuntime({now: () => fixedNow});
+	const callerToolsApi = makeApi({
+		spoolDir: callerToolsDir,
+		session: makeSession(),
+		runtime: callerToolsRuntime.runtime,
+	});
+	mod(callerToolsApi.api, callerToolsRuntime.runtime);
+	// The caller narrows the run to one tool. The definition says nothing about
+	// tools, so only the caller's list restricts it.
+	await toolOf(callerToolsApi, 'subagent_spawn').run({
+		input: {description: 'narrow', prompt: 'work', tools: 'Read'},
+	});
+	const callerToolsSpec = JSON.parse(callerToolsRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.equal(
+		callerToolsSpec.restrictedTools,
+		true,
+		"a run narrowed by the caller's tools is restricted",
+	);
+	// The job finishes, and the resume continues it.
+	const callerToolsRecordPath = join(callerToolsDir, 'jobs', `${callerToolsSpec.id}.json`);
+	writeFileSync(
+		callerToolsRecordPath,
+		JSON.stringify({
+			...JSON.parse(readFileSync(callerToolsRecordPath, 'utf8')),
+			state: 'done',
+			exitCode: 0,
+			finishedAt: fixedNow,
+			durationMs: 10,
+			acpSessionId: 'acp-session-caller-tools',
+		}),
+	);
+	await toolOf(callerToolsApi, 'subagent_resume').run({input: {id: callerToolsSpec.id, prompt: 'continue'}});
+	const callerToolsResumed = JSON.parse(callerToolsRuntime.spawnCalls[1].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(
+		callerToolsResumed.tools,
+		callerToolsSpec.tools,
+		'the resumed run keeps the same resolved tool list',
+	);
+	assert.equal(
+		callerToolsResumed.restrictedTools,
+		true,
+		'the resumed run stays restricted, so the worker enforces its tool list',
+	);
+	ok('a resumed agent stays restricted when the caller narrowed the tools');
+
+	// 124. A plain agent is NOT restricted -----------------------------------
+	// Every agent has a resolved tool list, including a plain one that asked for
+	// nothing. The "restricted" flag means a restriction was applied, so the
+	// worker knows its list must be enforced. Flagging a plain agent would make
+	// the worker refuse to run whenever the ACP child did not load the mod.
+	const plainDir = mkdtempSync(join(tmpdir(), 'subagent-plain-'));
+	const plainRuntime = makeRuntime({now: () => fixedNow});
+	const plainApi = makeApi({spoolDir: plainDir, session: makeSession(), runtime: plainRuntime.runtime});
+	mod(plainApi.api, plainRuntime.runtime);
+	await toolOf(plainApi, 'subagent_spawn').run({input: {description: 'plain', prompt: 'work'}});
+	const plainSpec = JSON.parse(plainRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.ok(Array.isArray(plainSpec.tools), 'a plain agent still has a resolved tool list');
+	assert.notEqual(
+		plainSpec.restrictedTools,
+		true,
+		'a plain agent is not restricted, so the worker does not demand the hook',
+	);
+	ok('a plain agent is not restricted');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

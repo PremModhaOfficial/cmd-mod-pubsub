@@ -47,6 +47,14 @@ export interface JobRecord extends JobIdentity {
 	background?: boolean;
 	model?: string;
 	tools?: string[];
+	/** The deny list this run resolved, not the definition's. A spawn may override
+	 *  the definition's `disallowedTools`, and a resume must restore what the run
+	 *  actually had, or the follow-up loses a tool the first run was allowed. */
+	disallowedTools?: string[];
+	/** A tool restriction was applied to this run, so the worker hook must enforce
+	 *  it. A plain agent has a resolved tool list too, so the list alone does not
+	 *  say "restricted"; a follow-up needs this flag to know. */
+	restrictedTools?: boolean;
 	/** The MCP servers scoped to this agent; a resume keeps the same scope. The shape
 	 *  is the one the definition layer parses, restated so the record names no registry. */
 	mcpServers?: {name: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string}[];
