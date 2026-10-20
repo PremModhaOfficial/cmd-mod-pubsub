@@ -459,11 +459,18 @@ const isFork = spec.kind === 'fork';
 let forkStdout = '';
 let forkSessionId = typeof spec.forkSessionId === 'string' ? spec.forkSessionId : undefined;
 
+// A command runs in its OWN process group. The timeout has to be able to stop
+// everything the command started, not just the shell: a command that
+// backgrounds itself - "(sleep 30; ...) &" - left that grandchild running
+// after the job reported a timeout, so the work carried on past the bound the
+// caller set. The group is led by the shell, and the group is what gets
+// signalled.
+const isCommand = spec.kind !== 'fork' && spec.kind !== 'agent';
 const child = isFork
   ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', 'pipe', 'pipe']})
   : spec.kind === 'agent'
     ? spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['pipe', 'pipe', 'pipe']})
-    : spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', out, out]});
+    : spawn(spec.bin, spec.args || [], {cwd: spec.cwd, stdio: ['ignore', out, out], detached: true});
 
 if (isFork && child.stdout && child.stderr) {
   child.stdout.on('data', chunk => { forkStdout += chunk.toString(); });
@@ -474,13 +481,26 @@ let timedOut = false;
 let killTimer;
 let hardTimer;
 
+// A command's whole process group is signalled, not just the shell. The
+// negative pid addresses the group, so a grandchild the command started dies
+// with it. A command that is not detached has no group of its own, and the
+// pid alone is the right target there.
+const signalChild = (signal) => {
+  try {
+    if (isCommand && typeof child.pid === 'number') process.kill(-child.pid, signal);
+    else child.kill(signal);
+  } catch (e) {
+    try { child.kill(signal); } catch (e2) {}
+  }
+};
+
 // A timeout is still one result: SIGTERM, SIGKILL a second later, and a failed
 // signal that says why. Nothing is left running and nothing is left silent.
 if (typeof spec.timeoutMs === 'number' && spec.timeoutMs > 0) {
   killTimer = setTimeout(() => {
     timedOut = true;
-    try { child.kill('SIGTERM'); } catch (e) {}
-    hardTimer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (e) {} }, 1000);
+    signalChild('SIGTERM');
+    hardTimer = setTimeout(() => { signalChild('SIGKILL'); }, 1000);
     if (hardTimer.unref) hardTimer.unref();
   }, spec.timeoutMs);
   if (killTimer.unref) killTimer.unref();
@@ -495,9 +515,9 @@ const clearTimers = () => {
 // close its stdin, then make sure it cannot outlive the worker.
 const shutdown = () => {
   try { child.stdin.end(); } catch (e) {}
-  try { child.kill('SIGTERM'); } catch (e) {}
+  signalChild('SIGTERM');
   setTimeout(() => {
-    try { child.kill('SIGKILL'); } catch (e) {}
+    signalChild('SIGKILL');
     process.exit(0);
   }, 1000);
 };

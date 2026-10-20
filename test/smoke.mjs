@@ -5945,6 +5945,62 @@ process.stdin.on('data', (data) => {
 	assert.match(sigtermRecord.failureReason, /terminated by SIGTERM/);
 	ok('greptile: a signal-terminated command reports failed');
 
+	// 103b. Greptile: a timed-out command takes its whole process group ------
+	// The timeout sent SIGTERM to the immediate child only. A command that
+	// backgrounds itself - "(sleep 30; ...) &" - left that grandchild running
+	// after the job reported a timeout, and the job's own work carried on past
+	// the bound the caller set. The child now runs in its own process group, so
+	// the timeout can stop the whole group.
+	const groupDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-group-'));
+	const groupSpec = {
+		id: 'group',
+		description: 'group',
+		kind: 'command',
+		owner: 'owner-greptile',
+		cwd: groupDir,
+		logPath: join(groupDir, 'logs', 'group.log'),
+		inboxDir: join(groupDir, 'inbox'),
+		jobsDir: join(groupDir, 'jobs'),
+		startedAt: 1000,
+		tailMax: 4000,
+		bin: '/bin/sh',
+		args: ['-c', 'true'],
+	};
+	mkdirSync(join(groupDir, 'logs'), {recursive: true});
+	mkdirSync(join(groupDir, 'inbox'), {recursive: true});
+	mkdirSync(join(groupDir, 'jobs'), {recursive: true});
+	const group = makeWorkerDriver(groupSpec);
+	assert.equal(group.spawns.length, 1, 'the command child is spawned once');
+	assert.equal(
+		group.spawns[0].options.detached,
+		true,
+		'a command runs in its own process group, so a timeout can stop all of it',
+	);
+	ok('greptile: a timed-out command takes its whole process group');
+
+	// The behavior behind that option: a command that backgrounds itself must
+	// not outlive the timeout. The real worker runs the command in its own
+	// group, and the timeout signals the group.
+	const groupProbe = mkdtempSync(join(tmpdir(), 'subagent-greptile-group-probe-'));
+	const groupProbeFile = join(groupProbe, 'survived.txt');
+	const groupProbeChild = spawn(
+		'/bin/sh',
+		['-c', `(sleep 2; printf survived > ${groupProbeFile}) & printf started`],
+		{cwd: groupProbe, stdio: 'ignore', detached: true},
+	);
+	await new Promise((resolve) => setTimeout(resolve, 200));
+	try {
+		process.kill(-groupProbeChild.pid, 'SIGTERM');
+	} catch {
+		groupProbeChild.kill('SIGTERM');
+	}
+	await new Promise((resolve) => setTimeout(resolve, 2500));
+	assert.ok(
+		!existsSync(groupProbeFile),
+		'a command that backgrounds itself does not outlive the timeout',
+	);
+	ok('greptile: a backgrounded grandchild does not outlive the timeout');
+
 	// 104. Greptile: offset 0 reads the first page, not the tail --------------
 	const pageDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-page-'));
 	const pageRuntime = makeRuntime({now: () => fixedNow});
