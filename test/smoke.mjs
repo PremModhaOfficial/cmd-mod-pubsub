@@ -404,6 +404,61 @@ try {
 	);
 	ok('a held signal is never visible half-written');
 
+	// 11d. A foreign backlog does not cost unbounded work per tick ----------
+	// The drain examined EVERY inbox file, and the caps counted only the
+	// signals this session owns. A foreign signal was claimed, read and put
+	// back without counting, so an offline session's backlog made every drain
+	// tick and every status tick do work proportional to the whole backlog.
+	const backlogDir = mkdtempSync(join(tmpdir(), 'pubsub-backlog-'));
+	const backlogSessionA = makeSession();
+	const backlogSessionB = makeSession();
+	const backlogOwner = ownerEntries(backlogSessionA)[0];
+	const backlogA = makeApi({spoolDir: backlogDir, session: backlogSessionA, runtime: makeRuntime().runtime});
+	const backlogB = makeApi({spoolDir: backlogDir, session: backlogSessionB, runtime: makeRuntime().runtime});
+	mod(backlogA.api, backlogA.runtime);
+	mod(backlogB.api, backlogB.runtime);
+	// Another session drains and counts over that backlog. Each pass must touch
+	// a bounded number of files, not the whole backlog.
+	const backlogOps = [];
+	const backlogFiles = new Set();
+	const backlogInbox = join(backlogDir, 'inbox');
+	const backlogFs = {
+		...realFs,
+		rename(from, to) {
+			// A file that is claimed and then put back is renamed twice. The count
+			// that matters is how many files the pass CLAIMED - that is the work.
+			if (from.startsWith(backlogInbox)) backlogFiles.add(from);
+			backlogOps.push(from);
+			return renameSync(from, to);
+		},
+	};
+	const backlogC = makeApi({
+		spoolDir: backlogDir,
+		session: makeSession(),
+		runtime: makeRuntime({fs: backlogFs}).runtime,
+	});
+	mod(backlogC.api, backlogC.runtime);
+	// The backlog is written AFTER the sessions start, so it is still there
+	// when the pass runs. A hundred signals for a session that is not here.
+	for (let index = 0; index < 100; index += 1) {
+		writeFileSync(
+			join(backlogDir, 'inbox', `${Date.now()}-${index}-foreign.json`),
+			JSON.stringify({id: `foreign-${index}`, owner: backlogOwner, description: 'foreign', kind: 'command', state: 'done', title: 'foreign', body: 'ok'}),
+		);
+	}
+	backlogOps.length = 0;
+	backlogFiles.clear();
+	backlogC.registeredHooks.onStop();
+	assert.ok(
+		backlogFiles.size <= 60,
+		`one pass must not look at the whole foreign backlog: ${backlogFiles.size} files`,
+	);
+	assert.ok(
+		backlogOps.length <= 120,
+		`one pass must not do unbounded work on the foreign backlog: ${backlogOps.length} file operations`,
+	);
+	ok('a foreign backlog does not cost unbounded work per pass');
+
 	// The pending count reads the same spool, so it cannot disagree with delivery.
 	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'subagents');
 	const raceCommandB = raceB.commandDefs.find((def) => def.name === 'subagents');

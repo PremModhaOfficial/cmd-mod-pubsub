@@ -93,6 +93,10 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	let draining = false;
 	// The jobs signature seen last, so a refresh only ticks the host when it changes.
 	let lastJobsSignature = '';
+	// Where the next pass starts in the inbox. A pass examines a bounded number of
+	// files, and this cursor is what makes the NEXT pass carry on from there
+	// instead of looking at the same head of the backlog every time.
+	let inboxCursor = 0;
 
 	function markDelivered(id: string): void {
 		const job = deps.readJob(id);
@@ -170,12 +174,51 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		}
 	}
 
+	// Where this pass starts in the inbox. The cursor carries over between
+	// passes, so a long backlog is worked through instead of the same head
+	// being examined every tick. It wraps around, and it resets when the
+	// inbox has changed shape, so a new signal at the front is not starved
+	// behind a long backlog.
+	function startCursor(names: string[]): number {
+		if (names.length === 0) {
+			inboxCursor = 0;
+			return 0;
+		}
+		// The inbox changed: the old position means nothing.
+		if (inboxCursor >= names.length) inboxCursor = 0;
+		return inboxCursor;
+	}
+
 	// Claim the next signal this session may deliver. Everything else - torn, already
 	// delivered, untagged, foreign, or not classifiable yet - is settled right here,
 	// so the caller only ever sees its own work. `seen` bounds one pass.
-	function next(seen: Set<string>): Claim | undefined {
-		for (const name of inboxNames()) {
+	//
+	// `budget` bounds the FILES this call may look at, not the signals it returns.
+	// A foreign signal costs a claim, a read and a restore, and it is not
+	// returned, so a cap on returned signals left the work unbounded: an
+	// offline session's backlog made every drain tick and every status tick
+	// touch the whole backlog. The budget is spent whatever the file turns out
+	// to be.
+	//
+	// `names` is the inbox as it was at the start of the pass. Re-reading the
+	// directory on every call made a pass cost one read per signal, so the
+	// pass was quadratic in the backlog.
+	//
+	// `cursor` says where the pass started, so a bounded pass still ADVANCES
+	// through a long backlog. Without it, every pass looked at the same first
+	// files and the ones behind them were never reached.
+	function next(
+		seen: Set<string>,
+		budget: {left: number},
+		names: string[],
+		cursor: {at: number},
+	): Claim | undefined {
+		while (cursor.at < names.length) {
+			const name = names[cursor.at];
+			cursor.at += 1;
 			if (seen.has(name)) continue;
+			if (budget.left <= 0) return undefined;
+			budget.left -= 1;
 			seen.add(name);
 			const live = join(deps.inboxDir, name);
 			const claimed = join(deps.claimedDir, name);
@@ -294,10 +337,15 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		if (draining) return;
 		draining = true;
 		const seen = new Set<string>();
+		// One budget and one directory read for the whole pass: the files this
+		// pass may look at, and the inbox as it is now.
+		const budget = {left: FILES_PER_DRAIN_MAX};
+		const names = inboxNames();
+		const cursor = {at: startCursor(names)};
 		try {
 			answerLivePermissions();
 			for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-				const claim = next(seen);
+				const claim = next(seen, budget, names, cursor);
 				if (claim === undefined) return;
 				// No bound session is a state, not an exception: sending here would
 				// degrade to a silent queue push in a headless run. Hold it instead.
@@ -315,6 +363,9 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 				settle(claim, 'accepted');
 			}
 		} finally {
+			// The next pass carries on from here, so a long backlog is worked
+			// through instead of the same head being examined every tick.
+			inboxCursor = cursor.at % Math.max(1, names.length);
 			draining = false;
 		}
 	}
@@ -333,12 +384,19 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// claim stays in claimed/ and is swept later.
 	function claimPending(limit: number): Claim[] {
 		const seen = new Set<string>();
+		// The budget is the larger of the two bounds: a pass may look at more
+		// files than it claims, because a foreign file is looked at and put back
+		// without being claimed.
+		const budget = {left: Math.max(limit, FILES_PER_DRAIN_MAX)};
+		const names = inboxNames();
+		const cursor = {at: startCursor(names)};
 		const claims: Claim[] = [];
 		while (claims.length < limit) {
-			const claim = next(seen);
+			const claim = next(seen, budget, names, cursor);
 			if (claim === undefined) break;
 			claims.push(claim);
 		}
+		inboxCursor = cursor.at % Math.max(1, names.length);
 		return claims;
 	}
 
@@ -346,13 +404,21 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// next()/settle() pair the drain uses, so the count cannot drift from delivery.
 	function countPending(): number {
 		const seen = new Set<string>();
+		// The count is a number for the status line, not a promise to look at the
+		// whole inbox. It runs on every status refresh, so it gets the same
+		// per-pass bound the drain does: a foreign backlog must not make the
+		// status line cost more than the drain does.
+		const budget = {left: FILES_PER_DRAIN_MAX};
+		const names = inboxNames();
+		const cursor = {at: startCursor(names)};
 		let count = 0;
 		while (count < PENDING_SCAN_MAX) {
-			const claim = next(seen);
+			const claim = next(seen, budget, names, cursor);
 			if (claim === undefined) break;
 			count += 1;
 			settle(claim, 'held');
 		}
+		inboxCursor = cursor.at % Math.max(1, names.length);
 		return count;
 	}
 

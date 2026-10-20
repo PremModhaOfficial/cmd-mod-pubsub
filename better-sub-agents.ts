@@ -1271,6 +1271,7 @@ function createDelivery(deps) {
   const answeredPermissions = deps.askedPermissions;
   let draining = false;
   let lastJobsSignature = "";
+  let inboxCursor = 0;
   function markDelivered(id) {
     const job = deps.readJob(id);
     if (job === void 0) return;
@@ -1329,9 +1330,22 @@ ${next2}`;
     }
   }
   __name(inboxNames, "inboxNames");
-  function next(seen) {
-    for (const name of inboxNames()) {
+  function startCursor(names) {
+    if (names.length === 0) {
+      inboxCursor = 0;
+      return 0;
+    }
+    if (inboxCursor >= names.length) inboxCursor = 0;
+    return inboxCursor;
+  }
+  __name(startCursor, "startCursor");
+  function next(seen, budget, names, cursor) {
+    while (cursor.at < names.length) {
+      const name = names[cursor.at];
+      cursor.at += 1;
       if (seen.has(name)) continue;
+      if (budget.left <= 0) return void 0;
+      budget.left -= 1;
       seen.add(name);
       const live = join5(deps.inboxDir, name);
       const claimed = join5(deps.claimedDir, name);
@@ -1424,10 +1438,13 @@ ${next2}`;
     if (draining) return;
     draining = true;
     const seen = /* @__PURE__ */ new Set();
+    const budget = { left: FILES_PER_DRAIN_MAX };
+    const names = inboxNames();
+    const cursor = { at: startCursor(names) };
     try {
       answerLivePermissions();
       for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-        const claim = next(seen);
+        const claim = next(seen, budget, names, cursor);
         if (claim === void 0) return;
         if (!deps.hasSession()) {
           settle(claim, "held");
@@ -1443,6 +1460,7 @@ ${next2}`;
         settle(claim, "accepted");
       }
     } finally {
+      inboxCursor = cursor.at % Math.max(1, names.length);
       draining = false;
     }
   }
@@ -1455,24 +1473,32 @@ ${next2}`;
   }, "safeDrain");
   function claimPending(limit) {
     const seen = /* @__PURE__ */ new Set();
+    const budget = { left: Math.max(limit, FILES_PER_DRAIN_MAX) };
+    const names = inboxNames();
+    const cursor = { at: startCursor(names) };
     const claims = [];
     while (claims.length < limit) {
-      const claim = next(seen);
+      const claim = next(seen, budget, names, cursor);
       if (claim === void 0) break;
       claims.push(claim);
     }
+    inboxCursor = cursor.at % Math.max(1, names.length);
     return claims;
   }
   __name(claimPending, "claimPending");
   function countPending() {
     const seen = /* @__PURE__ */ new Set();
+    const budget = { left: FILES_PER_DRAIN_MAX };
+    const names = inboxNames();
+    const cursor = { at: startCursor(names) };
     let count = 0;
     while (count < PENDING_SCAN_MAX) {
-      const claim = next(seen);
+      const claim = next(seen, budget, names, cursor);
       if (claim === void 0) break;
       count += 1;
       settle(claim, "held");
     }
+    inboxCursor = cursor.at % Math.max(1, names.length);
     return count;
   }
   __name(countPending, "countPending");
@@ -2490,7 +2516,7 @@ function planFromRecord(record, instruction, mode, ctx) {
     definitionBackground: resumeDefinition?.background,
     env: ctx.env
   }) === "background";
-  const resumedMcp = mode === "message" ? [] : resumeDefinition === void 0 ? record.mcpServers ?? [] : ctx.resolveAgentMcpServers({
+  const resumedMcp = resumeDefinition === void 0 ? record.mcpServers ?? [] : ctx.resolveAgentMcpServers({
     defined: resumeDefinition.mcpServers ?? [],
     configured: ctx.mcpServerConfigs(ctx.fs, [ctx.home, ctx.runtimeCwd]),
     definition: resumeDefinition,
@@ -2535,6 +2561,8 @@ function planFromRecord(record, instruction, mode, ctx) {
       // saved tool list includes it. Restoring the definition's list here
       // would block Bash on the resume and the work could not continue.
       ...record.disallowedTools !== void 0 ? { disallowedTools: record.disallowedTools } : resumeDefinition?.disallowedTools !== void 0 ? { disallowedTools: resumeDefinition.disallowedTools } : {},
+      // A message continues the same ACP session, so its scope is the one the
+      // session was created with. A resume re-reads the definition.
       ...mode === "message" ? record.mcpServers !== void 0 ? { mcpServers: record.mcpServers } : {} : resumedMcp.length > 0 ? { mcpServers: resumedMcp } : {},
       ...resumeCompact !== void 0 ? { autoCompactWindow: resumeCompact } : {},
       ...resumeCacheTtl !== void 0 ? { cacheTtl: resumeCacheTtl } : {},

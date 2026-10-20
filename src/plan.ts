@@ -492,23 +492,25 @@ export function planFromRecord(
 						definitionBackground: resumeDefinition?.background,
 						env: ctx.env,
 					}) === 'background';
+	// The MCP scope of a follow-up. A MESSAGE continues the same ACP session, so
+	// its scope is the one the session was created with: the recorded list. A
+	// RESUME re-reads the definition, so a policy or trust change between the
+	// two runs is honored.
 	const resumedMcp =
-		mode === 'message'
-			? []
-			: resumeDefinition === undefined
-				? (record.mcpServers ?? [])
-				: ctx.resolveAgentMcpServers({
-						defined: resumeDefinition.mcpServers ?? [],
-						configured: ctx.mcpServerConfigs(ctx.fs, [ctx.home, ctx.runtimeCwd]),
-						definition: resumeDefinition,
-						env: ctx.env,
-						trusted: ctx.agentFolderTrusted(resumeDefinition, {
-							cwd: ctx.runtimeCwd,
-							home: ctx.home,
-							managedDir: ctx.managedDir,
-							addDirs: ctx.addDirs,
-						}),
-					}).servers;
+		resumeDefinition === undefined
+			? (record.mcpServers ?? [])
+			: ctx.resolveAgentMcpServers({
+					defined: resumeDefinition.mcpServers ?? [],
+					configured: ctx.mcpServerConfigs(ctx.fs, [ctx.home, ctx.runtimeCwd]),
+					definition: resumeDefinition,
+					env: ctx.env,
+					trusted: ctx.agentFolderTrusted(resumeDefinition, {
+						cwd: ctx.runtimeCwd,
+						home: ctx.home,
+						managedDir: ctx.managedDir,
+						addDirs: ctx.addDirs,
+					}),
+				}).servers;
 	const resumeCompact =
 		mode === 'message'
 			? record.autoCompactWindow
@@ -553,6 +555,8 @@ export function planFromRecord(
 				: resumeDefinition?.disallowedTools !== undefined
 					? {disallowedTools: resumeDefinition.disallowedTools}
 					: {}),
+			// A message continues the same ACP session, so its scope is the one the
+			// session was created with. A resume re-reads the definition.
 			...(mode === 'message'
 				? record.mcpServers !== undefined
 					? {mcpServers: record.mcpServers}
