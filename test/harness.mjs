@@ -9,7 +9,6 @@
 // dead pid, a failed rename or a frozen clock is a function call - not a process, a
 // crash or a wait.
 
-import assert from 'node:assert/strict';
 import * as modExports from '../better-sub-agents.ts';
 import {
 	appendFileSync,
@@ -285,17 +284,14 @@ export function ownerEntries(session, customType = 'subagent/owner') {
 }
 
 // The detached worker is a string in the mod. Exporting the built string means a
-// syntax error surfaces here, and the envelope injection is already resolved. The
-// literal-extraction fallback keeps the suite runnable against the pre-T1 source
-// (used to demonstrate the new checks failing before the change).
+// syntax error surfaces here, and the envelope injection is already resolved.
 export function workerSource() {
-	if (typeof modExports.WORKER_SOURCE === 'string') return modExports.WORKER_SOURCE;
-	const source = readFileSync(new URL('../better-sub-agents.ts', import.meta.url), 'utf8');
-	const start = source.indexOf('const WORKER_SOURCE = `');
-	const end = source.indexOf('\n`;', start);
-	assert.ok(start > 0 && end > start, 'WORKER_SOURCE must be findable in better-sub-agents.ts');
-	const literal = source.slice(start + 'const WORKER_SOURCE = '.length, end + 2);
-	return Function(`"use strict"; return ${literal};`)();
+	if (typeof modExports.WORKER_SOURCE !== 'string') {
+		throw new Error(
+			`better-sub-agents.ts must export WORKER_SOURCE as a string, got ${typeof modExports.WORKER_SOURCE}`,
+		);
+	}
+	return modExports.WORKER_SOURCE;
 }
 
 export function modSource() {

@@ -27,13 +27,17 @@
 	],
 	"scripts": {
 		"build": "node scripts/build.mjs",
-		"check": "npm run build && git diff --exit-code -- better-sub-agents.ts",
-		"gate": "npm run check && node test/bundle.mjs && npm test",
+		"check": "npm run build && node scripts/check-stale.mjs",
+		"check:imports": "node scripts/check-imports.mjs",
+		"gate": "npm run check && npm run typecheck && npm run check:imports && node test/bundle.mjs && npm test",
 		"test": "node test/smoke.mjs",
-		"test:e2e": "node test/e2e.mjs"
+		"test:e2e": "node test/e2e.mjs",
+		"typecheck": "tsc --noEmit"
 	},
 	"devDependencies": {
-		"esbuild": "^0.25.12"
+		"@types/node": "^22.10.0",
+		"esbuild": "^0.25.12",
+		"typescript": "^5.7.0"
 	},
 	"engines": {
 		"node": ">=22.18"

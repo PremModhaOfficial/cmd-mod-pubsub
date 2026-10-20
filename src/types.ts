@@ -140,6 +140,7 @@ export interface JobPatch {
 	finishedAt?: number;
 	durationMs?: number;
 	failureReason?: string;
+	canceledAt?: number;
 	awaitingInput?: boolean;
 	question?: string;
 	permissionRequest?: PermissionRequest;

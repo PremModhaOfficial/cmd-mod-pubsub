@@ -7,8 +7,8 @@
 // runtime or a session, so both are pure apart from the injected `fs`.
 // ---------------------------------------------------------------------------
 
-import {isAbsolute, join} from 'node:path';
 import type {SpoolFs} from './types.ts';
+import {isAbsolute, join} from 'node:path';
 
 export const AUTO_COMPACT_MIN = 100_000;
 export const AUTO_COMPACT_MAX = 1_000_000;

@@ -8,8 +8,8 @@
 // so the store names no ambient spool and no clock.
 // ---------------------------------------------------------------------------
 
-import {join} from 'node:path';
 import type {CompactBoundary, JobIdentity, PermissionRequest, SpoolFs} from './types.ts';
+import {join} from 'node:path';
 
 // The durable record behind a job: the shared identity plus its bookkeeping.
 export interface JobRecord extends JobIdentity {

@@ -24,7 +24,8 @@ jobs:
         run: npm ci
 
       # Build the bundle from `src/`, fail if the committed root artifact is
-      # stale, then run the bundle contract test and the smoke suite.
+      # stale, typecheck, enforce the module import rules, then run the bundle
+      # contract test and the smoke suite.
       - name: Run gate
         run: npm run gate
 

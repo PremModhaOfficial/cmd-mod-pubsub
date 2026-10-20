@@ -8,8 +8,8 @@
 // onStop claim, and a restart reconcile can each ask without removing twice.
 // ---------------------------------------------------------------------------
 
-import {dirname, resolve, sep} from 'node:path';
 import type {Runtime} from './types.ts';
+import {dirname, resolve, sep} from 'node:path';
 
 export interface GitResult {
 	readonly code: number;
