@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join as join5, resolve as resolve2 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join7, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -1015,6 +1015,633 @@ function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
   return { block: true, reason: `Blocked: ${escape}. This subagent is isolated in ${roots.worktree}.` };
 }
 __name(guardToolCall, "guardToolCall");
+
+// src/plan.ts
+import { join as join5 } from "node:path";
+function planFromInput(input, ctx) {
+  const label = String(input.description ?? input.label ?? "").trim();
+  if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
+  const command = typeof input.command === "string" && input.command.trim().length > 0 ? input.command : void 0;
+  const prompt = typeof input.prompt === "string" && input.prompt.trim().length > 0 ? input.prompt : void 0;
+  if (command === void 0 && prompt === void 0) {
+    return { ok: false, error: "pass either prompt (a headless agent) or command (a shell command)" };
+  }
+  if (command !== void 0 && prompt !== void 0) return { ok: false, error: "pass prompt or command, not both" };
+  if (input.isolation !== void 0) {
+    return {
+      ok: false,
+      error: "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it"
+    };
+  }
+  const requestedMode = typeof input.permission_mode === "string" && input.permission_mode.trim().length > 0 ? input.permission_mode.trim() : void 0;
+  if (requestedMode !== void 0 && ctx.canonicalPermissionMode(requestedMode) === void 0) {
+    return { ok: false, error: `unknown permission_mode "${requestedMode}"` };
+  }
+  if (requestedMode !== void 0 && prompt === void 0) {
+    return { ok: false, error: "permission_mode applies to agent jobs; a shell command has no permission mode" };
+  }
+  const model = typeof input.model === "string" && input.model.trim().length > 0 ? input.model.trim() : void 0;
+  const name = typeof input.name === "string" && input.name.trim().length > 0 ? input.name.trim() : void 0;
+  const teamName = typeof input.team_name === "string" && input.team_name.trim().length > 0 ? input.team_name.trim() : void 0;
+  const requestedMaxTurns = Number(input.max_turns);
+  const timeoutMs = Number(input.timeout_ms);
+  const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim().length > 0 ? input.subagent_type.trim() : void 0;
+  const aliasType = typeof input.agent_type === "string" && input.agent_type.trim().length > 0 ? input.agent_type.trim() : void 0;
+  if (subagentType !== void 0 && aliasType !== void 0 && subagentType !== aliasType) {
+    return { ok: false, error: "pass subagent_type or its deprecated alias agent_type, not both" };
+  }
+  let definition;
+  if (prompt !== void 0) {
+    const resolved = ctx.resolveAgentDefinition(subagentType ?? aliasType);
+    if (resolved.ok === false) return { ok: false, error: resolved.error };
+    definition = resolved.definition;
+  }
+  const forkRequested = definition?.fork === true;
+  const teammate = prompt !== void 0 && teamName !== void 0;
+  const requestedBackground = typeof input.run_in_background === "boolean" ? input.run_in_background : void 0;
+  const teamPolicy = ctx.resolveTeamPolicy({
+    teammate,
+    definitionBackground: definition?.background,
+    ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
+    forkMode: ctx.forkMode
+  });
+  if (teamPolicy.ok === false) return { ok: false, error: teamPolicy.error };
+  const requestedTools = prompt === void 0 || forkRequested ? void 0 : ctx.listField(input.tools) ?? definition?.tools;
+  const requestedDisallowed = prompt === void 0 || forkRequested ? void 0 : ctx.listField(input.disallowed_tools) ?? definition?.disallowedTools;
+  let permissionMode;
+  if (prompt !== void 0) {
+    if (forkRequested) {
+      permissionMode = ctx.mainPermissionMode() ?? "default";
+    } else {
+      const modeResolution = ctx.resolvePermissionMode(requestedMode ?? definition?.permissionMode, ctx.mainPermissionMode());
+      if (modeResolution.ok === false) return { ok: false, error: modeResolution.error };
+      permissionMode = modeResolution.mode;
+    }
+  }
+  const background = teammate ? false : ctx.forkModeEnabled ? true : ctx.resolveExecutionPolicy({
+    ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
+    definitionBackground: definition?.background,
+    env: ctx.env
+  }) === "background";
+  const configuredMcp = ctx.mcpServerConfigs(ctx.fs, [ctx.home, ctx.runtimeCwd]);
+  const mcp = ctx.resolveAgentMcpServers({
+    defined: definition?.mcpServers ?? [],
+    configured: configuredMcp,
+    definition,
+    env: ctx.env,
+    trusted: definition === void 0 || ctx.agentFolderTrusted(definition, {
+      cwd: ctx.runtimeCwd,
+      home: ctx.home,
+      managedDir: ctx.managedDir,
+      addDirs: ctx.addDirs
+    })
+  });
+  const mcpNames = Object.keys(configuredMcp);
+  for (const server of mcp.servers) if (!mcpNames.includes(server.name)) mcpNames.push(server.name);
+  const launch = forkRequested ? { ok: true, model: void 0, modelSource: "inherit", effort: void 0, effortSource: "none", tools: [], removed: [] } : ctx.resolveLaunch({
+    ...model !== void 0 ? { requestedModel: model } : {},
+    ...definition?.model !== void 0 ? { definitionModel: definition.model } : {},
+    ...typeof input.effort === "string" ? { requestedEffort: input.effort } : {},
+    ...definition?.effort !== void 0 ? { definitionEffort: definition.effort } : {},
+    env: ctx.env,
+    // The mod API exposes no main-model getter: an absent model means the ACP
+    // child inherits the user's configured model, which is the main one.
+    ...requestedTools !== void 0 ? { tools: requestedTools } : {},
+    ...requestedDisallowed !== void 0 ? { disallowedTools: requestedDisallowed } : {},
+    ...permissionMode !== void 0 ? { permissionMode } : {},
+    background,
+    ...teammate ? { team: true } : {},
+    mcpServers: mcpNames
+  });
+  if (launch.ok === false) return { ok: false, error: launch.error };
+  const sessionId = ctx.sessionId();
+  if (forkRequested && (sessionId === void 0 || sessionId.length === 0)) {
+    return { ok: false, error: "a fork needs the main session id; the session has not bound yet" };
+  }
+  const launchTools = prompt === void 0 || forkRequested ? void 0 : ctx.withMemoryTools(launch.tools, definition?.memory);
+  const maxTurns = prompt === void 0 || forkRequested ? void 0 : Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0 ? Math.round(requestedMaxTurns) : definition?.maxTurns;
+  const runCwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : ctx.cwd;
+  const compactWindow = ctx.resolveAutoCompactWindow(
+    ctx.contextWindowForModel(launch.model, ctx.env),
+    definition?.autoCompactWindow,
+    false
+  );
+  return {
+    ok: true,
+    plan: {
+      description: label,
+      kind: forkRequested ? "fork" : prompt !== void 0 ? "agent" : "command",
+      command,
+      prompt,
+      background,
+      cwd: runCwd,
+      ...name !== void 0 ? { name } : {},
+      ...teamName !== void 0 ? { teamName } : {},
+      agentType: definition?.name,
+      oneShot: definition?.oneShot,
+      ...forkRequested ? { fork: true, ...sessionId !== void 0 ? { mainSessionId: sessionId } : {} } : {},
+      systemPrompt: forkRequested ? void 0 : ctx.systemPromptFor(definition?.prompt),
+      appendSystemPrompt: ctx.appendPromptText,
+      restrictedTools: definition?.tools !== void 0 || definition?.disallowedTools !== void 0 || requestedDisallowed !== void 0,
+      hooks: forkRequested ? void 0 : definition?.hooks,
+      startup: forkRequested ? void 0 : ctx.startupFor(definition, runCwd, prompt, launch.model),
+      model: prompt === void 0 || forkRequested ? void 0 : launch.model,
+      tools: launchTools,
+      ...requestedDisallowed !== void 0 ? { disallowedTools: requestedDisallowed } : {},
+      ...definition?.color !== void 0 ? { color: definition.color } : {},
+      ...prompt !== void 0 && !forkRequested ? { mcpServers: mcp.servers } : {},
+      ...prompt !== void 0 && !forkRequested && compactWindow !== void 0 ? { autoCompactWindow: compactWindow } : {},
+      ...prompt !== void 0 && !forkRequested && definition?.cacheTtl !== void 0 ? { cacheTtl: definition.cacheTtl } : {},
+      maxTurns,
+      effort: prompt === void 0 || forkRequested ? void 0 : launch.effort,
+      permissionMode,
+      isolation: forkRequested ? void 0 : definition?.isolation,
+      timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : void 0
+    }
+  };
+}
+__name(planFromInput, "planFromInput");
+function planFromRecord(record, instruction, mode, ctx) {
+  const label = String(record.name ?? record.id);
+  const jobId = record.id;
+  const suffix = mode === "resume" ? "resume" : "message";
+  const resumeCwd = String(record.cwd ?? ctx.cwd);
+  if (record.fork === true) {
+    if (record.forkSessionId === void 0) {
+      return {
+        ok: false,
+        error: mode === "resume" ? `subagent: job ${jobId} is a fork with no recorded session; spawn it again` : `${label} has finished and its fork session was never recorded; spawn it again`
+      };
+    }
+    return {
+      ok: true,
+      plan: {
+        description: `${String(record.description ?? jobId)} (${suffix})`,
+        kind: "fork",
+        prompt: instruction,
+        background: record.teamName !== void 0 ? false : true,
+        cwd: resumeCwd,
+        agentType: FORK_AGENT_TYPE,
+        fork: true,
+        ...record.mainSessionId !== void 0 ? { mainSessionId: record.mainSessionId } : {},
+        resumeSession: record.forkSessionId,
+        resumedFrom: jobId,
+        ...record.permissionMode !== void 0 ? { permissionMode: record.permissionMode } : {},
+        ...record.name !== void 0 ? { name: record.name } : {},
+        ...record.teamName !== void 0 ? { teamName: record.teamName } : {},
+        ...record.owner !== void 0 ? { owner: record.owner } : {}
+      }
+    };
+  }
+  if (record.acpSessionId === void 0 && mode === "message") {
+    return { ok: false, error: `${label} has finished and has no resumable session; spawn it again` };
+  }
+  const definition = record.agentType === void 0 ? void 0 : ctx.resolveAgentDefinition(record.agentType);
+  const resumeDefinition = definition?.ok === true ? definition.definition : void 0;
+  const background = mode === "message" ? record.teamName !== void 0 ? false : true : record.teamName !== void 0 ? false : ctx.resolveExecutionPolicy({
+    definitionBackground: resumeDefinition?.background,
+    env: ctx.env
+  }) === "background";
+  const resumedMcp = mode === "message" ? [] : resumeDefinition === void 0 ? record.mcpServers ?? [] : ctx.resolveAgentMcpServers({
+    defined: resumeDefinition.mcpServers ?? [],
+    configured: ctx.mcpServerConfigs(ctx.fs, [ctx.home, ctx.runtimeCwd]),
+    definition: resumeDefinition,
+    env: ctx.env,
+    trusted: ctx.agentFolderTrusted(resumeDefinition, {
+      cwd: ctx.runtimeCwd,
+      home: ctx.home,
+      managedDir: ctx.managedDir,
+      addDirs: ctx.addDirs
+    })
+  }).servers;
+  const resumeCompact = mode === "message" ? record.autoCompactWindow : record.autoCompactWindow ?? ctx.resolveAutoCompactWindow(
+    ctx.contextWindowForModel(record.model, ctx.env),
+    resumeDefinition?.autoCompactWindow,
+    false
+  );
+  const resumeCacheTtl = mode === "message" ? record.cacheTtl : record.cacheTtl ?? resumeDefinition?.cacheTtl;
+  return {
+    ok: true,
+    plan: {
+      description: `${String(record.description ?? jobId)} (${suffix})`,
+      kind: "agent",
+      prompt: instruction,
+      background,
+      cwd: resumeCwd,
+      agentType: record.agentType,
+      systemPrompt: mode === "message" ? resumeDefinition?.prompt : ctx.systemPromptFor(resumeDefinition?.prompt),
+      appendSystemPrompt: ctx.appendPromptText,
+      restrictedTools: resumeDefinition?.tools !== void 0 || resumeDefinition?.disallowedTools !== void 0,
+      hooks: resumeDefinition?.hooks,
+      startup: ctx.startupFor(resumeDefinition, resumeCwd, instruction, record.model),
+      model: record.model,
+      ...record.tools !== void 0 ? { tools: record.tools } : {},
+      ...mode === "message" ? record.mcpServers !== void 0 ? { mcpServers: record.mcpServers } : {} : resumedMcp.length > 0 ? { mcpServers: resumedMcp } : {},
+      ...resumeCompact !== void 0 ? { autoCompactWindow: resumeCompact } : {},
+      ...resumeCacheTtl !== void 0 ? { cacheTtl: resumeCacheTtl } : {},
+      ...record.color !== void 0 ? { color: record.color } : {},
+      maxTurns: record.maxTurns,
+      // The per-invocation model and effort are what make a resume the same run
+      // continued, not a fresh one with the definition's defaults.
+      effort: record.effort,
+      permissionMode: record.permissionMode,
+      timeoutMs: record.timeoutMs,
+      resumeSession: record.acpSessionId,
+      resumedFrom: jobId,
+      ...record.name !== void 0 ? { name: record.name } : {},
+      ...record.teamName !== void 0 ? { teamName: record.teamName } : {},
+      ...record.owner !== void 0 ? { owner: record.owner } : {}
+    }
+  };
+}
+__name(planFromRecord, "planFromRecord");
+function sessionNameOf(id) {
+  return `subagent-${id}`;
+}
+__name(sessionNameOf, "sessionNameOf");
+function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
+  const isAgent = intent.prompt !== void 0;
+  return {
+    id,
+    owner,
+    description: intent.description,
+    kind: intent.kind,
+    ...intent.name !== void 0 ? { name: intent.name } : {},
+    state: "queued",
+    // The resolved policy, not the raw `run_in_background`: env and definition
+    // overrides are already applied by the caller.
+    background: intent.background !== false,
+    ...isAgent && intent.live !== false && intent.oneShot !== true ? { live: true } : {},
+    cwd: intent.cwd,
+    logPath,
+    startedAt,
+    sessionId: ctx.sessionId(),
+    updatedAt: startedAt,
+    ...intent.depth !== void 0 ? { depth: intent.depth } : {},
+    ...intent.parentJobId !== void 0 ? { parentJobId: intent.parentJobId } : {},
+    ...isAgent ? {
+      // The durable resume handle. A one-shot agent has none, so nothing can
+      // invite a resume that the lifecycle forbids.
+      ...intent.oneShot === true ? {} : { agentId: id },
+      agentType: intent.agentType ?? "general-purpose",
+      sessionName: sessionNameOf(id),
+      transcriptPath: join5(ctx.transcriptsDir, `${id}.jsonl`),
+      ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
+    } : {},
+    ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
+    ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
+    ...intent.model !== void 0 ? { model: intent.model } : {},
+    ...intent.tools !== void 0 ? { tools: intent.tools } : {},
+    ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
+    ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
+    ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
+    ...intent.color !== void 0 ? { color: intent.color } : {},
+    ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
+    ...intent.effort !== void 0 ? { effort: intent.effort } : {},
+    ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
+    ...intent.isolation !== void 0 ? { isolation: intent.isolation } : {},
+    ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
+    ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command }
+  };
+}
+__name(recordFromPlan, "recordFromPlan");
+
+// src/spawn.ts
+import { join as join6 } from "node:path";
+function buildArgs(spec, modPath) {
+  if (spec.kind === "command") return ["-c", String(spec.command ?? "")];
+  if (spec.kind === "fork") {
+    const prompt = String(spec.prompt ?? "");
+    if (typeof spec.resumeSession === "string" && spec.resumeSession.length > 0) {
+      return ["--resume", spec.resumeSession, "-p", prompt, "--output-format", "json"];
+    }
+    const name = String(spec.sessionName ?? `subagent-${spec.id}`);
+    return [
+      "--fork-session",
+      "--resume",
+      String(spec.mainSessionId ?? ""),
+      "-n",
+      name,
+      "-p",
+      prompt,
+      "--output-format",
+      "json"
+    ];
+  }
+  const maxTurns = typeof spec.maxTurns === "number" && spec.maxTurns > 0 ? String(spec.maxTurns) : "";
+  return [...maxTurns.length > 0 ? ["--max-turns", maxTurns] : [], "--mod", modPath, "acp"];
+}
+__name(buildArgs, "buildArgs");
+function buildSpec(input, modPath) {
+  const spec = { ...input, args: [] };
+  spec.args = buildArgs(spec, modPath);
+  return spec;
+}
+__name(buildSpec, "buildSpec");
+function positiveInt(raw, fallback) {
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
+}
+__name(positiveInt, "positiveInt");
+function resolveMaxConcurrent(env) {
+  return positiveInt(env[MAX_CONCURRENT_ENV] || env[MAX_CONCURRENT_ENV_ALIAS], MAX_CONCURRENT_DEFAULT);
+}
+__name(resolveMaxConcurrent, "resolveMaxConcurrent");
+function resolveMaxDepth(env) {
+  return positiveInt(env[MAX_DEPTH_ENV] || env[MAX_DEPTH_ENV_ALIAS], MAX_DEPTH_DEFAULT);
+}
+__name(resolveMaxDepth, "resolveMaxDepth");
+function depthOf(spec) {
+  const depth = Number(spec?.depth);
+  return Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
+}
+__name(depthOf, "depthOf");
+function workerEnv(parent, spec) {
+  const env = { ...parent };
+  delete env[WORKER_SPEC_ENV];
+  delete env[WORKER_ENV];
+  delete env.PUBSUB_WORKER;
+  delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT;
+  delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT;
+  delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE;
+  delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE;
+  env[WORKER_SPEC_ENV] = JSON.stringify(spec);
+  env[WORKER_ENV] = "1";
+  if (typeof spec.appendSystemPrompt === "string" && spec.appendSystemPrompt.length > 0) {
+    env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT = spec.appendSystemPrompt;
+  }
+  return env;
+}
+__name(workerEnv, "workerEnv");
+function failJob(job, reason, ctx) {
+  const now = ctx.now();
+  const signal = signalOf(job, {
+    state: "failed",
+    finishedAt: now,
+    durationMs: Math.max(0, now - Number(job.startedAt ?? now)),
+    body: reason
+  });
+  if (!ctx.applyPatch(job.id, patchOf(signal), job, now)) return;
+  ctx.enqueueSignal(signal);
+  ctx.refreshJobs();
+}
+__name(failJob, "failJob");
+function startWorker(record, spec, ctx) {
+  const id = record.id;
+  let worker;
+  try {
+    worker = ctx.spawn(ctx.execPath, ["-e", ctx.workerSource], {
+      cwd: spec.cwd,
+      detached: true,
+      stdio: "ignore",
+      env: workerEnv(ctx.env, spec)
+    });
+  } catch (error) {
+    const reason = `spawn error: ${String(error?.message ?? error)}`;
+    failJob(record, reason, ctx);
+    return { ok: false, error: reason };
+  }
+  worker.on("error", (error) => {
+    failJob(ctx.readJob(id) ?? record, `worker spawn error: ${String(error?.message ?? error)}`, ctx);
+  });
+  worker.unref();
+  if (typeof worker.pid !== "number") {
+    const reason = "the worker process did not start";
+    failJob(ctx.readJob(id) ?? record, reason, ctx);
+    return { ok: false, error: reason };
+  }
+  const latest = ctx.readJob(id) ?? record;
+  latest.workerPid = worker.pid;
+  latest.updatedAt = ctx.now();
+  ctx.writeJob(latest);
+  ctx.runProjectHooks("SubagentStart", spec.cwd, spec.agentType, {
+    id,
+    label: record.description,
+    kind: record.kind
+  });
+  ctx.refreshJobs();
+  return { ok: true, id, pid: worker.pid };
+}
+__name(startWorker, "startWorker");
+function activeJobCount(ctx) {
+  const owner = ctx.owner();
+  let count = 0;
+  for (const job of ctx.readRecentJobs(ACTIVE_JOB_SCAN_MAX)) {
+    if (job.owner !== owner) continue;
+    const state = normalizeState(job.state);
+    if (state !== void 0 && state !== "queued" && state !== "running") continue;
+    count += 1;
+  }
+  return count;
+}
+__name(activeJobCount, "activeJobCount");
+async function fire(intent, ctx) {
+  const depth = depthOf(ctx.workerSpec) + 1;
+  if (intent.prompt !== void 0) {
+    const maxDepth = resolveMaxDepth(ctx.env);
+    if (depth > maxDepth) {
+      return {
+        ok: false,
+        error: `Subagent nesting depth limit reached (${maxDepth}). This subagent cannot spawn children; do not retry.`
+      };
+    }
+  }
+  const maxConcurrent = resolveMaxConcurrent(ctx.env);
+  if (activeJobCount(ctx) >= maxConcurrent) {
+    return {
+      ok: false,
+      error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`
+    };
+  }
+  const id = `${ctx.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const logPath = join6(ctx.logsDir, `${id}.log`);
+  const startedAt = ctx.now();
+  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join6(ctx.worktreesDir, id) }) : void 0;
+  const owner = intent.owner ?? ctx.owner();
+  const record = ctx.recordFromPlan(
+    { ...intent, depth, ...ctx.workerSpec?.id !== void 0 ? { parentJobId: ctx.workerSpec.id } : {} },
+    id,
+    logPath,
+    startedAt,
+    owner
+  );
+  if (isolation?.ok === true) {
+    record.worktree = isolation.path;
+    record.worktreeRepo = isolation.mainCheckouts[0];
+    if (isolation.head !== void 0) record.worktreeHead = isolation.head;
+    record.mainCheckouts = isolation.mainCheckouts;
+    record.cwd = isolation.path;
+  }
+  ctx.writeJob(record);
+  if (isolation !== void 0 && isolation.ok === false) {
+    failJob(record, isolation.error, ctx);
+    return { ok: false, error: isolation.error };
+  }
+  try {
+    ctx.appendJobEntry({
+      customType: JOB_ENTRY_TYPE,
+      data: {
+        id,
+        description: intent.description,
+        kind: intent.kind,
+        state: "queued",
+        owner,
+        sessionId: ctx.sessionId()
+      }
+    });
+  } catch {
+  }
+  const isAgent = intent.prompt !== void 0;
+  const live = isAgent && intent.live !== false && intent.oneShot !== true;
+  const canSend = intent.tools === void 0 || intent.tools.includes("SendMessage") || intent.tools.includes("subagent_send");
+  const roster = isAgent && intent.fork !== true && canSend ? ctx.rosterFor(intent.name) : { rosterNames: [] };
+  const idleMs = Number(ctx.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
+  if (live) {
+    try {
+      ctx.fs.mkdir(join6(ctx.controlRoot, id));
+    } catch {
+    }
+  }
+  const spec = buildSpec(
+    {
+      id,
+      description: intent.description,
+      kind: intent.kind,
+      owner,
+      cwd: isolation?.ok === true ? isolation.path : intent.cwd,
+      logPath,
+      inboxDir: ctx.inboxDir,
+      jobsDir: ctx.jobsDir,
+      startedAt,
+      tailMax: LOG_TAIL_BYTES_MAX,
+      controlPollMs: CONTROL_POLL_MS,
+      permissionTimeoutMs: intent.background === false ? FOREGROUND_PERMISSION_TIMEOUT_MS : PERMISSION_TIMEOUT_MS,
+      bin: isAgent ? ctx.env.COMMANDCODE_BIN ?? "cmd" : "/bin/sh",
+      sessionId: ctx.sessionId(),
+      ...intent.name !== void 0 ? { name: intent.name } : {},
+      background: intent.background !== false,
+      // A foreground caller answers permission prompts inline; a background run
+      // settles with the request instead of holding a worker that nobody watches.
+      ...intent.background === false ? { interactive: true, controlDir: join6(ctx.jobsDir, "..", "control", id) } : {},
+      depth,
+      ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
+      ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
+      ...record.transcriptPath !== void 0 ? { transcriptPath: record.transcriptPath } : {},
+      ...intent.fork === true ? {
+        fork: true,
+        promptCache: "shared",
+        sessionName: ctx.sessionNameOf(id),
+        ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {}
+      } : isAgent ? { promptCache: "own" } : {},
+      ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
+      ...intent.systemPrompt !== void 0 ? { systemPrompt: intent.systemPrompt } : {},
+      ...intent.appendSystemPrompt !== void 0 ? { appendSystemPrompt: intent.appendSystemPrompt } : {},
+      ...intent.restrictedTools === true ? { restrictedTools: true } : {},
+      ...intent.hooks !== void 0 ? { hooks: intent.hooks } : {},
+      ...intent.startup !== void 0 ? { startup: intent.startup } : {},
+      ...intent.model !== void 0 ? { model: intent.model } : {},
+      ...intent.tools !== void 0 ? { tools: intent.tools } : {},
+      ...intent.disallowedTools !== void 0 ? { disallowedTools: intent.disallowedTools } : {},
+      ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
+      ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
+      ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
+      ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
+      ...intent.effort !== void 0 ? { effort: intent.effort } : {},
+      ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
+      ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
+      ...intent.resumeSession !== void 0 ? { resumeSession: intent.resumeSession } : {},
+      ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command },
+      ...roster.roster !== void 0 ? { roster: roster.roster } : {},
+      ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
+      ...intent.background !== void 0 ? { background: intent.background } : {},
+      ...live ? { live: true, controlDir: join6(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+      ...isAgent ? { promptMarkerPath: join6(ctx.logsDir, `${id}.mod`) } : {},
+      ...isolation?.ok === true ? { worktree: isolation.path, mainCheckouts: isolation.mainCheckouts } : {}
+    },
+    ctx.modPath
+  );
+  const launched = startWorker(record, spec, ctx);
+  if (launched.ok === false || intent.background !== false) return launched;
+  return settleForeground(launched, ctx);
+}
+__name(fire, "fire");
+async function answerPendingPermission(controlDir, answered, ctx) {
+  let request;
+  try {
+    request = JSON.parse(ctx.fs.readFile(join6(controlDir, "permission.json")));
+  } catch {
+    return;
+  }
+  const key = String(request.requestId ?? "");
+  if (key.length === 0 || answered.has(key)) return;
+  const options = request.options ?? [];
+  const choices = options.map((option2, index) => ({
+    label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
+    index
+  }));
+  const ui = ctx.ui;
+  if (typeof ui.select !== "function") return;
+  let chosen;
+  try {
+    chosen = await ui.select({
+      title: `Approve "${String(request.title)}"?`,
+      options: choices.map((choice) => ({ label: choice.label }))
+    });
+  } catch {
+    return;
+  }
+  if (typeof chosen !== "string") return;
+  answered.add(key);
+  const picked = choices.find((choice) => choice.label === chosen);
+  const option = picked === void 0 ? void 0 : options[picked.index];
+  const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
+  const file = join6(controlDir, "permission-response.json");
+  const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
+  ctx.fs.writeFile(tmp, JSON.stringify(response));
+  ctx.fs.rename(tmp, file);
+}
+__name(answerPendingPermission, "answerPendingPermission");
+async function settleForeground(launched, ctx) {
+  const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
+  let record = ctx.readJob(launched.id);
+  const answered = /* @__PURE__ */ new Set();
+  const permissionDir = join6(ctx.controlRoot, launched.id);
+  for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
+    if (ctx.backgrounded.has(launched.id)) {
+      ctx.refreshJobs();
+      return {
+        ok: true,
+        id: launched.id,
+        pid: launched.pid,
+        result: {
+          ok: true,
+          partial: true,
+          text: `${String(record?.description ?? launched.id)} continues in the background; its result will arrive as a signal.`
+        }
+      };
+    }
+    await ctx.answerPendingPermission(permissionDir, answered);
+    await ctx.sleep(FOREGROUND_POLL_MS);
+    record = ctx.readJob(launched.id);
+  }
+  if (record === void 0 || !isTerminalState(record.state)) {
+    if (record !== void 0) ctx.writeJob({ ...record, background: true, updatedAt: ctx.now() });
+    ctx.refreshJobs();
+    return {
+      ok: false,
+      error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
+    };
+  }
+  const log = ctx.readLog(String(record.logPath ?? join6(ctx.logsDir, `${launched.id}.log`)));
+  const decision = ctx.finalizeJobWorktree(record);
+  const outcome = ctx.foregroundOutcome(record, log);
+  if (decision?.kept !== true) return { ...launched, result: outcome };
+  const note = `
+worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decision.error})`}`;
+  const result = outcome.ok === true ? { ok: true, text: `${outcome.text}${note}`, partial: outcome.partial } : { ok: false, error: `${outcome.error}${note}` };
+  return { ...launched, result };
+}
+__name(settleForeground, "settleForeground");
 
 // src/index.ts
 function scanOutput(text) {
@@ -2872,7 +3499,7 @@ function createAgentRegistry(deps) {
   let entries = [];
   const loggedSkips = /* @__PURE__ */ new Set();
   const definitionWarnings = /* @__PURE__ */ new WeakMap();
-  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join5(deps.home, ".commandcode", "managed"), "managedDir");
+  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join7(deps.home, ".commandcode", "managed"), "managedDir");
   function pushEntry(entry) {
     entries.push(entry);
     const problem = entry.warning ?? entry.reason;
@@ -2929,7 +3556,7 @@ function createAgentRegistry(deps) {
     }
     for (const name of names) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join5(dir, name);
+      const full = join7(dir, name);
       if (name.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, scope);
         if (definition === void 0) continue;
@@ -2956,7 +3583,7 @@ function createAgentRegistry(deps) {
     }
     for (const child of children) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join5(dir, child);
+      const full = join7(dir, child);
       if (child.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, "plugin", {
           plugin: true,
@@ -2987,7 +3614,7 @@ function createAgentRegistry(deps) {
       return;
     }
     for (const pluginName of pluginNames) {
-      const agentsDir = join5(root, pluginName, "agents");
+      const agentsDir = join7(root, pluginName, "agents");
       if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
     }
   }
@@ -3007,9 +3634,9 @@ function createAgentRegistry(deps) {
   __name(projectBases, "projectBases");
   function pluginRoots() {
     const roots = [...deps.pluginRoots ?? []];
-    roots.push(join5(managedDir(), "plugins"));
-    for (const base of projectBases()) roots.push(join5(base, ".commandcode", "plugins"));
-    roots.push(join5(deps.home, ".commandcode", "plugins"));
+    roots.push(join7(managedDir(), "plugins"));
+    for (const base of projectBases()) roots.push(join7(base, ".commandcode", "plugins"));
+    roots.push(join7(deps.home, ".commandcode", "plugins"));
     return roots;
   }
   __name(pluginRoots, "pluginRoots");
@@ -3130,15 +3757,15 @@ function createAgentRegistry(deps) {
   function refresh() {
     entries = [];
     const found = [];
-    scanDir(join5(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join7(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
     scanCli(found);
     for (const base of projectBases()) {
-      scanDir(join5(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join7(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
     for (const dir of deps.addDirs ?? []) {
-      scanDir(join5(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join7(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
-    scanDir(join5(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join7(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
     for (const root of pluginRoots()) scanPlugins(root, found);
     found.push(...deps.builtins);
     const seen = /* @__PURE__ */ new Set();
@@ -3195,7 +3822,7 @@ function startupFile(fs, path) {
 __name(startupFile, "startupFile");
 function hasGitMarker(fs, dir) {
   try {
-    fs.stat(join5(dir, ".git"));
+    fs.stat(join7(dir, ".git"));
     return true;
   } catch {
     return false;
@@ -3219,11 +3846,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join5(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join7(cwd, path);
     let dir = dirname2(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname2(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join5(dir, "CLAUDE.md");
+      const filePath = join7(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -3243,24 +3870,24 @@ function claudeMdHierarchy(options) {
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join5(options.home, ".commandcode", "managed", "CLAUDE.md");
+    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join7(options.home, ".commandcode", "managed", "CLAUDE.md");
     const managed = startupFile(fs, managedPath);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
     const user = startupFile(
       fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join5(options.home, ".commandcode", "CLAUDE.md")
+      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join7(options.home, ".commandcode", "CLAUDE.md")
     );
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join5(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join7(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join5(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join7(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join5(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join7(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -3272,11 +3899,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join5(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join5(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join7(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join7(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join5(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join5(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join7(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join7(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -3284,8 +3911,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join5(options.home, ".commandcode", "agent-memory") : scope === "project" ? join5(options.cwd, ".commandcode", "agent-memory") : join5(options.cwd, ".commandcode", "agent-memory-local");
-  return join5(root, name);
+  const root = scope === "user" ? join7(options.home, ".commandcode", "agent-memory") : scope === "project" ? join7(options.cwd, ".commandcode", "agent-memory") : join7(options.cwd, ".commandcode", "agent-memory-local");
+  return join7(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -3322,7 +3949,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join5(dir, MEMORY_INDEX_FILE);
+  const path = join7(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -3462,36 +4089,6 @@ function listAgentsVisible(options) {
   return options.background !== true;
 }
 __name(listAgentsVisible, "listAgentsVisible");
-function buildArgs(spec, modPath) {
-  if (spec.kind === "command") return ["-c", String(spec.command ?? "")];
-  if (spec.kind === "fork") {
-    const prompt = String(spec.prompt ?? "");
-    if (typeof spec.resumeSession === "string" && spec.resumeSession.length > 0) {
-      return ["--resume", spec.resumeSession, "-p", prompt, "--output-format", "json"];
-    }
-    const name = String(spec.sessionName ?? `subagent-${spec.id}`);
-    return [
-      "--fork-session",
-      "--resume",
-      String(spec.mainSessionId ?? ""),
-      "-n",
-      name,
-      "-p",
-      prompt,
-      "--output-format",
-      "json"
-    ];
-  }
-  const maxTurns = typeof spec.maxTurns === "number" && spec.maxTurns > 0 ? String(spec.maxTurns) : "";
-  return [...maxTurns.length > 0 ? ["--max-turns", maxTurns] : [], "--mod", modPath, "acp"];
-}
-__name(buildArgs, "buildArgs");
-function buildSpec(input, modPath) {
-  const spec = { ...input, args: [] };
-  spec.args = buildArgs(spec, modPath);
-  return spec;
-}
-__name(buildSpec, "buildSpec");
 function resolveModel(input = {}) {
   const env = input.env ?? {};
   const envModel = nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
@@ -3562,7 +4159,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join5(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join7(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -3591,11 +4188,11 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join5(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join7(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join5(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? join7(roots.home, ".commandcode", "managed"),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
@@ -3851,41 +4448,6 @@ function tasksHintVisible(jobs, now) {
   });
 }
 __name(tasksHintVisible, "tasksHintVisible");
-function positiveInt(raw, fallback) {
-  const value = Number(raw);
-  return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
-}
-__name(positiveInt, "positiveInt");
-function resolveMaxConcurrent(env) {
-  return positiveInt(env[MAX_CONCURRENT_ENV] || env[MAX_CONCURRENT_ENV_ALIAS], MAX_CONCURRENT_DEFAULT);
-}
-__name(resolveMaxConcurrent, "resolveMaxConcurrent");
-function resolveMaxDepth(env) {
-  return positiveInt(env[MAX_DEPTH_ENV] || env[MAX_DEPTH_ENV_ALIAS], MAX_DEPTH_DEFAULT);
-}
-__name(resolveMaxDepth, "resolveMaxDepth");
-function depthOf(spec) {
-  const depth = Number(spec?.depth);
-  return Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
-}
-__name(depthOf, "depthOf");
-function workerEnv(parent, spec) {
-  const env = { ...parent };
-  delete env[WORKER_SPEC_ENV];
-  delete env[WORKER_ENV];
-  delete env.PUBSUB_WORKER;
-  delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT;
-  delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT;
-  delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE;
-  delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE;
-  env[WORKER_SPEC_ENV] = JSON.stringify(spec);
-  env[WORKER_ENV] = "1";
-  if (typeof spec.appendSystemPrompt === "string" && spec.appendSystemPrompt.length > 0) {
-    env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT = spec.appendSystemPrompt;
-  }
-  return env;
-}
-__name(workerEnv, "workerEnv");
 function sweepExpiredEntries(io, dir, now, options = {}) {
   let names;
   try {
@@ -3895,7 +4457,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join5(dir, name);
+    const file = join7(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -4000,15 +4562,15 @@ function index_default(cmd, overrides = {}) {
     flag: readFlag(FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join5(root, "inbox");
-  const claimedDir = join5(root, "claimed");
-  const orphanedDir = join5(root, "orphaned");
-  const logsDir = join5(root, "logs");
-  const jobsDir = join5(root, "jobs");
-  const transcriptsDir = join5(root, "transcripts");
-  const worktreesDir = join5(root, "worktrees");
-  const controlRoot = join5(root, "control");
-  const ledgerPath = join5(root, "delivered.jsonl");
+  const inboxDir = join7(root, "inbox");
+  const claimedDir = join7(root, "claimed");
+  const orphanedDir = join7(root, "orphaned");
+  const logsDir = join7(root, "logs");
+  const jobsDir = join7(root, "jobs");
+  const transcriptsDir = join7(root, "transcripts");
+  const worktreesDir = join7(root, "worktrees");
+  const controlRoot = join7(root, "control");
+  const ledgerPath = join7(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -4031,7 +4593,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join5(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join7(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -4135,13 +4697,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join5(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join7(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join5(current, ".git"));
+        spool.stat(join7(current, ".git"));
         break;
       } catch {
       }
@@ -4240,6 +4802,14 @@ function index_default(cmd, overrides = {}) {
     pid: runtime.pid,
     now: /* @__PURE__ */ __name(() => runtime.now(), "now")
   });
+  const permissionCtx = {
+    fs: spool,
+    now: /* @__PURE__ */ __name(() => runtime.now(), "now"),
+    pid: process.pid,
+    get ui() {
+      return cmd.ui;
+    }
+  };
   const {
     safeDrain,
     claimPending,
@@ -4269,7 +4839,7 @@ function index_default(cmd, overrides = {}) {
     deliverAs,
     sendUserMessage: /* @__PURE__ */ __name((text, options) => cmd.sendUserMessage(text, options), "sendUserMessage"),
     showEntry: /* @__PURE__ */ __name((type, data) => cmd.showEntry(type, data), "showEntry"),
-    answerPendingPermission,
+    answerPendingPermission: /* @__PURE__ */ __name((controlDir, answered) => answerPendingPermission(controlDir, answered, permissionCtx), "answerPendingPermission"),
     jobs: /* @__PURE__ */ __name(() => jobCache, "jobs"),
     setJobs: /* @__PURE__ */ __name((jobs) => {
       jobCache = jobs;
@@ -4325,7 +4895,7 @@ function index_default(cmd, overrides = {}) {
     const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join5(controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join7(controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -4333,10 +4903,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(liveState, "liveState");
   function appendLive(id, from, message) {
-    const dir = join5(controlRoot, id);
+    const dir = join7(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join5(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join7(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -4368,9 +4938,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join5(inboxDir, `.tmp-${stamp}`);
+      const tmp = join7(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join5(inboxDir, stamp));
+      spool.rename(tmp, join7(inboxDir, stamp));
     } catch {
     }
   }
@@ -4379,7 +4949,7 @@ function index_default(cmd, overrides = {}) {
     for (const base of [runtime.cwd, runtime.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join5(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join7(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -4414,7 +4984,7 @@ function index_default(cmd, overrides = {}) {
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join5(jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join7(jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -4429,18 +4999,18 @@ function index_default(cmd, overrides = {}) {
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join5(logsDir, `${id}.log`));
+        spool.remove(join7(logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join5(transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join7(transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join5(worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join7(worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, logsDir, now, {
@@ -4475,7 +5045,7 @@ function index_default(cmd, overrides = {}) {
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join5(worktreesDir, name);
+      const path = join7(worktreesDir, name);
       let old = false;
       try {
         old = now - spool.stat(path).mtimeMs > ttlMs;
@@ -4506,7 +5076,7 @@ function index_default(cmd, overrides = {}) {
         if (hasPendingSignal(job.id)) continue;
         const startedAt = Number(job.startedAt ?? 0) || 0;
         if (now - startedAt < LOST_GRACE_MS) continue;
-        failJob(job, state === "queued" ? "worker never started" : "lost (no live process)");
+        failJob(job, state === "queued" ? "worker never started" : "lost (no live process)", spawnCtx);
       } else if (state !== void 0 && state !== job.state) {
         applyPatch(job.id, { state }, job, now);
       }
@@ -4606,8 +5176,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join5(controlRoot, id));
-        spool.writeFile(join5(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join7(controlRoot, id));
+        spool.writeFile(join7(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -4649,319 +5219,6 @@ function index_default(cmd, overrides = {}) {
   let selectedTaskId;
   let agentViewOpen = false;
   let panelNotice;
-  function failJob(job, reason) {
-    const now = runtime.now();
-    const signal = signalOf(job, {
-      state: "failed",
-      finishedAt: now,
-      durationMs: Math.max(0, now - Number(job.startedAt ?? now)),
-      body: reason
-    });
-    if (!applyPatch(job.id, patchOf(signal), job, now)) return;
-    enqueueSignal(signal);
-    refreshJobs();
-  }
-  __name(failJob, "failJob");
-  function sessionNameOf(id) {
-    return `subagent-${id}`;
-  }
-  __name(sessionNameOf, "sessionNameOf");
-  function makeRecord(intent, id, logPath, startedAt, owner) {
-    const isAgent = intent.prompt !== void 0;
-    return {
-      id,
-      owner,
-      description: intent.description,
-      kind: intent.kind,
-      ...intent.name !== void 0 ? { name: intent.name } : {},
-      state: "queued",
-      // The resolved policy, not the raw `run_in_background`: env and definition
-      // overrides are already applied by the caller.
-      background: intent.background !== false,
-      ...isAgent && intent.live !== false && intent.oneShot !== true ? { live: true } : {},
-      cwd: intent.cwd,
-      logPath,
-      startedAt,
-      sessionId,
-      updatedAt: startedAt,
-      ...intent.depth !== void 0 ? { depth: intent.depth } : {},
-      ...intent.parentJobId !== void 0 ? { parentJobId: intent.parentJobId } : {},
-      ...isAgent ? {
-        // The durable resume handle. A one-shot agent has none, so nothing can
-        // invite a resume that the lifecycle forbids.
-        ...intent.oneShot === true ? {} : { agentId: id },
-        agentType: intent.agentType ?? "general-purpose",
-        sessionName: sessionNameOf(id),
-        transcriptPath: join5(transcriptsDir, `${id}.jsonl`),
-        ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
-      } : {},
-      ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
-      ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
-      ...intent.model !== void 0 ? { model: intent.model } : {},
-      ...intent.tools !== void 0 ? { tools: intent.tools } : {},
-      ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
-      ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
-      ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
-      ...intent.color !== void 0 ? { color: intent.color } : {},
-      ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
-      ...intent.effort !== void 0 ? { effort: intent.effort } : {},
-      ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
-      ...intent.isolation !== void 0 ? { isolation: intent.isolation } : {},
-      ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
-      ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command }
-    };
-  }
-  __name(makeRecord, "makeRecord");
-  function startWorker(record, spec) {
-    const id = record.id;
-    let worker;
-    try {
-      worker = runtime.spawn(runtime.execPath, ["-e", WORKER_SOURCE], {
-        cwd: spec.cwd,
-        detached: true,
-        stdio: "ignore",
-        env: workerEnv(runtime.env, spec)
-      });
-    } catch (error) {
-      const reason = `spawn error: ${String(error?.message ?? error)}`;
-      failJob(record, reason);
-      return { ok: false, error: reason };
-    }
-    worker.on("error", (error) => {
-      failJob(readJob(id) ?? record, `worker spawn error: ${String(error?.message ?? error)}`);
-    });
-    worker.unref();
-    if (typeof worker.pid !== "number") {
-      const reason = "the worker process did not start";
-      failJob(readJob(id) ?? record, reason);
-      return { ok: false, error: reason };
-    }
-    const latest = readJob(id) ?? record;
-    latest.workerPid = worker.pid;
-    latest.updatedAt = runtime.now();
-    writeJob(latest);
-    runHookRules(runtime.run, projectHookRules("SubagentStart"), {
-      event: "SubagentStart",
-      cwd: spec.cwd,
-      agent: spec.agentType,
-      input: { id, label: record.description, kind: record.kind }
-    });
-    refreshJobs();
-    return { ok: true, id, pid: worker.pid };
-  }
-  __name(startWorker, "startWorker");
-  function activeJobCount() {
-    const owner = currentOwner();
-    let count = 0;
-    for (const job of readRecentJobs(ACTIVE_JOB_SCAN_MAX)) {
-      if (job.owner !== owner) continue;
-      const state = normalizeState(job.state);
-      if (state !== void 0 && state !== "queued" && state !== "running") continue;
-      count += 1;
-    }
-    return count;
-  }
-  __name(activeJobCount, "activeJobCount");
-  async function fire(intent) {
-    const depth = depthOf(workerSpec) + 1;
-    if (intent.prompt !== void 0) {
-      const maxDepth = resolveMaxDepth(runtime.env);
-      if (depth > maxDepth) {
-        return {
-          ok: false,
-          error: `Subagent nesting depth limit reached (${maxDepth}). This subagent cannot spawn children; do not retry.`
-        };
-      }
-    }
-    const maxConcurrent = resolveMaxConcurrent(runtime.env);
-    if (activeJobCount() >= maxConcurrent) {
-      return {
-        ok: false,
-        error: `Concurrent subagent limit reached (${maxConcurrent}). Do not retry; wait for a running subagent to finish or cancel one first.`
-      };
-    }
-    const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const logPath = join5(logsDir, `${id}.log`);
-    const startedAt = runtime.now();
-    const isolation2 = intent.isolation === "worktree" ? createJobWorktree({ git: git.git, fs: spool }, { cwd: intent.cwd, path: join5(worktreesDir, id) }) : void 0;
-    const owner = intent.owner ?? currentOwner();
-    const record = makeRecord(
-      { ...intent, depth, ...workerSpec?.id !== void 0 ? { parentJobId: workerSpec.id } : {} },
-      id,
-      logPath,
-      startedAt,
-      owner
-    );
-    if (isolation2?.ok === true) {
-      record.worktree = isolation2.path;
-      record.worktreeRepo = isolation2.mainCheckouts[0];
-      if (isolation2.head !== void 0) record.worktreeHead = isolation2.head;
-      record.mainCheckouts = isolation2.mainCheckouts;
-      record.cwd = isolation2.path;
-    }
-    writeJob(record);
-    if (isolation2 !== void 0 && isolation2.ok === false) {
-      failJob(record, isolation2.error);
-      return { ok: false, error: isolation2.error };
-    }
-    try {
-      cmd.session?.appendCustomEntry({
-        customType: JOB_ENTRY_TYPE,
-        data: { id, description: intent.description, kind: intent.kind, state: "queued", owner, sessionId }
-      });
-    } catch {
-    }
-    const isAgent = intent.prompt !== void 0;
-    const live = isAgent && intent.live !== false && intent.oneShot !== true;
-    const canSend = intent.tools === void 0 || intent.tools.includes("SendMessage") || intent.tools.includes("subagent_send");
-    const roster = isAgent && intent.fork !== true && canSend ? rosterFor(intent.name) : { rosterNames: [] };
-    const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
-    if (live) {
-      try {
-        spool.mkdir(join5(controlRoot, id));
-      } catch {
-      }
-    }
-    const spec = buildSpec(
-      {
-        id,
-        description: intent.description,
-        kind: intent.kind,
-        owner,
-        cwd: isolation2?.ok === true ? isolation2.path : intent.cwd,
-        logPath,
-        inboxDir,
-        jobsDir,
-        startedAt,
-        tailMax: LOG_TAIL_BYTES_MAX,
-        controlPollMs: CONTROL_POLL_MS,
-        permissionTimeoutMs: intent.background === false ? FOREGROUND_PERMISSION_TIMEOUT_MS : PERMISSION_TIMEOUT_MS,
-        bin: isAgent ? runtime.env.COMMANDCODE_BIN ?? "cmd" : "/bin/sh",
-        sessionId,
-        ...intent.name !== void 0 ? { name: intent.name } : {},
-        background: intent.background !== false,
-        // A foreground caller answers permission prompts inline; a background run
-        // settles with the request instead of holding a worker that nobody watches.
-        ...intent.background === false ? { interactive: true, controlDir: join5(jobsDir, "..", "control", id) } : {},
-        depth,
-        ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
-        ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
-        ...record.transcriptPath !== void 0 ? { transcriptPath: record.transcriptPath } : {},
-        ...intent.fork === true ? {
-          fork: true,
-          promptCache: "shared",
-          sessionName: sessionNameOf(id),
-          ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {}
-        } : isAgent ? { promptCache: "own" } : {},
-        ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
-        ...intent.systemPrompt !== void 0 ? { systemPrompt: intent.systemPrompt } : {},
-        ...intent.appendSystemPrompt !== void 0 ? { appendSystemPrompt: intent.appendSystemPrompt } : {},
-        ...intent.restrictedTools === true ? { restrictedTools: true } : {},
-        ...intent.hooks !== void 0 ? { hooks: intent.hooks } : {},
-        ...intent.startup !== void 0 ? { startup: intent.startup } : {},
-        ...intent.model !== void 0 ? { model: intent.model } : {},
-        ...intent.tools !== void 0 ? { tools: intent.tools } : {},
-        ...intent.disallowedTools !== void 0 ? { disallowedTools: intent.disallowedTools } : {},
-        ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
-        ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
-        ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
-        ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
-        ...intent.effort !== void 0 ? { effort: intent.effort } : {},
-        ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
-        ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
-        ...intent.resumeSession !== void 0 ? { resumeSession: intent.resumeSession } : {},
-        ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command },
-        ...roster.roster !== void 0 ? { roster: roster.roster } : {},
-        ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
-        ...intent.background !== void 0 ? { background: intent.background } : {},
-        ...live ? { live: true, controlDir: join5(controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-        ...isAgent ? { promptMarkerPath: join5(logsDir, `${id}.mod`) } : {},
-        ...isolation2?.ok === true ? { worktree: isolation2.path, mainCheckouts: isolation2.mainCheckouts } : {}
-      },
-      MOD_PATH
-    );
-    const launched = startWorker(record, spec);
-    if (launched.ok === false || intent.background !== false) return launched;
-    return settleForeground(launched);
-  }
-  __name(fire, "fire");
-  async function answerPendingPermission(controlDir, answered) {
-    let request;
-    try {
-      request = JSON.parse(spool.readFile(join5(controlDir, "permission.json")));
-    } catch {
-      return;
-    }
-    const key = String(request.requestId ?? "");
-    if (key.length === 0 || answered.has(key)) return;
-    const options = request.options ?? [];
-    const choices = options.map((option2, index) => ({
-      label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
-      index
-    }));
-    const ui = cmd.ui;
-    if (typeof ui.select !== "function") return;
-    let chosen;
-    try {
-      chosen = await ui.select({
-        title: `Approve "${String(request.title)}"?`,
-        options: choices.map((choice) => ({ label: choice.label }))
-      });
-    } catch {
-      return;
-    }
-    if (typeof chosen !== "string") return;
-    answered.add(key);
-    const picked = choices.find((choice) => choice.label === chosen);
-    const option = picked === void 0 ? void 0 : options[picked.index];
-    const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-    const file = join5(controlDir, "permission-response.json");
-    const tmp = `${file}.mod-${process.pid}-${runtime.now()}`;
-    spool.writeFile(tmp, JSON.stringify(response));
-    spool.rename(tmp, file);
-  }
-  __name(answerPendingPermission, "answerPendingPermission");
-  async function settleForeground(launched) {
-    const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
-    let record = readJob(launched.id);
-    const answered = /* @__PURE__ */ new Set();
-    const permissionDir = join5(controlRoot, launched.id);
-    for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
-      if (backgroundedForegrounds.has(launched.id)) {
-        refreshJobs();
-        return {
-          ok: true,
-          id: launched.id,
-          pid: launched.pid,
-          result: {
-            ok: true,
-            partial: true,
-            text: `${String(record?.description ?? launched.id)} continues in the background; its result will arrive as a signal.`
-          }
-        };
-      }
-      await answerPendingPermission(permissionDir, answered);
-      await runtime.sleep(FOREGROUND_POLL_MS);
-      record = readJob(launched.id);
-    }
-    if (record === void 0 || !isTerminalState(record.state)) {
-      if (record !== void 0) writeJob({ ...record, background: true, updatedAt: runtime.now() });
-      refreshJobs();
-      return {
-        ok: false,
-        error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
-      };
-    }
-    const log = readLog(String(record.logPath ?? join5(logsDir, `${launched.id}.log`)));
-    const decision = finalizeJobWorktree(record);
-    const outcome = foregroundOutcome(record, log);
-    if (decision?.kept !== true) return { ...launched, result: outcome };
-    const note = `
-worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decision.error})`}`;
-    const result = outcome.ok === true ? { ok: true, text: `${outcome.text}${note}`, partial: outcome.partial } : { ok: false, error: `${outcome.error}${note}` };
-    return { ...launched, result };
-  }
-  __name(settleForeground, "settleForeground");
   function visibleTaskRows() {
     return taskPanelRows(jobCache, { now: runtime.now(), dismissed: dismissedTasks });
   }
@@ -5136,153 +5393,87 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
     }
   }
   __name(addSurface, "addSurface");
-  function planFromInput(input) {
-    const label = String(input.description ?? input.label ?? "").trim();
-    if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
-    const command = typeof input.command === "string" && input.command.trim().length > 0 ? input.command : void 0;
-    const prompt = typeof input.prompt === "string" && input.prompt.trim().length > 0 ? input.prompt : void 0;
-    if (command === void 0 && prompt === void 0) {
-      return { ok: false, error: "pass either prompt (a headless agent) or command (a shell command)" };
-    }
-    if (command !== void 0 && prompt !== void 0) return { ok: false, error: "pass prompt or command, not both" };
-    if (input.isolation !== void 0) {
-      return {
-        ok: false,
-        error: "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it"
-      };
-    }
-    const requestedMode = typeof input.permission_mode === "string" && input.permission_mode.trim().length > 0 ? input.permission_mode.trim() : void 0;
-    if (requestedMode !== void 0 && canonicalPermissionMode(requestedMode) === void 0) {
-      return { ok: false, error: `unknown permission_mode "${requestedMode}"` };
-    }
-    if (requestedMode !== void 0 && prompt === void 0) {
-      return { ok: false, error: "permission_mode applies to agent jobs; a shell command has no permission mode" };
-    }
-    const model = typeof input.model === "string" && input.model.trim().length > 0 ? input.model.trim() : void 0;
-    const name = typeof input.name === "string" && input.name.trim().length > 0 ? input.name.trim() : void 0;
-    const teamName = typeof input.team_name === "string" && input.team_name.trim().length > 0 ? input.team_name.trim() : void 0;
-    const requestedMaxTurns = Number(input.max_turns);
-    const timeoutMs = Number(input.timeout_ms);
-    const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim().length > 0 ? input.subagent_type.trim() : void 0;
-    const aliasType = typeof input.agent_type === "string" && input.agent_type.trim().length > 0 ? input.agent_type.trim() : void 0;
-    if (subagentType !== void 0 && aliasType !== void 0 && subagentType !== aliasType) {
-      return { ok: false, error: "pass subagent_type or its deprecated alias agent_type, not both" };
-    }
-    let definition;
-    if (prompt !== void 0) {
-      const resolved = resolveAgentDefinition(subagentType ?? aliasType);
-      if (resolved.ok === false) return { ok: false, error: resolved.error };
-      definition = resolved.definition;
-    }
-    const forkRequested = definition?.fork === true;
-    const teammate = prompt !== void 0 && teamName !== void 0;
-    const requestedBackground = typeof input.run_in_background === "boolean" ? input.run_in_background : void 0;
-    const teamPolicy = resolveTeamPolicy({
-      teammate,
-      definitionBackground: definition?.background,
-      ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
-      forkMode
-    });
-    if (teamPolicy.ok === false) return { ok: false, error: teamPolicy.error };
-    const requestedTools = prompt === void 0 || forkRequested ? void 0 : listField(input.tools) ?? definition?.tools;
-    const requestedDisallowed = prompt === void 0 || forkRequested ? void 0 : listField(input.disallowed_tools) ?? definition?.disallowedTools;
-    let permissionMode;
-    if (prompt !== void 0) {
-      if (forkRequested) {
-        permissionMode = mainPermissionMode ?? "default";
-      } else {
-        const modeResolution = resolvePermissionMode(requestedMode ?? definition?.permissionMode, mainPermissionMode);
-        if (modeResolution.ok === false) return { ok: false, error: modeResolution.error };
-        permissionMode = modeResolution.mode;
-      }
-    }
-    const background = teammate ? false : forkModeEnabled ? true : resolveExecutionPolicy({
-      ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
-      definitionBackground: definition?.background,
-      env: runtime.env
-    }) === "background";
-    const configuredMcp = mcpServerConfigs(spool, [runtime.home, runtime.cwd]);
-    const mcp = resolveAgentMcpServers({
-      defined: definition?.mcpServers ?? [],
-      configured: configuredMcp,
+  const planCtx = {
+    fs: spool,
+    env: runtime.env,
+    cwd: cmd.cwd,
+    runtimeCwd: runtime.cwd,
+    home: runtime.home,
+    transcriptsDir,
+    appendPromptText,
+    forkMode,
+    forkModeEnabled,
+    managedDir: readFlag("managed_dir") || MANAGED_SETTINGS_DEFAULT,
+    addDirs,
+    sessionId: /* @__PURE__ */ __name(() => sessionId, "sessionId"),
+    mainPermissionMode: /* @__PURE__ */ __name(() => mainPermissionMode, "mainPermissionMode"),
+    resolveAgentDefinition,
+    systemPromptFor: subagentSystemPrompt,
+    startupFor: /* @__PURE__ */ __name((definition, cwd, prompt, model) => startupFor(definition, cwd, prompt, model), "startupFor"),
+    canonicalPermissionMode,
+    resolveTeamPolicy,
+    resolvePermissionMode,
+    resolveExecutionPolicy,
+    mcpServerConfigs,
+    resolveAgentMcpServers: /* @__PURE__ */ __name((input) => resolveAgentMcpServers({
+      defined: input.defined,
+      configured: input.configured,
+      definition: input.definition,
+      env: input.env,
+      trusted: input.trusted
+    }), "resolveAgentMcpServers"),
+    agentFolderTrusted: /* @__PURE__ */ __name((definition, roots) => agentFolderTrusted(
       definition,
-      env: runtime.env,
-      trusted: definition === void 0 || agentFolderTrusted(definition, {
-        cwd: runtime.cwd,
-        home: runtime.home,
-        managedDir: readFlag("managed_dir") || MANAGED_SETTINGS_DEFAULT,
-        addDirs
-      })
-    });
-    const mcpNames = Object.keys(configuredMcp);
-    for (const server of mcp.servers) if (!mcpNames.includes(server.name)) mcpNames.push(server.name);
-    const launch = forkRequested ? { ok: true, model: void 0, modelSource: "inherit", effort: void 0, effortSource: "none", tools: [], removed: [] } : resolveLaunch({
-      ...model !== void 0 ? { requestedModel: model } : {},
-      ...definition?.model !== void 0 ? { definitionModel: definition.model } : {},
-      ...typeof input.effort === "string" ? { requestedEffort: input.effort } : {},
-      ...definition?.effort !== void 0 ? { definitionEffort: definition.effort } : {},
-      env: runtime.env,
-      // The mod API exposes no main-model getter: an absent model means the ACP
-      // child inherits the user's configured model, which is the main one.
-      ...requestedTools !== void 0 ? { tools: requestedTools } : {},
-      ...requestedDisallowed !== void 0 ? { disallowedTools: requestedDisallowed } : {},
-      ...permissionMode !== void 0 ? { permissionMode } : {},
-      background,
-      ...teammate ? { team: true } : {},
-      mcpServers: mcpNames
-    });
-    if (launch.ok === false) return { ok: false, error: launch.error };
-    if (forkRequested && (sessionId === void 0 || sessionId.length === 0)) {
-      return { ok: false, error: "a fork needs the main session id; the session has not bound yet" };
-    }
-    const launchTools = prompt === void 0 || forkRequested ? void 0 : withMemoryTools(launch.tools, definition?.memory);
-    const maxTurns = prompt === void 0 || forkRequested ? void 0 : Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0 ? Math.round(requestedMaxTurns) : definition?.maxTurns;
-    const runCwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : cmd.cwd;
-    const compactWindow = resolveAutoCompactWindow(
-      contextWindowForModel(launch.model, runtime.env),
-      definition?.autoCompactWindow,
-      false
-    );
-    return {
-      ok: true,
-      plan: {
-        description: label,
-        kind: forkRequested ? "fork" : prompt !== void 0 ? "agent" : "command",
-        command,
-        prompt,
-        background,
-        cwd: runCwd,
-        ...name !== void 0 ? { name } : {},
-        ...teamName !== void 0 ? { teamName } : {},
-        agentType: definition?.name,
-        oneShot: definition?.oneShot,
-        ...forkRequested ? { fork: true, ...sessionId !== void 0 ? { mainSessionId: sessionId } : {} } : {},
-        systemPrompt: forkRequested ? void 0 : subagentSystemPrompt(definition?.prompt),
-        appendSystemPrompt: appendPromptText,
-        restrictedTools: definition?.tools !== void 0 || definition?.disallowedTools !== void 0 || requestedDisallowed !== void 0,
-        hooks: forkRequested ? void 0 : definition?.hooks,
-        startup: forkRequested ? void 0 : startupFor(definition, runCwd, prompt, launch.model),
-        model: prompt === void 0 || forkRequested ? void 0 : launch.model,
-        tools: launchTools,
-        ...requestedDisallowed !== void 0 ? { disallowedTools: requestedDisallowed } : {},
-        ...definition?.color !== void 0 ? { color: definition.color } : {},
-        ...prompt !== void 0 && !forkRequested ? { mcpServers: mcp.servers } : {},
-        ...prompt !== void 0 && !forkRequested && compactWindow !== void 0 ? { autoCompactWindow: compactWindow } : {},
-        ...prompt !== void 0 && !forkRequested && definition?.cacheTtl !== void 0 ? { cacheTtl: definition.cacheTtl } : {},
-        maxTurns,
-        effort: prompt === void 0 || forkRequested ? void 0 : launch.effort,
-        permissionMode,
-        isolation: forkRequested ? void 0 : definition?.isolation,
-        timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : void 0
-      }
-    };
-  }
-  __name(planFromInput, "planFromInput");
+      roots
+    ), "agentFolderTrusted"),
+    resolveLaunch: /* @__PURE__ */ __name((input) => resolveLaunch(input), "resolveLaunch"),
+    withMemoryTools,
+    contextWindowForModel,
+    resolveAutoCompactWindow,
+    listField
+  };
+  const spawnCtx = {
+    fs: spool,
+    env: runtime.env,
+    execPath: runtime.execPath,
+    spawn: runtime.spawn,
+    now: /* @__PURE__ */ __name(() => runtime.now(), "now"),
+    sleep: runtime.sleep,
+    workerSpec,
+    workerSource: WORKER_SOURCE,
+    modPath: MOD_PATH,
+    inboxDir,
+    jobsDir,
+    logsDir,
+    worktreesDir,
+    controlRoot,
+    git,
+    sessionId: /* @__PURE__ */ __name(() => sessionId, "sessionId"),
+    owner: currentOwner,
+    recordFromPlan: /* @__PURE__ */ __name((intent, id, logPath, startedAt, owner) => recordFromPlan(intent, id, logPath, startedAt, owner, planCtx), "recordFromPlan"),
+    sessionNameOf,
+    readJob,
+    writeJob,
+    readRecentJobs,
+    applyPatch,
+    enqueueSignal,
+    refreshJobs,
+    finalizeJobWorktree,
+    foregroundOutcome,
+    readLog,
+    rosterFor,
+    runProjectHooks: /* @__PURE__ */ __name((event, cwd, agent, input) => runHookRules(runtime.run, projectHookRules(event), { event, cwd, agent, input }), "runProjectHooks"),
+    appendJobEntry: /* @__PURE__ */ __name((entry) => {
+      cmd.session?.appendCustomEntry(entry);
+    }, "appendJobEntry"),
+    answerPendingPermission: /* @__PURE__ */ __name((controlDir, answered) => answerPendingPermission(controlDir, answered, permissionCtx), "answerPendingPermission"),
+    backgrounded: backgroundedForegrounds
+  };
   const spawnRun = /* @__PURE__ */ __name(async ({ input }) => {
-    const planned = planFromInput(input);
+    const planned = planFromInput(input, planCtx);
     if (planned.ok === false) return badInput(planned.error);
     const plan = planned.plan;
-    const launched = await fire(plan);
+    const launched = await fire(plan, spawnCtx);
     if (launched.ok === false) return badInput(launched.error);
     const spawnedAgentId = readJob(launched.id)?.agentId;
     if (launched.result !== void 0) {
@@ -5296,7 +5487,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join5(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join7(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5319,7 +5510,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join5(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join7(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5351,8 +5542,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join5(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join5(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join7(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join7(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5420,100 +5611,6 @@ transcript ${transcriptPath}` : "") + `${timing}
     const result = cancelJob(id);
     return result.ok ? okText(result.message) : badInput(result.message);
   }, "cancelRun");
-  function planFromRecord(record, instruction, mode) {
-    const label = String(record.name ?? record.id);
-    const jobId = record.id;
-    const suffix = mode === "resume" ? "resume" : "message";
-    const resumeCwd = String(record.cwd ?? cmd.cwd);
-    if (record.fork === true) {
-      if (record.forkSessionId === void 0) {
-        return {
-          ok: false,
-          error: mode === "resume" ? `subagent: job ${jobId} is a fork with no recorded session; spawn it again` : `${label} has finished and its fork session was never recorded; spawn it again`
-        };
-      }
-      return {
-        ok: true,
-        plan: {
-          description: `${String(record.description ?? jobId)} (${suffix})`,
-          kind: "fork",
-          prompt: instruction,
-          background: record.teamName !== void 0 ? false : true,
-          cwd: resumeCwd,
-          agentType: FORK_AGENT_TYPE,
-          fork: true,
-          ...record.mainSessionId !== void 0 ? { mainSessionId: record.mainSessionId } : {},
-          resumeSession: record.forkSessionId,
-          resumedFrom: jobId,
-          ...record.permissionMode !== void 0 ? { permissionMode: record.permissionMode } : {},
-          ...record.name !== void 0 ? { name: record.name } : {},
-          ...record.teamName !== void 0 ? { teamName: record.teamName } : {},
-          ...record.owner !== void 0 ? { owner: record.owner } : {}
-        }
-      };
-    }
-    if (record.acpSessionId === void 0 && mode === "message") {
-      return { ok: false, error: `${label} has finished and has no resumable session; spawn it again` };
-    }
-    const definition = record.agentType === void 0 ? void 0 : resolveAgentDefinition(record.agentType);
-    const resumeDefinition = definition?.ok === true ? definition.definition : void 0;
-    const background = mode === "message" ? record.teamName !== void 0 ? false : true : record.teamName !== void 0 ? false : resolveExecutionPolicy({
-      definitionBackground: resumeDefinition?.background,
-      env: runtime.env
-    }) === "background";
-    const resumedMcp = mode === "message" ? [] : resumeDefinition === void 0 ? record.mcpServers ?? [] : resolveAgentMcpServers({
-      defined: resumeDefinition.mcpServers ?? [],
-      configured: mcpServerConfigs(spool, [runtime.home, runtime.cwd]),
-      definition: resumeDefinition,
-      env: runtime.env,
-      trusted: agentFolderTrusted(resumeDefinition, {
-        cwd: runtime.cwd,
-        home: runtime.home,
-        managedDir: readFlag("managed_dir") || MANAGED_SETTINGS_DEFAULT,
-        addDirs
-      })
-    }).servers;
-    const resumeCompact = mode === "message" ? record.autoCompactWindow : record.autoCompactWindow ?? resolveAutoCompactWindow(
-      contextWindowForModel(record.model, runtime.env),
-      resumeDefinition?.autoCompactWindow,
-      false
-    );
-    const resumeCacheTtl = mode === "message" ? record.cacheTtl : record.cacheTtl ?? resumeDefinition?.cacheTtl;
-    return {
-      ok: true,
-      plan: {
-        description: `${String(record.description ?? jobId)} (${suffix})`,
-        kind: "agent",
-        prompt: instruction,
-        background,
-        cwd: resumeCwd,
-        agentType: record.agentType,
-        systemPrompt: mode === "message" ? resumeDefinition?.prompt : subagentSystemPrompt(resumeDefinition?.prompt),
-        appendSystemPrompt: appendPromptText,
-        restrictedTools: resumeDefinition?.tools !== void 0 || resumeDefinition?.disallowedTools !== void 0,
-        hooks: resumeDefinition?.hooks,
-        startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
-        model: record.model,
-        ...record.tools !== void 0 ? { tools: record.tools } : {},
-        ...mode === "message" ? record.mcpServers !== void 0 ? { mcpServers: record.mcpServers } : {} : resumedMcp.length > 0 ? { mcpServers: resumedMcp } : {},
-        ...resumeCompact !== void 0 ? { autoCompactWindow: resumeCompact } : {},
-        ...resumeCacheTtl !== void 0 ? { cacheTtl: resumeCacheTtl } : {},
-        ...record.color !== void 0 ? { color: record.color } : {},
-        maxTurns: record.maxTurns,
-        // The per-invocation model and effort are what make a resume the same run
-        // continued, not a fresh one with the definition's defaults.
-        effort: record.effort,
-        permissionMode: record.permissionMode,
-        timeoutMs: record.timeoutMs,
-        resumeSession: record.acpSessionId,
-        resumedFrom: jobId,
-        ...record.name !== void 0 ? { name: record.name } : {},
-        ...record.teamName !== void 0 ? { teamName: record.teamName } : {},
-        ...record.owner !== void 0 ? { owner: record.owner } : {}
-      }
-    };
-  }
-  __name(planFromRecord, "planFromRecord");
   const resumeRun = /* @__PURE__ */ __name(async ({ input }) => {
     const id = String(input.id ?? "").trim();
     if (id.length === 0) return badInput("id is required");
@@ -5537,9 +5634,9 @@ transcript ${transcriptPath}` : "") + `${timing}
         `subagent: job ${jobId} is still running; send it a live message with subagent_send` + (record.name === void 0 ? " once it finishes, or wait for its result" : `({to: "${record.name}", message}) instead`)
       );
     }
-    const planned = planFromRecord(record, instruction, "resume");
+    const planned = planFromRecord(record, instruction, "resume", planCtx);
     if (planned.ok === false) return badInput(planned.error);
-    const launched = await fire(planned.plan);
+    const launched = await fire(planned.plan, spawnCtx);
     if (launched.ok === false) return badInput(launched.error);
     const resumedAgentId = readJob(launched.id)?.agentId;
     return launchedToolResult(
@@ -5547,7 +5644,7 @@ transcript ${transcriptPath}` : "") + `${timing}
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join5(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join7(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -5620,9 +5717,9 @@ ${launched.result.text}` : launched.result.text);
 The reply arrives here as its own message signal.`
       );
     }
-    const planned = planFromRecord(record, message, "message");
+    const planned = planFromRecord(record, message, "message", planCtx);
     if (planned.ok === false) return badInput(planned.error);
-    const launched = await fire(planned.plan);
+    const launched = await fire(planned.plan, spawnCtx);
     if (launched.ok === false) return badInput(launched.error);
     return launchedToolResult(
       launched,
@@ -6010,16 +6107,19 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     if (prompt.length === 0) return { message: "subtask: usage: /subtask <prompt>" };
     if (agentViewOpen) return { message: "subtask: the agent view is on; select a task row (or Esc) before starting another" };
     if (sessionId === void 0 || sessionId.length === 0) return { message: "subtask: the main session has not bound yet; try again" };
-    const launched = await fire({
-      description: "subtask",
-      kind: "fork",
-      prompt,
-      background: true,
-      cwd: cmd.cwd,
-      agentType: FORK_AGENT_TYPE,
-      fork: true,
-      mainSessionId: sessionId
-    });
+    const launched = await fire(
+      {
+        description: "subtask",
+        kind: "fork",
+        prompt,
+        background: true,
+        cwd: cmd.cwd,
+        agentType: FORK_AGENT_TYPE,
+        fork: true,
+        mainSessionId: sessionId
+      },
+      spawnCtx
+    );
     if (launched.ok === false) return { message: `subtask: ${launched.error}` };
     return {
       message: `subtask: started fork ${launched.id} from the main conversation, pid ${launched.pid}.
@@ -6064,7 +6164,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join5(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join7(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
