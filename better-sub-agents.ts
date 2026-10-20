@@ -223,6 +223,194 @@ function resolveAppendSystemPrompt(input) {
 }
 __name(resolveAppendSystemPrompt, "resolveAppendSystemPrompt");
 
+// src/tool-filter.ts
+var SUBAGENT_TOOL_UNIVERSE = [
+  "Agent",
+  "Artifact",
+  "AskUserQuestion",
+  "Bash",
+  "Edit",
+  "EndConversation",
+  "EnterPlanMode",
+  "EnterWorktree",
+  "ExitPlanMode",
+  "ExitWorktree",
+  "Glob",
+  "Grep",
+  "LSP",
+  "ListAgents",
+  "Monitor",
+  "NotebookEdit",
+  "PowerShell",
+  "Read",
+  "ScheduleWakeup",
+  "SendMessage",
+  "Skill",
+  "SubagentHandback",
+  "TaskStop",
+  "TodoWrite",
+  "ToolSearch",
+  "WaitForMcpServers",
+  "WebFetch",
+  "WebSearch",
+  "Workflow",
+  "Write"
+];
+var UNIVERSAL_TOOL_REMOVALS = [
+  "AskUserQuestion",
+  "EndConversation",
+  "EnterPlanMode",
+  "ScheduleWakeup",
+  "WaitForMcpServers",
+  "Workflow"
+];
+var BACKGROUND_BUILTIN_TOOLS = [
+  "Read",
+  "Grep",
+  "Glob",
+  "LSP",
+  "Bash",
+  "PowerShell",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+  "WebFetch",
+  "WebSearch",
+  "TodoWrite",
+  "Skill",
+  "ToolSearch",
+  "EnterWorktree",
+  "ExitWorktree",
+  "Monitor",
+  "TaskStop",
+  "SendMessage",
+  "Artifact",
+  "SubagentHandback"
+];
+var EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
+var MCP_PREFIX = "mcp__";
+function unique(values) {
+  const out = [];
+  for (const value of values) if (!out.includes(value)) out.push(value);
+  return out;
+}
+__name(unique, "unique");
+var isMcpTool = /* @__PURE__ */ __name((name) => name.startsWith(MCP_PREFIX), "isMcpTool");
+function toolNameOfSpecifier(specifier) {
+  const text = String(specifier ?? "").trim();
+  const open = text.indexOf("(");
+  return (open >= 0 ? text.slice(0, open) : text).trim();
+}
+__name(toolNameOfSpecifier, "toolNameOfSpecifier");
+function mcpCapability(server) {
+  return `${MCP_PREFIX}${server}__*`;
+}
+__name(mcpCapability, "mcpCapability");
+function mcpParts(name) {
+  const rest = name.startsWith(MCP_PREFIX) ? name.slice(MCP_PREFIX.length) : name;
+  const separator = rest.indexOf("__");
+  if (separator < 0) return { server: rest };
+  return { server: rest.slice(0, separator), tool: rest.slice(separator + 2) };
+}
+__name(mcpParts, "mcpParts");
+function expandSpecifier(specifier, available, mcpServers) {
+  const name = toolNameOfSpecifier(specifier);
+  if (name.length === 0) return [];
+  const capabilities = mcpServers.map(mcpCapability);
+  if (name === "*") return [...available, ...capabilities];
+  if (name === `${MCP_PREFIX}*`) return capabilities;
+  if (isMcpTool(name)) {
+    const { server, tool } = mcpParts(name);
+    if (!mcpServers.includes(server)) return [];
+    if (tool === void 0 || tool === "*") return [mcpCapability(server)];
+    return [`${MCP_PREFIX}${server}__${tool}`];
+  }
+  return available.includes(name) ? [name] : [];
+}
+__name(expandSpecifier, "expandSpecifier");
+function withheldBy(specifier, capability) {
+  const name = toolNameOfSpecifier(specifier);
+  if (name.length === 0) return false;
+  if (name === "*") return true;
+  if (name === `${MCP_PREFIX}*`) return isMcpTool(capability);
+  if (isMcpTool(name)) {
+    if (!isMcpTool(capability)) return false;
+    const wanted = mcpParts(name);
+    const actual = mcpParts(capability);
+    if (wanted.server !== actual.server) return false;
+    if (wanted.tool === void 0 || wanted.tool === "*") return true;
+    return actual.tool === wanted.tool;
+  }
+  return capability === name;
+}
+__name(withheldBy, "withheldBy");
+var WORKER_TOOL_ALIASES = {
+  subagent_spawn: "Agent",
+  pubsub_fire: "Agent",
+  subagent_send: "SendMessage"
+};
+function workerToolAllowed(toolName, tools, disallowedTools = [], team = false) {
+  for (const specifier of disallowedTools) {
+    if (team && TEAM_TOOL_NAMES.includes(toolName)) continue;
+    if (withheldBy(specifier, toolName)) return false;
+  }
+  if (tools.includes(toolName)) return true;
+  const hostName = WORKER_TOOL_ALIASES[toolName];
+  if (hostName !== void 0 && tools.includes(hostName)) return true;
+  if (!isMcpTool(toolName)) return false;
+  if (tools.includes(`${MCP_PREFIX}*`)) return true;
+  return tools.includes(mcpCapability(mcpParts(toolName).server));
+}
+__name(workerToolAllowed, "workerToolAllowed");
+function filterTools(input = {}) {
+  const available = unique([
+    ...input.available ?? SUBAGENT_TOOL_UNIVERSE,
+    ...input.team === true ? TEAM_TOOL_NAMES : []
+  ]);
+  const mcpServers = unique(input.mcpServers ?? []);
+  const requested = input.tools === void 0 || input.tools.length === 0 ? void 0 : input.tools;
+  let selected;
+  if (requested === void 0) {
+    selected = [...available, ...mcpServers.map(mcpCapability)];
+  } else {
+    selected = [];
+    for (const specifier of requested) selected.push(...expandSpecifier(specifier, available, mcpServers));
+    selected = unique(selected);
+  }
+  for (const specifier of input.disallowedTools ?? []) {
+    selected = selected.filter((capability) => !withheldBy(specifier, capability));
+  }
+  const removed = [];
+  const kept = selected.filter((capability) => {
+    if (isMcpTool(capability)) return true;
+    if (UNIVERSAL_TOOL_REMOVALS.includes(capability)) {
+      removed.push(capability);
+      return false;
+    }
+    if (capability === "ExitPlanMode" && input.permissionMode !== "plan") {
+      removed.push(capability);
+      return false;
+    }
+    if (input.background === true && capability !== "Agent" && capability !== "ExitPlanMode" && !BACKGROUND_BUILTIN_TOOLS.includes(capability)) {
+      removed.push(capability);
+      return false;
+    }
+    return true;
+  });
+  if (input.team === true) {
+    for (const tool of TEAM_TOOL_NAMES) if (!kept.includes(tool)) kept.push(tool);
+  }
+  if (requested !== void 0 && kept.length === 0) {
+    return { ok: false, error: `tools list resolved to no available tool: ${requested.join(", ")}` };
+  }
+  return { ok: true, tools: kept, removed: removed.filter((tool) => !kept.includes(tool)) };
+}
+__name(filterTools, "filterTools");
+function nonEmpty(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
+}
+__name(nonEmpty, "nonEmpty");
+
 // src/index.ts
 function scanOutput(text) {
   const marker = "[harness: subagent output matched instruction-shaped pattern(s): ";
@@ -2903,192 +3091,6 @@ function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
   return { block: true, reason: `Blocked: ${escape}. This subagent is isolated in ${roots.worktree}.` };
 }
 __name(guardToolCall, "guardToolCall");
-var SUBAGENT_TOOL_UNIVERSE = [
-  "Agent",
-  "Artifact",
-  "AskUserQuestion",
-  "Bash",
-  "Edit",
-  "EndConversation",
-  "EnterPlanMode",
-  "EnterWorktree",
-  "ExitPlanMode",
-  "ExitWorktree",
-  "Glob",
-  "Grep",
-  "LSP",
-  "ListAgents",
-  "Monitor",
-  "NotebookEdit",
-  "PowerShell",
-  "Read",
-  "ScheduleWakeup",
-  "SendMessage",
-  "Skill",
-  "SubagentHandback",
-  "TaskStop",
-  "TodoWrite",
-  "ToolSearch",
-  "WaitForMcpServers",
-  "WebFetch",
-  "WebSearch",
-  "Workflow",
-  "Write"
-];
-var UNIVERSAL_TOOL_REMOVALS = [
-  "AskUserQuestion",
-  "EndConversation",
-  "EnterPlanMode",
-  "ScheduleWakeup",
-  "WaitForMcpServers",
-  "Workflow"
-];
-var BACKGROUND_BUILTIN_TOOLS = [
-  "Read",
-  "Grep",
-  "Glob",
-  "LSP",
-  "Bash",
-  "PowerShell",
-  "Edit",
-  "Write",
-  "NotebookEdit",
-  "WebFetch",
-  "WebSearch",
-  "TodoWrite",
-  "Skill",
-  "ToolSearch",
-  "EnterWorktree",
-  "ExitWorktree",
-  "Monitor",
-  "TaskStop",
-  "SendMessage",
-  "Artifact",
-  "SubagentHandback"
-];
-var EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"];
-var MCP_PREFIX = "mcp__";
-function unique(values) {
-  const out = [];
-  for (const value of values) if (!out.includes(value)) out.push(value);
-  return out;
-}
-__name(unique, "unique");
-var isMcpTool = /* @__PURE__ */ __name((name) => name.startsWith(MCP_PREFIX), "isMcpTool");
-function toolNameOfSpecifier(specifier) {
-  const text = String(specifier ?? "").trim();
-  const open = text.indexOf("(");
-  return (open >= 0 ? text.slice(0, open) : text).trim();
-}
-__name(toolNameOfSpecifier, "toolNameOfSpecifier");
-function mcpCapability(server) {
-  return `${MCP_PREFIX}${server}__*`;
-}
-__name(mcpCapability, "mcpCapability");
-function mcpParts(name) {
-  const rest = name.startsWith(MCP_PREFIX) ? name.slice(MCP_PREFIX.length) : name;
-  const separator = rest.indexOf("__");
-  if (separator < 0) return { server: rest };
-  return { server: rest.slice(0, separator), tool: rest.slice(separator + 2) };
-}
-__name(mcpParts, "mcpParts");
-function expandSpecifier(specifier, available, mcpServers) {
-  const name = toolNameOfSpecifier(specifier);
-  if (name.length === 0) return [];
-  const capabilities = mcpServers.map(mcpCapability);
-  if (name === "*") return [...available, ...capabilities];
-  if (name === `${MCP_PREFIX}*`) return capabilities;
-  if (isMcpTool(name)) {
-    const { server, tool } = mcpParts(name);
-    if (!mcpServers.includes(server)) return [];
-    if (tool === void 0 || tool === "*") return [mcpCapability(server)];
-    return [`${MCP_PREFIX}${server}__${tool}`];
-  }
-  return available.includes(name) ? [name] : [];
-}
-__name(expandSpecifier, "expandSpecifier");
-function withheldBy(specifier, capability) {
-  const name = toolNameOfSpecifier(specifier);
-  if (name.length === 0) return false;
-  if (name === "*") return true;
-  if (name === `${MCP_PREFIX}*`) return isMcpTool(capability);
-  if (isMcpTool(name)) {
-    if (!isMcpTool(capability)) return false;
-    const wanted = mcpParts(name);
-    const actual = mcpParts(capability);
-    if (wanted.server !== actual.server) return false;
-    if (wanted.tool === void 0 || wanted.tool === "*") return true;
-    return actual.tool === wanted.tool;
-  }
-  return capability === name;
-}
-__name(withheldBy, "withheldBy");
-var WORKER_TOOL_ALIASES = {
-  subagent_spawn: "Agent",
-  pubsub_fire: "Agent",
-  subagent_send: "SendMessage"
-};
-function workerToolAllowed(toolName, tools, disallowedTools = [], team = false) {
-  for (const specifier of disallowedTools) {
-    if (team && TEAM_TOOL_NAMES.includes(toolName)) continue;
-    if (withheldBy(specifier, toolName)) return false;
-  }
-  if (tools.includes(toolName)) return true;
-  const hostName = WORKER_TOOL_ALIASES[toolName];
-  if (hostName !== void 0 && tools.includes(hostName)) return true;
-  if (!isMcpTool(toolName)) return false;
-  if (tools.includes(`${MCP_PREFIX}*`)) return true;
-  return tools.includes(mcpCapability(mcpParts(toolName).server));
-}
-__name(workerToolAllowed, "workerToolAllowed");
-function filterTools(input = {}) {
-  const available = unique([
-    ...input.available ?? SUBAGENT_TOOL_UNIVERSE,
-    ...input.team === true ? TEAM_TOOL_NAMES : []
-  ]);
-  const mcpServers = unique(input.mcpServers ?? []);
-  const requested = input.tools === void 0 || input.tools.length === 0 ? void 0 : input.tools;
-  let selected;
-  if (requested === void 0) {
-    selected = [...available, ...mcpServers.map(mcpCapability)];
-  } else {
-    selected = [];
-    for (const specifier of requested) selected.push(...expandSpecifier(specifier, available, mcpServers));
-    selected = unique(selected);
-  }
-  for (const specifier of input.disallowedTools ?? []) {
-    selected = selected.filter((capability) => !withheldBy(specifier, capability));
-  }
-  const removed = [];
-  const kept = selected.filter((capability) => {
-    if (isMcpTool(capability)) return true;
-    if (UNIVERSAL_TOOL_REMOVALS.includes(capability)) {
-      removed.push(capability);
-      return false;
-    }
-    if (capability === "ExitPlanMode" && input.permissionMode !== "plan") {
-      removed.push(capability);
-      return false;
-    }
-    if (input.background === true && capability !== "Agent" && capability !== "ExitPlanMode" && !BACKGROUND_BUILTIN_TOOLS.includes(capability)) {
-      removed.push(capability);
-      return false;
-    }
-    return true;
-  });
-  if (input.team === true) {
-    for (const tool of TEAM_TOOL_NAMES) if (!kept.includes(tool)) kept.push(tool);
-  }
-  if (requested !== void 0 && kept.length === 0) {
-    return { ok: false, error: `tools list resolved to no available tool: ${requested.join(", ")}` };
-  }
-  return { ok: true, tools: kept, removed: removed.filter((tool) => !kept.includes(tool)) };
-}
-__name(filterTools, "filterTools");
-function nonEmpty(value) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
-}
-__name(nonEmpty, "nonEmpty");
 function resolveModel(input = {}) {
   const env = input.env ?? {};
   const envModel = nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
