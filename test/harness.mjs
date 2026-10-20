@@ -145,6 +145,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 	const notifyCalls = [];
 	const promptSubmits = [];
 	const stateValues = new Map();
+	let selectAnswer = () => undefined;
 
 	const api = {
 		// ---- registration
@@ -232,6 +233,7 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 				openPaneCalls.push(id);
 				return true;
 			},
+			select: async ({options}) => selectAnswer(options),
 			notify(message, level) {
 				notifyCalls.push({message, level});
 			},
@@ -265,6 +267,9 @@ export function makeApi({spoolDir, session, runtime, dirFlag = 'subagent_dir'}) 
 		userMessages,
 		notifyCalls,
 		promptSubmits,
+		setSelectAnswer(answer) {
+			selectAnswer = answer;
+		},
 	};
 }
 

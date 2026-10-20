@@ -100,6 +100,9 @@ const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
 // channel, and how long a foreground permission prompt waits for an answer.
 const CONTROL_POLL_MS = 100;
 const PERMISSION_TIMEOUT_MS = 30 * 1000;
+// A foreground prompt is answered by a person, so it gets a person's bound. The
+// 30s value only bounds the wait a background run never performs.
+const FOREGROUND_PERMISSION_TIMEOUT_MS = 10 * 60 * 1000;
 const ROSTER_MAIN = 'main';
 
 // Task rows. A success disappears immediately; a failure or stop stays visible for
@@ -501,7 +504,7 @@ const finish = (code, spawnError, signal) => {
   }
 
   const lastLine = tail.trimEnd().split('\\n').filter(line => line.trim()).pop() || '';
-  const failed = timedOut || spawnError !== undefined || (code !== 0 && code !== null);
+  const failed = timedOut || spawnError !== undefined || code !== 0 || (typeof signal === 'string' && signal.length > 0);
   const wantsInput = !failed && /\\?\\s*$/.test(lastLine);
   const detail = timedOut
     ? 'timed out after ' + timeoutLabel
@@ -2413,8 +2416,14 @@ export const BUILTIN_AGENT_DEFINITIONS: AgentDefinition[] = [
 ];
 
 export function builtinAgentDefinitions(env: Record<string, string | undefined>): AgentDefinition[] {
-	if (env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS === '1' || env.BETTER_SUBAGENTS_DISABLE_BUILTIN_AGENTS === '1') return [];
-	if (env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS === '1') {
+	if (
+		env.CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS === '1' ||
+		env.BETTER_SUBAGENTS_DISABLE_BUILTIN_AGENTS === '1' ||
+		env.BETTER_SUBAGENTS_DISABLE_BUILTINS === '1'
+	) {
+		return [];
+	}
+	if (env.CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS === '1' || env.BETTER_SUBAGENTS_DISABLE_EXPLORE_PLAN === '1') {
 		return BUILTIN_AGENT_DEFINITIONS.filter(definition => definition.name !== 'explore' && definition.name !== 'plan');
 	}
 	return [...BUILTIN_AGENT_DEFINITIONS];
@@ -3441,7 +3450,7 @@ export interface WorktreeSeam extends GitSeam {
 }
 
 export type IsolationResult =
-	| {readonly ok: true; readonly path: string; readonly base: string; readonly mainCheckouts: string[]}
+	| {readonly ok: true; readonly path: string; readonly base: string; readonly head?: string; readonly mainCheckouts: string[]}
 	| {readonly ok: false; readonly error: string};
 
 export interface WorktreeDecision {
@@ -3537,15 +3546,21 @@ export function createJobWorktree(seam: WorktreeSeam, opts: {cwd: string; path: 
 		const reason = firstLine(added.stderr) || firstLine(added.stdout) || `exit ${added.code}`;
 		return {ok: false, error: `isolation: worktree add failed: ${reason}`};
 	}
-	return {ok: true, path: opts.path, base, mainCheckouts: roots};
+	const head = seam.git(['rev-parse', 'HEAD'], opts.path);
+	const start = head.code === 0 ? firstLine(head.stdout) : '';
+	return {ok: true, path: opts.path, base, ...(start.length > 0 ? {head: start} : {}), mainCheckouts: roots};
 }
 
 // `undefined` is "git could not tell", which must keep the worktree: deleting on
 // uncertainty would discard a user's work.
-export function worktreeChanged(seam: GitSeam, path: string): boolean | undefined {
+export function worktreeChanged(seam: GitSeam, path: string, head?: string): boolean | undefined {
 	const status = seam.git(['status', '--porcelain'], path);
 	if (status.code !== 0) return undefined;
-	return status.stdout.trim().length > 0;
+	if (status.stdout.trim().length > 0) return true;
+	if (head === undefined) return false;
+	const current = seam.git(['rev-parse', 'HEAD'], path);
+	if (current.code !== 0) return undefined;
+	return firstLine(current.stdout) !== head;
 }
 
 /**
@@ -3556,13 +3571,16 @@ export function worktreeChanged(seam: GitSeam, path: string): boolean | undefine
  */
 export function finalizeWorktree(
 	seam: GitSeam,
-	record: {worktree?: string; worktreeRepo?: string; worktreeFinalized?: boolean},
+	record: {worktree?: string; worktreeRepo?: string; worktreeFinalized?: boolean; worktreeHead?: string; live?: boolean},
 ): WorktreeDecision | undefined {
 	if (typeof record.worktree !== 'string' || record.worktree.length === 0 || record.worktreeFinalized === true) {
 		return undefined;
 	}
 	const path = record.worktree;
-	const changed = worktreeChanged(seam, path);
+	// A live agent can still accept a follow-up, so its checkout must survive the
+	// first-turn result. The worker owns the later cleanup decision.
+	if (record.live === true) return {kept: true, path};
+	const changed = worktreeChanged(seam, path, record.worktreeHead);
 	if (changed === undefined) return {kept: true, path, error: 'git status failed; kept the worktree'};
 	if (changed) return {kept: true, path};
 	// Run in the repository root: `git worktree remove` from inside the worktree it
@@ -3857,7 +3875,14 @@ const WORKER_TOOL_ALIASES: Readonly<Record<string, string>> = {
 
 // The worker enforces the resolved set because ACP offers no per-session tool
 // filter. An MCP capability stands for every tool on its server.
-export function workerToolAllowed(toolName: string, tools: readonly string[]): boolean {
+export function workerToolAllowed(
+	toolName: string,
+	tools: readonly string[],
+	disallowedTools: readonly string[] = [],
+): boolean {
+	for (const specifier of disallowedTools) {
+		if (withheldBy(specifier, toolName)) return false;
+	}
 	if (tools.includes(toolName)) return true;
 	const hostName = WORKER_TOOL_ALIASES[toolName];
 	if (hostName !== undefined && tools.includes(hostName)) return true;
@@ -4460,6 +4485,10 @@ interface JobRecord extends JobIdentity {
 	/** Set once cleanup decided: the worktree was removed, or kept. */
 	worktreeFinalized?: boolean;
 	worktreeKept?: boolean;
+	/** The worktree's starting commit; a new HEAD means committed work. */
+	worktreeHead?: string;
+	/** A live agent may still accept a follow-up; its checkout must survive. */
+	live?: boolean;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;
@@ -6443,6 +6472,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			// The resolved policy, not the raw `run_in_background`: env and definition
 			// overrides are already applied by the caller.
 			background: intent.background !== false,
+			...(isAgent && intent.live !== false && intent.oneShot !== true ? {live: true} : {}),
 			cwd: intent.cwd,
 			logPath,
 			startedAt,
@@ -6584,6 +6614,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (isolation?.ok === true) {
 			record.worktree = isolation.path;
 			record.worktreeRepo = isolation.mainCheckouts[0];
+			if (isolation.head !== undefined) record.worktreeHead = isolation.head;
 			record.mainCheckouts = isolation.mainCheckouts;
 			record.cwd = isolation.path;
 		}
@@ -6602,7 +6633,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		}
 
 		const isAgent = intent.prompt !== undefined;
-		const live = isAgent && intent.live !== false;
+		const live = isAgent && intent.live !== false && intent.oneShot !== true;
 		// The roster is for an agent that can actually message a peer. Host definitions
 		// name the tool SendMessage; the mod registers it as subagent_send. A fork
 		// already has the conversation (and its roster) and gets no fresh bundle.
@@ -6630,7 +6661,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				startedAt,
 				tailMax: LOG_TAIL_BYTES_MAX,
 				controlPollMs: CONTROL_POLL_MS,
-				permissionTimeoutMs: PERMISSION_TIMEOUT_MS,
+				permissionTimeoutMs: intent.background === false ? FOREGROUND_PERMISSION_TIMEOUT_MS : PERMISSION_TIMEOUT_MS,
 				bin: isAgent ? (runtime.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 				sessionId,
 				...(intent.name !== undefined ? {name: intent.name} : {}),
@@ -6684,12 +6715,54 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return settleForeground(launched);
 	}
 
+	// A foreground worker cannot ask the human itself: it writes its permission
+	// request to its control dir and waits, bounded. This process owns the human, so
+	// it puts the request to them and writes the answer back. No answer (headless,
+	// dismissed) leaves the worker's own bound in charge instead of inventing one.
+	async function answerPendingPermission(controlDir: string, answered: Set<string>): Promise<void> {
+		let request: PermissionRequest;
+		try {
+			request = JSON.parse(spool.readFile(join(controlDir, 'permission.json'))) as PermissionRequest;
+		} catch {
+			return;
+		}
+		const key = String(request.requestId ?? '');
+		if (key.length === 0 || answered.has(key)) return;
+		const options = request.options ?? [];
+		const choices = options.map((option, index) => ({
+			label: option.name || option.kind || option.optionId || `option ${index + 1}`,
+			index,
+		}));
+		const ui = cmd.ui as unknown as {
+			select?: (ask: {title: string; options: Array<{label: string}>}) => Promise<string | undefined>;
+		};
+		if (typeof ui.select !== 'function') return;
+		const chosen = await ui.select({
+			title: `Approve "${String(request.title)}"?`,
+			options: choices.map(choice => ({label: choice.label})),
+		});
+		if (typeof chosen !== 'string') return;
+		answered.add(key);
+		const picked = choices.find(choice => choice.label === chosen);
+		const option = picked === undefined ? undefined : options[picked.index];
+		const response =
+			option === undefined
+				? {requestId: request.requestId, outcome: 'cancelled'}
+				: {requestId: request.requestId, optionId: option.optionId};
+		const file = join(controlDir, 'permission-response.json');
+		const tmp = `${file}.mod-${process.pid}-${runtime.now()}`;
+		spool.writeFile(tmp, JSON.stringify(response));
+		spool.rename(tmp, file);
+	}
+
 	// Foreground is a bounded wait on the same durable record a background job
 	// leaves behind. Completion is the record, never the process: a worker that died
 	// after writing its result must still return it.
 	async function settleForeground(launched: {readonly id: string; readonly pid: number}): Promise<Launch> {
 		const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
 		let record = readJob(launched.id);
+		const answered = new Set<string>();
+		const permissionDir = join(controlRoot, launched.id);
 		for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
 			if (backgroundedForegrounds.has(launched.id)) {
 				// Ctrl+B: stop waiting, but leave the worker alone. Its result now arrives
@@ -6706,6 +6779,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 					},
 				};
 			}
+			await answerPendingPermission(permissionDir, answered);
 			await runtime.sleep(FOREGROUND_POLL_MS);
 			record = readJob(launched.id);
 		}
@@ -7214,7 +7288,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		const offset = Number(input.offset);
 		let body: string;
 		let note = '';
-		if (Number.isFinite(offset) && offset > 0) {
+		if (input.offset !== undefined && Number.isFinite(offset) && offset >= 0) {
 			body = log.slice(offset, offset + maxChars);
 			note = `\n[chars ${offset}-${Math.min(log.length, offset + maxChars)} of ${log.length}]`;
 		} else if (log.length > maxChars) {
@@ -7351,10 +7425,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// A resume is a fresh job: it follows the default (background) and the
 		// definition's pinned background, not the mode of the run it resumes.
 		const background =
-			resolveExecutionPolicy({
-				definitionBackground: definition?.ok === true ? definition.definition.background : undefined,
-				env: runtime.env,
-			}) === 'background';
+			record.teamName !== undefined
+				? false
+				: resolveExecutionPolicy({
+						definitionBackground: definition?.ok === true ? definition.definition.background : undefined,
+						env: runtime.env,
+					}) === 'background';
 		const resumedMcp =
 			resumeDefinition === undefined
 				? (record.mcpServers ?? [])
@@ -7401,6 +7477,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			resumeSession: record.acpSessionId,
 			resumedFrom: jobId,
 			...(record.name !== undefined ? {name: record.name} : {}),
+			...(record.teamName !== undefined ? {teamName: record.teamName} : {}),
 			...(record.owner !== undefined ? {owner: record.owner} : {}),
 		});
 		if (!launched.ok) return badInput(launched.error);
@@ -7485,6 +7562,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	async function sendToRecord(record: JobRecord, message: string, from: string): Promise<ToolResult> {
 		const label = String(record.name ?? record.id);
 		const {alive, busy} = liveState(record);
+		if (!alive && record.fork !== true && record.agentId === undefined) {
+			return badInput(`subagent: ${label} is one-shot (no agent id); it cannot be messaged`);
+		}
 		if (alive) {
 			if (!appendLive(record.id, from, message)) return badInput(`cannot reach ${label}: its control queue is not writable`);
 			return okText(
@@ -7542,6 +7622,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
 			model: record.model,
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			...(record.mcpServers !== undefined ? {mcpServers: record.mcpServers} : {}),
 			...(record.autoCompactWindow !== undefined ? {autoCompactWindow: record.autoCompactWindow} : {}),
 			...(record.cacheTtl !== undefined ? {cacheTtl: record.cacheTtl} : {}),
 			...(record.color !== undefined ? {color: record.color} : {}),
@@ -8108,6 +8189,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// The resolved pool, enforced where the tools run. ACP has no per-session tool
 	// filter, so this is the only place the definition's `tools` can hold.
 	const workerTools = workerMode && Array.isArray(workerSpec?.tools) ? workerSpec.tools : undefined;
+	const workerDisallowed =
+		workerMode && Array.isArray(workerSpec?.disallowedTools) ? workerSpec.disallowedTools : undefined;
 	const workerHookCwd = String(workerSpec?.cwd ?? runtime.cwd);
 	const workerHookAgent = workerSpec?.agentType;
 
@@ -8146,16 +8229,20 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		// A blocked tool returns the reason as its result, so the model learns where it
 		// is allowed to work instead of silently retrying. The definition's PreToolUse
 		// hooks run after the isolation guard: a hook cannot widen a worktree.
-		...(isolation !== undefined || workerHooks?.PreToolUse !== undefined || workerTools !== undefined
+		...(isolation !== undefined || workerHooks?.PreToolUse !== undefined || workerTools !== undefined || workerDisallowed !== undefined
 			? {
 					beforeToolCall: (call: {toolName?: string; input?: Record<string, unknown>}) => {
 						const toolName = String(call?.toolName ?? '');
-						if (workerTools !== undefined && !workerToolAllowed(toolName, workerTools)) {
+						const denied =
+							workerTools !== undefined
+								? !workerToolAllowed(toolName, workerTools, workerDisallowed ?? [])
+								: (workerDisallowed ?? []).some(specifier => withheldBy(specifier, toolName));
+						if (denied) {
 							return {
 								block: true,
 								additionalContext:
 									`subagent: "${toolName}" is not in this agent's resolved tool set` +
-									(workerTools.length > 0 ? ` (${workerTools.join(', ')})` : '') +
+									(workerTools !== undefined && workerTools.length > 0 ? ` (${workerTools.join(', ')})` : '') +
 									'. Use only the listed tools.',
 							};
 						}

@@ -3915,7 +3915,7 @@ process.stdin.on('data', (data) => {
 
 	writeFileSync(
 		join(liveSpool, 'jobs', 'live-1.json'),
-		JSON.stringify({...liveRecord, state: 'done', workerPid: undefined, acpSessionId: 'acp-old', finishedAt: 2, durationMs: 1}),
+		JSON.stringify({...liveRecord, state: 'done', workerPid: undefined, agentId: 'agent-live', acpSessionId: 'acp-old', finishedAt: 2, durationMs: 1}),
 	);
 	const spawnsBefore = sendRuntime.spawnCalls.length;
 	const resumedLive = await sendTool.run({input: {to: 'Tester', message: 'after finish'}});
@@ -5428,6 +5428,7 @@ process.stdin.on('data', (data) => {
 			state: 'done',
 			teamName: 'crew',
 			agentType: 'general-purpose',
+			agentId: 'agent-mate',
 			acpSessionId: 'acp-mate',
 			cwd: mateRoot,
 			owner: ownerEntries(mateSession)[0],
@@ -5897,6 +5898,260 @@ process.stdin.on('data', (data) => {
 		'the deviation is recorded in the job log',
 	);
 	ok('auto permission mode maps to the prompting mode and logs the deviation');
+
+	// 103. Greptile: a signal-terminated command is a failure, not success -----
+	const grepDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-'));
+	const grepSpec = {
+		id: 'sigterm',
+		description: 'sigterm',
+		kind: 'command',
+		owner: 'owner-greptile',
+		cwd: grepDir,
+		logPath: join(grepDir, 'logs', 'sigterm.log'),
+		inboxDir: join(grepDir, 'inbox'),
+		jobsDir: join(grepDir, 'jobs'),
+		startedAt: 1000,
+		tailMax: 4000,
+		bin: '/bin/sh',
+		args: ['-c', 'true'],
+	};
+	mkdirSync(join(grepDir, 'logs'), {recursive: true});
+	mkdirSync(join(grepDir, 'inbox'), {recursive: true});
+	mkdirSync(join(grepDir, 'jobs'), {recursive: true});
+	const sigterm = makeWorkerDriver(grepSpec);
+	sigterm.emit('exit', null, 'SIGTERM');
+	const sigtermRecord = JSON.parse(readFileSync(join(grepDir, 'jobs', 'sigterm.json'), 'utf8'));
+	assert.equal(sigtermRecord.state, 'failed', 'a signal-terminated command is a failure, not done');
+	assert.match(sigtermRecord.failureReason, /terminated by SIGTERM/);
+	ok('greptile: a signal-terminated command reports failed');
+
+	// 104. Greptile: offset 0 reads the first page, not the tail --------------
+	const pageDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-page-'));
+	const pageRuntime = makeRuntime({now: () => fixedNow});
+	const page = makeApi({spoolDir: pageDir, session: makeSession(), runtime: pageRuntime.runtime});
+	mod(page.api, page.runtime);
+	await toolOf(page, 'subagent_spawn').run({input: {description: 'page', command: 'true'}});
+	const pageId = JSON.parse(pageRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC).id;
+	writeFileSync(join(pageDir, 'logs', `${pageId}.log`), 'START' + 'x'.repeat(1000) + 'END');
+	const firstPage = await toolOf(page, 'subagent_output').run({input: {id: pageId, offset: 0, max_chars: 3}});
+	assert.match(firstPage.content[0].text, /START/, 'offset 0 returns the first page, not the tail');
+	ok('greptile: offset 0 reads the first page');
+
+	// 105. Greptile: the documented disable names remove built-ins ------------
+	assert.equal(
+		modExports.builtinAgentDefinitions({BETTER_SUBAGENTS_DISABLE_BUILTINS: '1'}).length,
+		0,
+		'BETTER_SUBAGENTS_DISABLE_BUILTINS removes every built-in',
+	);
+	const noExplorePlan = modExports.builtinAgentDefinitions({BETTER_SUBAGENTS_DISABLE_EXPLORE_PLAN: '1'});
+	assert.equal(
+		noExplorePlan.filter((definition) => definition.name === 'explore' || definition.name === 'plan').length,
+		0,
+		'BETTER_SUBAGENTS_DISABLE_EXPLORE_PLAN removes Explore and Plan',
+	);
+	ok('greptile: the documented disable names remove built-ins');
+
+	// 106. Greptile: a foreground permission request reaches the human --------
+	// The parent, not the worker, owns the human. The fake UI answers "Allow"; the
+	// parent must write that decision back to the worker's control dir.
+	const permUiDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-perm-'));
+	const permSpecs = [];
+	let permSleeps = 0;
+	const permCase = modeCase(permUiDir, {
+		spawn(_command, _args, options) {
+			permSpecs.push(JSON.parse(options.env.SUBAGENT_SPEC));
+			return makeChild();
+		},
+		async sleep() {
+			if (permSpecs.length === 0) return;
+			const controlDir = join(permUiDir, 'control', permSpecs[0].id);
+			if (permSleeps === 0) {
+				mkdirSync(controlDir, {recursive: true});
+				writeFileSync(
+					join(controlDir, 'permission.json'),
+					JSON.stringify({
+						requestId: 7,
+						title: 'Write file',
+						options: [
+							{optionId: 'allow-once', kind: 'allow_once', name: 'Allow'},
+							{optionId: 'reject-once', kind: 'reject_once', name: 'Reject'},
+						],
+					}),
+				);
+				permSleeps = 1;
+				return;
+			}
+			if (existsSync(join(controlDir, 'permission-response.json'))) {
+				settleJob(permUiDir, permSpecs[0], {state: 'done', log: 'AFTER APPROVAL'});
+			}
+		},
+	});
+	permCase.bundle.setSelectAnswer(() => 'Allow');
+	const permOut = await toolOf(permCase.bundle, 'subagent_spawn').run({
+		input: {description: 'perm', prompt: 'work', run_in_background: false},
+	});
+	assert.equal(permOut.ok, true, `the approved foreground run must finish: ${JSON.stringify(permOut)}`);
+	assert.match(permOut.content[0].text, /AFTER APPROVAL/, 'the approved run continues');
+	const permResponse = JSON.parse(
+		readFileSync(join(permUiDir, 'control', permSpecs[0].id, 'permission-response.json'), 'utf8'),
+	);
+	assert.equal(permResponse.requestId, 7, 'the response answers the request');
+	assert.equal(permResponse.optionId, 'allow-once', 'the selected option reaches the worker');
+	ok('greptile: a foreground permission request is answered inline');
+
+	// 107. Greptile: committed work and a live session keep their checkout ----
+	const committedGit = gitSeam({
+		'status --porcelain': {code: 0, stdout: '', stderr: ''},
+		'rev-parse HEAD': {code: 0, stdout: 'new-head\n', stderr: ''},
+	});
+	const committed = finalizeWorktree(committedGit, {
+		worktree: '/spool/worktrees/committed',
+		worktreeRepo: '/repo',
+		worktreeHead: 'old-head',
+	});
+	assert.deepEqual(committed, {kept: true, path: '/spool/worktrees/committed'}, 'a new commit keeps the worktree');
+	assert.ok(
+		!committedGit.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'),
+		'committed work is never removed',
+	);
+
+	const liveGit = gitSeam({'status --porcelain': {code: 0, stdout: '', stderr: ''}});
+	const liveDecision = finalizeWorktree(liveGit, {worktree: '/spool/worktrees/live', worktreeRepo: '/repo', live: true});
+	assert.equal(liveDecision.kept, true, 'a live agent keeps its worktree');
+	assert.ok(
+		!liveGit.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'),
+		'a live worktree is never removed',
+	);
+
+	const headRepo = gitSeam({
+		'rev-parse --show-toplevel': {code: 0, stdout: '/repo\n', stderr: ''},
+		'rev-parse --path-format=absolute --git-common-dir': {code: 0, stdout: '/repo/.git\n', stderr: ''},
+		'symbolic-ref --short refs/remotes/origin/HEAD': {code: 0, stdout: 'origin/main\n', stderr: ''},
+		'rev-parse --verify': {code: 0, stdout: '', stderr: ''},
+		'worktree add': {code: 0, stdout: '', stderr: ''},
+		'rev-parse HEAD': {code: 0, stdout: 'base-head\n', stderr: ''},
+	});
+	const createdHead = createJobWorktree(
+		{git: headRepo.git, fs: {mkdir() {}}},
+		{cwd: '/repo', path: '/spool/worktrees/head'},
+	);
+	assert.equal(createdHead.head, 'base-head', 'creation records the starting commit');
+	ok('greptile: committed work and a live session keep their checkout');
+
+	// 108. Greptile: a specific MCP deny beats the server wildcard ------------
+	const deniedTools = modExports.filterTools({
+		available: ['Read'],
+		mcpServers: ['docs'],
+		tools: ['mcp__docs__*'],
+		disallowedTools: ['mcp__docs__delete'],
+	});
+	assert.equal(deniedTools.ok, true, 'the wildcard tool list resolves');
+	assert.equal(
+		modExports.workerToolAllowed('mcp__docs__delete', deniedTools.tools, ['mcp__docs__delete']),
+		false,
+		'a specific MCP deny beats an inherited server wildcard',
+	);
+	assert.equal(
+		modExports.workerToolAllowed('mcp__docs__read', deniedTools.tools, ['mcp__docs__delete']),
+		true,
+		'other tools on the same server stay allowed',
+	);
+	ok('greptile: a specific MCP deny beats the server wildcard');
+
+	// 109. Greptile: a one-shot agent cannot be messaged ----------------------
+	const grepSendCase = modeCase(mkdtempSync(join(tmpdir(), 'subagent-greptile-send-')));
+	const grepSendOwner = ownerEntries(grepSendCase.session)[0];
+	const grepOneShotRecord = {
+		id: 'one-shot',
+		owner: grepSendOwner,
+		description: 'Plan',
+		kind: 'agent',
+		name: 'Plan',
+		state: 'done',
+		agentType: 'plan',
+		prompt: 'first task',
+		acpSessionId: 'acp-plan',
+		startedAt: MODE_NOW,
+		updatedAt: MODE_NOW,
+		finishedAt: MODE_NOW,
+		cwd: grepSendCase.dir,
+		logPath: join(grepSendCase.dir, 'logs', 'one-shot.log'),
+		sessionId: 'sess',
+	};
+	writeFileSync(join(grepSendCase.dir, 'jobs', 'one-shot.json'), JSON.stringify(grepOneShotRecord));
+	const grepOneShotSend = await toolOf(grepSendCase.bundle, 'subagent_send').run({input: {to: 'Plan', message: 'again'}});
+	assert.equal(grepOneShotSend.ok, false, 'a one-shot agent has no agent id to message');
+	assert.match(grepOneShotSend.error, /one-shot|no agent id/, 'the refusal names the one-shot rule');
+	ok('greptile: a one-shot agent cannot be messaged');
+
+	// 110. Greptile: a resumed teammate stays foreground and in its team -----
+	const grepTeamCase = modeCase(mkdtempSync(join(tmpdir(), 'subagent-greptile-team-')));
+	const grepTeamOwner = ownerEntries(grepTeamCase.session)[0];
+	const grepTeamRecord = {
+		id: 'team-resume',
+		owner: grepTeamOwner,
+		description: 'Mate',
+		kind: 'agent',
+		name: 'Mate',
+		teamName: 'Team',
+		state: 'done',
+		agentType: 'general-purpose',
+		agentId: 'agent-mate',
+		prompt: 'first task',
+		acpSessionId: 'acp-mate',
+		model: 'sonnet',
+		effort: 'low',
+		permissionMode: 'default',
+		startedAt: MODE_NOW,
+		updatedAt: MODE_NOW,
+		finishedAt: MODE_NOW,
+		cwd: grepTeamCase.dir,
+		logPath: join(grepTeamCase.dir, 'logs', 'team-resume.log'),
+		sessionId: 'sess',
+	};
+	writeFileSync(join(grepTeamCase.dir, 'jobs', 'team-resume.json'), JSON.stringify(grepTeamRecord));
+	const grepTeamResume = await toolOf(grepTeamCase.bundle, 'subagent_resume').run({
+		input: {id: 'agent-mate', prompt: 'continue'},
+	});
+	assert.ok(
+		grepTeamCase.rt.spawnCalls.length > 0,
+		`a teammate resume must spawn a foreground worker: ${JSON.stringify(grepTeamResume)}`,
+	);
+	const grepTeamSpec = JSON.parse(grepTeamCase.rt.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.equal(grepTeamSpec.background, false, 'a resumed teammate stays foreground');
+	assert.equal(grepTeamSpec.teamName, 'Team', 'the team survives resume');
+	ok('greptile: a resumed teammate stays foreground and in its team');
+
+	// 111. Greptile: a follow-up keeps the recorded MCP servers --------------
+	const grepMcpCase = modeCase(mkdtempSync(join(tmpdir(), 'subagent-greptile-mcp-')));
+	const grepMcpOwner = ownerEntries(grepMcpCase.session)[0];
+	const grepMcpRecord = {
+		id: 'mcp-send',
+		owner: grepMcpOwner,
+		description: 'Mcp',
+		kind: 'agent',
+		name: 'Mcp',
+		state: 'done',
+		agentType: 'general-purpose',
+		agentId: 'agent-mcp',
+		prompt: 'first task',
+		acpSessionId: 'acp-mcp',
+		mcpServers: [{name: 'docs'}],
+		startedAt: MODE_NOW,
+		updatedAt: MODE_NOW,
+		finishedAt: MODE_NOW,
+		cwd: grepMcpCase.dir,
+		logPath: join(grepMcpCase.dir, 'logs', 'mcp-send.log'),
+		sessionId: 'sess',
+	};
+	writeFileSync(join(grepMcpCase.dir, 'jobs', 'mcp-send.json'), JSON.stringify(grepMcpRecord));
+	const grepMcpSend = await toolOf(grepMcpCase.bundle, 'subagent_send').run({
+		input: {to: 'Mcp', message: 'use docs'},
+	});
+	assert.ok(grepMcpCase.rt.spawnCalls.length > 0, `a follow-up must spawn a worker: ${JSON.stringify(grepMcpSend)}`);
+	const grepMcpSpec = JSON.parse(grepMcpCase.rt.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
+	assert.deepEqual(grepMcpSpec.mcpServers, [{name: 'docs'}], 'the follow-up keeps the recorded MCP servers');
+	ok('greptile: a follow-up keeps the recorded MCP servers');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {
