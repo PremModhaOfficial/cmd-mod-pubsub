@@ -67,15 +67,11 @@ import {
 	AGENT_NAME_MAX,
 	AGENT_SCAN_DEPTH_MAX,
 	AGENT_SCAN_MAX,
-	BACKGROUND_DISABLE_ENV,
-	BACKGROUND_DISABLE_ENV_ALIAS,
 	CLI_AGENTS_OPTION,
 	DELIVERED_LEDGER_KEEP,
 	DELIVERED_LEDGER_MAX,
 	DRAIN_INTERVAL_MS,
 	FORK_AGENT_TYPE,
-	FORK_MODE_ENV,
-	FORK_MODE_ENV_ALIAS,
 	FORK_MODE_FLAG,
 	HOST_RESERVED_AGENT_NAMES,
 	LEDGER_COMPACT_BYTES,
@@ -94,15 +90,12 @@ import {
 	REFRESH_INTERVAL_MS,
 	RETENTION_SWEEP_INTERVAL_MS,
 	ROSTER_MAIN,
-	SDK_ENV,
-	SDK_ENV_ALIAS,
 	SUBAGENT_DIR_DEFAULT,
 	TASK_ROW_GRACE_MS,
 	TEAM_TOOL_NAMES,
 	WAIT_DEFAULT_MS,
 	WAIT_MAX_MS,
 	WAIT_POLL_MS,
-	WORKER_ENV,
 	WORKER_SPEC_ENV,
 } from './constants.ts';
 import type {
@@ -136,6 +129,28 @@ import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Ownership} from './signals.ts';
 import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
+import {
+	agentNameFromEnv,
+	agentSdk,
+	backgroundDisabled,
+	contextWindowOverride,
+	crossSessionEnabled,
+	effortLevel,
+	effortLevelFromEnv,
+	forkModeFromEnv,
+	managedSettingsDir,
+	managedSettingsHome,
+	mainPermissionModeFromEnv,
+	mcpPolicy,
+	optionList,
+	optionValue,
+	pickOption,
+	policyFiles,
+	subagentModel,
+	subagentModelForced,
+	toggle,
+	workerModeFromEnv,
+} from './config.ts';
 import {createJobWorktree, gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
 import {createWorktreeLifecycle, sweepExpiredEntries} from './worktree-lifecycle.ts';
 import {planFromInput, planFromRecord, recordFromPlan, sessionNameOf} from './plan.ts';
@@ -1694,18 +1709,14 @@ export function claudeMdHierarchy(options: StartupOptions): {claudeMd: StartupFi
 	// Explore and Plan start without project instructions, but a path-scoped
 	// CLAUDE.md still loads because the agent works with files there.
 	const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
+	const policy = policyFiles(env, options.home);
 	// Managed policy loads even under omitClaudeMd, except for a managed agent.
 	if (!skipHierarchy && definition?.scope !== 'managed') {
-		const managedPath =
-			env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join(options.home, '.commandcode', 'managed', 'CLAUDE.md');
-		const managed = startupFile(fs, managedPath);
+		const managed = startupFile(fs, policy.managed);
 		if (managed !== undefined) claudeMd.push(managed);
 	}
 	if (!skipHierarchy && definition?.omitClaudeMd !== true) {
-		const user = startupFile(
-			fs,
-			env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join(options.home, '.commandcode', 'CLAUDE.md'),
-		);
+		const user = startupFile(fs, policy.user);
 		if (user !== undefined) claudeMd.push(user);
 		for (const dir of projectDirsUpward(options.cwd, options.fs)) {
 			const project = startupFile(fs, join(dir, 'CLAUDE.md'));
@@ -1804,8 +1815,8 @@ export function contextWindowForModel(
 	model: string | undefined,
 	env: Record<string, string | undefined> = {},
 ): number {
-	const override = Number(env.BETTER_SUBAGENTS_CONTEXT_WINDOW ?? env.CLAUDE_CODE_CONTEXT_WINDOW);
-	if (Number.isFinite(override) && override >= 1000) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
+	const override = contextWindowOverride(env);
+	if (override !== undefined && override >= 1000) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
 	const value = (model ?? '').toLowerCase();
 	for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
 		if (pattern.test(value)) return window;
@@ -1981,13 +1992,8 @@ export interface ModelResolution {
 // environment value win over the parameter and the frontmatter.
 export function resolveModel(input: ModelResolutionInput = {}): ModelResolution {
 	const env = input.env ?? {};
-	const envModel =
-		nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
-	const forced =
-		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === '1' ||
-		env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === 'true' ||
-		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === '1' ||
-		env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === 'true';
+	const envModel = subagentModel(env);
+	const forced = subagentModelForced(env);
 	const main = nonEmpty(input.main);
 	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
 
@@ -2018,21 +2024,15 @@ export interface EffortResolution {
 	source: EffortSource;
 }
 
-function effortLevel(value: unknown): string | undefined {
-	const level = nonEmpty(value)?.toLowerCase();
-	return level !== undefined && (EFFORT_LEVELS as readonly string[]).includes(level) ? level : undefined;
-}
-
 // Per-invocation, frontmatter, environment. There is no effort inheritance from the
 // main conversation: the runtime default applies when nothing is set.
 export function resolveEffort(input: EffortResolutionInput = {}): EffortResolution {
 	const env = input.env ?? {};
-	const requested = effortLevel(input.requested);
+	const requested = effortLevel(input.requested, EFFORT_LEVELS);
 	if (requested !== undefined) return {effort: requested, source: 'parameter'};
-	const definition = effortLevel(input.definition);
+	const definition = effortLevel(input.definition, EFFORT_LEVELS);
 	if (definition !== undefined) return {effort: definition, source: 'definition'};
-	const fromEnv =
-		effortLevel(env.BETTER_SUBAGENTS_EFFORT_LEVEL) ?? effortLevel(env.CLAUDE_CODE_EFFORT_LEVEL);
+	const fromEnv = effortLevelFromEnv(env, EFFORT_LEVELS);
 	if (fromEnv !== undefined) return {effort: fromEnv, source: 'environment'};
 	return {effort: undefined, source: 'none'};
 }
@@ -2167,7 +2167,7 @@ export function agentFolderTrusted(
 	const trustedRoots = [
 		roots.cwd,
 		roots.home,
-		roots.managedDir ?? join(roots.home, '.commandcode', 'managed'),
+		roots.managedDir ?? managedSettingsHome(roots.home),
 		...(roots.addDirs ?? []),
 	];
 	return trustedRoots.some(root => root.length > 0 && isInside(root, absolute));
@@ -2193,13 +2193,6 @@ export interface McpResolution {
 	readonly dropped: McpDrop[];
 }
 
-function commaList(value: string | undefined): string[] {
-	return String(value ?? '')
-		.split(',')
-		.map(item => item.trim())
-		.filter(Boolean);
-}
-
 // The one resolution: a name resolves from configured servers, an inline entry
 // needs trust, and strict/bare/allow/deny policies apply afterwards. The result
 // is what `session/new` receives, so the scope is exactly this agent's.
@@ -2211,15 +2204,14 @@ export function resolveAgentMcpServers(input: McpResolutionInput = {}): McpResol
 		for (const spec of defined) dropped.push({name: spec.name, reason: 'plugin definitions ignore mcpServers'});
 		return {servers: [], dropped};
 	}
-	const bare = env.BETTER_SUBAGENTS_BARE ?? env.CLAUDE_CODE_BARE;
-	if (bare === '1' || bare === 'true') {
+	const policy = mcpPolicy(env);
+	if (policy.bare) {
 		for (const spec of defined) dropped.push({name: spec.name, reason: 'bare mode disables MCP'});
 		return {servers: [], dropped};
 	}
-	const strictConfig = env.BETTER_SUBAGENTS_STRICT_MCP_CONFIG ?? env.CLAUDE_CODE_STRICT_MCP_CONFIG;
-	const strict = strictConfig === '1' || strictConfig === 'true';
-	const allow = commaList(env.BETTER_SUBAGENTS_MCP_ALLOW ?? env.CLAUDE_CODE_MCP_ALLOW);
-	const deny = commaList(env.BETTER_SUBAGENTS_MCP_DENY ?? env.CLAUDE_CODE_MCP_DENY);
+	const strict = policy.strict;
+	const allow = policy.allow;
+	const deny = policy.deny;
 	const trusted = input.trusted !== false;
 	const servers: AgentMcpServer[] = [];
 	const seen = new Set<string>();
@@ -2375,12 +2367,7 @@ export interface ExecutionPolicyInput {
 }
 
 export function resolveExecutionPolicy(input: ExecutionPolicyInput): ExecutionMode {
-	const isSet = (value: string | undefined): boolean => {
-		if (value === undefined) return false;
-		const normalized = value.trim().toLowerCase();
-		return normalized.length > 0 && normalized !== '0' && normalized !== 'false' && normalized !== 'no';
-	};
-	if (isSet(input.env[BACKGROUND_DISABLE_ENV]) || isSet(input.env[BACKGROUND_DISABLE_ENV_ALIAS])) return 'foreground';
+	if (backgroundDisabled(input.env)) return 'foreground';
 	if (input.definitionBackground === true) return 'background';
 	if (input.requested === false) return 'foreground';
 	return 'background';
@@ -2406,25 +2393,13 @@ export interface ForkModeInput {
 	readonly flag?: string;
 }
 
-function forkToggle(value: unknown): ForkMode | undefined {
-	if (typeof value !== 'string') return undefined;
-	const normalized = value.trim().toLowerCase();
-	if (['on', 'true', '1', 'yes'].includes(normalized)) return 'on';
-	if (['off', 'false', '0', 'no'].includes(normalized)) return 'off';
-	return undefined;
-}
-
 export function resolveForkMode(input: ForkModeInput = {}): ForkMode {
-	const flag = forkToggle(input.flag);
+	const flag = toggle(input.flag);
 	if (flag !== undefined) return flag;
 	const env = input.env ?? {};
-	const fromEnv = forkToggle(env[FORK_MODE_ENV]) ?? forkToggle(env[FORK_MODE_ENV_ALIAS]);
+	const fromEnv = forkModeFromEnv(env);
 	if (fromEnv !== undefined) return fromEnv;
-	const inSdk =
-		input.sdk === true ||
-		forkToggle(env[SDK_ENV]) === 'on' ||
-		forkToggle(env[SDK_ENV_ALIAS]) === 'on' ||
-		forkToggle(env.COMMANDCODE_SDK) === 'on';
+	const inSdk = input.sdk === true || agentSdk(env);
 	if (inSdk) return 'off';
 	return input.interactive === true ? 'on' : 'off';
 }
@@ -2675,26 +2650,12 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		description: 'File whose text is appended to every subagent system prompt.',
 	});
 
-	const readFlag = (name: string): string => String(cmd.getFlag(name) ?? '');
-	// A flag still sitting on its default is not an override; anything else is.
-	const pick = (primary: string, primaryDefault: string, legacy: string, legacyDefault: string): string => {
-		const value = readFlag(primary);
-		if (value.length > 0 && value !== primaryDefault) return value;
-		const old = readFlag(legacy);
-		if (old.length > 0 && old !== legacyDefault) return old;
-		return value.length > 0 ? value : legacyDefault;
-	};
-	const splitFlag = (name: string): string[] =>
-		readFlag(name)
-			.split(',')
-			.map(value => value.trim())
-			.filter(value => value.length > 0);
 	// The flag's directories plus any `/add-dir` the user ran. One array, mutated in
 	// place, so the registry, the MCP trust roots and every refresh agree.
-	const addDirs = splitFlag(ADD_DIRS_OPTION);
+	const addDirs = optionList(cmd, ADD_DIRS_OPTION);
 	// A headless worker loads this mod too. It has its own owner token and must never
 	// steal an unaddressed signal from the session that fired it.
-	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
+	const workerMode = workerModeFromEnv(runtime.env);
 	// The worker carries the parent's absolute spool paths in its spec; derive the
 	// root from them so send, handback, and nested spawns use the same spool.
 	const workerRoot = (() => {
@@ -2706,11 +2667,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			return undefined;
 		}
 	})();
-	const root = workerRoot ?? resolve(pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT));
+	const root = workerRoot ?? resolve(pickOption(cmd, 'subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT));
 	const forkMode = resolveForkMode({
 		interactive: runtime.interactive === true,
 		env: runtime.env,
-		flag: readFlag(FORK_MODE_FLAG),
+		flag: optionValue(cmd, FORK_MODE_FLAG),
 	});
 	const forkModeEnabled = forkMode === 'on';
 	const inboxDir = join(root, 'inbox');
@@ -2732,7 +2693,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// first event (and the suite). Absent means `default`, the safe reading: a
 	// definition can then never grant itself bypass.
 	let mainPermissionMode: CanonicalPermissionMode | undefined = canonicalPermissionMode(
-		runtime.env.BETTER_SUBAGENTS_MAIN_PERMISSION_MODE,
+		mainPermissionModeFromEnv(runtime.env),
 	);
 	function noteMainPermissionMode(value: unknown): void {
 		const mode = canonicalPermissionMode(value);
@@ -2748,10 +2709,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		cwd: runtime.cwd,
 		home: runtime.home,
 		builtins: builtinAgentDefinitions(runtime.env),
-		managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+		managedDir: managedSettingsDir(cmd),
 		addDirs,
-		pluginRoots: splitFlag(PLUGIN_DIRS_OPTION),
-		cli: {value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true},
+		pluginRoots: optionList(cmd, PLUGIN_DIRS_OPTION),
+		cli: {value: optionValue(cmd, CLI_AGENTS_OPTION), interactive: runtime.interactive === true},
 		log: message => {
 			try {
 				spool.appendFile(join(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}\n`);
@@ -2809,7 +2770,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// deviation. A worker never sets one: it is already an agent.
 	const sessionAgentName = (): string => {
 		if (workerMode) return '';
-		return (readFlag('agent') || runtime.env.BETTER_SUBAGENTS_AGENT || runtime.env.CLAUDE_CODE_AGENT || '').trim();
+		return (optionValue(cmd, 'agent') || agentNameFromEnv(runtime.env)).trim();
 	};
 	function sessionAgent(): AgentDefinition | undefined {
 		const name = sessionAgentName();
@@ -2841,8 +2802,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		workerMode && typeof workerSpec?.appendSystemPrompt === 'string'
 			? workerSpec.appendSystemPrompt
 			: resolveAppendSystemPrompt({
-					flag: readFlag('append_subagent_system_prompt'),
-					file: readFlag('append_subagent_system_prompt_file'),
+					flag: optionValue(cmd, 'append_subagent_system_prompt'),
+					file: optionValue(cmd, 'append_subagent_system_prompt_file'),
 					env: runtime.env,
 					fs: spool,
 					cwd: cmd.cwd,
@@ -2921,7 +2882,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	}
 
 	const deliverAs = (): 'steer' | 'follow-up' =>
-		(pick('subagent_deliver', 'steer', 'pubsub_deliver', 'steer') === 'follow-up' ? 'follow-up' : 'steer');
+		(pickOption(cmd, 'subagent_deliver', 'steer', 'pubsub_deliver', 'steer') === 'follow-up' ? 'follow-up' : 'steer');
 
 	// Bound once the harness binds. Diagnostic only; routing is by owner token.
 	let sessionId: string | undefined;
@@ -3636,7 +3597,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		appendPromptText,
 		forkMode,
 		forkModeEnabled,
-		managedDir: readFlag('managed_dir') || MANAGED_SETTINGS_DEFAULT,
+		managedDir: managedSettingsDir(cmd),
 		addDirs,
 		sessionId: () => sessionId,
 		mainPermissionMode: () => mainPermissionMode,
@@ -4183,8 +4144,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		{readOnly: true},
 	);
 
-	const crossSessionMessaging = runtime.env.BETTER_SUBAGENTS_CROSS_SESSION !== '0';
-	if (listAgentsVisible({background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging})) {
+	const canMessageAcrossSessions = crossSessionEnabled(runtime.env);
+	if (listAgentsVisible({background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging: canMessageAcrossSessions})) {
 		addSurface(
 			'ListAgents',
 			'List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.',

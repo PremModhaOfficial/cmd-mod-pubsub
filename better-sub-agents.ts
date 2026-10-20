@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute2, join as join10, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute2, join as join11, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -1730,6 +1730,156 @@ function nonEmpty(value) {
 }
 __name(nonEmpty, "nonEmpty");
 
+// src/config.ts
+import { join as join6 } from "node:path";
+var SUBAGENT_MODEL_ENV = "BETTER_SUBAGENTS_SUBAGENT_MODEL";
+var SUBAGENT_MODEL_ENV_ALIAS = "CLAUDE_CODE_SUBAGENT_MODEL";
+var SUBAGENT_MODEL_FORCE_ENV = "BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE";
+var SUBAGENT_MODEL_FORCE_ENV_ALIAS = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
+var EFFORT_LEVEL_ENV = "BETTER_SUBAGENTS_EFFORT_LEVEL";
+var EFFORT_LEVEL_ENV_ALIAS = "CLAUDE_CODE_EFFORT_LEVEL";
+var CONTEXT_WINDOW_ENV = "BETTER_SUBAGENTS_CONTEXT_WINDOW";
+var CONTEXT_WINDOW_ENV_ALIAS = "CLAUDE_CODE_CONTEXT_WINDOW";
+var BARE_ENV = "BETTER_SUBAGENTS_BARE";
+var BARE_ENV_ALIAS = "CLAUDE_CODE_BARE";
+var STRICT_MCP_CONFIG_ENV = "BETTER_SUBAGENTS_STRICT_MCP_CONFIG";
+var STRICT_MCP_CONFIG_ENV_ALIAS = "CLAUDE_CODE_STRICT_MCP_CONFIG";
+var MCP_ALLOW_ENV = "BETTER_SUBAGENTS_MCP_ALLOW";
+var MCP_ALLOW_ENV_ALIAS = "CLAUDE_CODE_MCP_ALLOW";
+var MCP_DENY_ENV = "BETTER_SUBAGENTS_MCP_DENY";
+var MCP_DENY_ENV_ALIAS = "CLAUDE_CODE_MCP_DENY";
+var MANAGED_CLAUDE_MD_ENV = "BETTER_SUBAGENTS_MANAGED_CLAUDE_MD";
+var USER_CLAUDE_MD_ENV = "BETTER_SUBAGENTS_USER_CLAUDE_MD";
+var AGENT_ENV = "BETTER_SUBAGENTS_AGENT";
+var AGENT_ENV_ALIAS = "CLAUDE_CODE_AGENT";
+var CROSS_SESSION_ENV = "BETTER_SUBAGENTS_CROSS_SESSION";
+var MAIN_PERMISSION_MODE_ENV = "BETTER_SUBAGENTS_MAIN_PERMISSION_MODE";
+var PUB_SUB_WORKER_ENV = "PUBSUB_WORKER";
+var COMMANDCODE_SDK_ENV = "COMMANDCODE_SDK";
+var MANAGED_DIR_OPTION = "managed_dir";
+function aliasValue(env, name, alias) {
+  const value = env[name];
+  return value !== void 0 ? value : env[alias];
+}
+__name(aliasValue, "aliasValue");
+function commaList(value) {
+  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
+}
+__name(commaList, "commaList");
+function isOn(value) {
+  return value === "1" || value === "true";
+}
+__name(isOn, "isOn");
+function subagentModel(env) {
+  const primary = env[SUBAGENT_MODEL_ENV]?.trim();
+  if (primary !== void 0 && primary.length > 0) return primary;
+  const alias = env[SUBAGENT_MODEL_ENV_ALIAS]?.trim();
+  return alias !== void 0 && alias.length > 0 ? alias : void 0;
+}
+__name(subagentModel, "subagentModel");
+function subagentModelForced(env) {
+  return isOn(env[SUBAGENT_MODEL_FORCE_ENV]) || isOn(env[SUBAGENT_MODEL_FORCE_ENV_ALIAS]);
+}
+__name(subagentModelForced, "subagentModelForced");
+function effortLevel(value, levels) {
+  const level = typeof value === "string" ? value.trim().toLowerCase() : "";
+  return level.length > 0 && levels.includes(level) ? level : void 0;
+}
+__name(effortLevel, "effortLevel");
+function effortLevelFromEnv(env, levels) {
+  return effortLevel(env[EFFORT_LEVEL_ENV], levels) ?? effortLevel(env[EFFORT_LEVEL_ENV_ALIAS], levels);
+}
+__name(effortLevelFromEnv, "effortLevelFromEnv");
+function contextWindowOverride(env) {
+  const value = Number(aliasValue(env, CONTEXT_WINDOW_ENV, CONTEXT_WINDOW_ENV_ALIAS));
+  return Number.isFinite(value) ? value : void 0;
+}
+__name(contextWindowOverride, "contextWindowOverride");
+function mcpPolicy(env) {
+  return {
+    bare: isOn(aliasValue(env, BARE_ENV, BARE_ENV_ALIAS)),
+    strict: isOn(aliasValue(env, STRICT_MCP_CONFIG_ENV, STRICT_MCP_CONFIG_ENV_ALIAS)),
+    allow: commaList(aliasValue(env, MCP_ALLOW_ENV, MCP_ALLOW_ENV_ALIAS)),
+    deny: commaList(aliasValue(env, MCP_DENY_ENV, MCP_DENY_ENV_ALIAS))
+  };
+}
+__name(mcpPolicy, "mcpPolicy");
+function backgroundDisabled(env) {
+  const isOnSwitch = /* @__PURE__ */ __name((value) => {
+    if (value === void 0) return false;
+    const normalized = value.trim().toLowerCase();
+    return normalized.length > 0 && normalized !== "0" && normalized !== "false" && normalized !== "no";
+  }, "isOnSwitch");
+  return isOnSwitch(env[BACKGROUND_DISABLE_ENV]) || isOnSwitch(env[BACKGROUND_DISABLE_ENV_ALIAS]);
+}
+__name(backgroundDisabled, "backgroundDisabled");
+function toggle(value) {
+  if (typeof value !== "string") return void 0;
+  const normalized = value.trim().toLowerCase();
+  if (["on", "true", "1", "yes"].includes(normalized)) return "on";
+  if (["off", "false", "0", "no"].includes(normalized)) return "off";
+  return void 0;
+}
+__name(toggle, "toggle");
+function forkModeFromEnv(env) {
+  return toggle(env[FORK_MODE_ENV]) ?? toggle(env[FORK_MODE_ENV_ALIAS]);
+}
+__name(forkModeFromEnv, "forkModeFromEnv");
+function agentSdk(env) {
+  return toggle(env[SDK_ENV]) === "on" || toggle(env[SDK_ENV_ALIAS]) === "on" || toggle(env[COMMANDCODE_SDK_ENV]) === "on";
+}
+__name(agentSdk, "agentSdk");
+function agentNameFromEnv(env) {
+  const primary = env[AGENT_ENV];
+  if (primary !== void 0 && primary.length > 0) return primary.trim();
+  const alias = env[AGENT_ENV_ALIAS];
+  return alias !== void 0 && alias.length > 0 ? alias.trim() : "";
+}
+__name(agentNameFromEnv, "agentNameFromEnv");
+function crossSessionEnabled(env) {
+  return env[CROSS_SESSION_ENV] !== "0";
+}
+__name(crossSessionEnabled, "crossSessionEnabled");
+function mainPermissionModeFromEnv(env) {
+  return env[MAIN_PERMISSION_MODE_ENV];
+}
+__name(mainPermissionModeFromEnv, "mainPermissionModeFromEnv");
+function workerModeFromEnv(env) {
+  return env[WORKER_ENV] === "1" || env[PUB_SUB_WORKER_ENV] === "1";
+}
+__name(workerModeFromEnv, "workerModeFromEnv");
+function policyFiles(env, home) {
+  return {
+    managed: env[MANAGED_CLAUDE_MD_ENV] ?? join6(home, ".commandcode", "managed", "CLAUDE.md"),
+    user: env[USER_CLAUDE_MD_ENV] ?? join6(home, ".commandcode", "CLAUDE.md")
+  };
+}
+__name(policyFiles, "policyFiles");
+function optionValue(source, name) {
+  return String(source.getFlag(name) ?? "");
+}
+__name(optionValue, "optionValue");
+function pickOption(source, primary, primaryDefault, legacy, legacyDefault) {
+  const value = optionValue(source, primary);
+  if (value.length > 0 && value !== primaryDefault) return value;
+  const old = optionValue(source, legacy);
+  if (old.length > 0 && old !== legacyDefault) return old;
+  return value.length > 0 ? value : legacyDefault;
+}
+__name(pickOption, "pickOption");
+function optionList(source, name) {
+  return commaList(optionValue(source, name));
+}
+__name(optionList, "optionList");
+function managedSettingsDir(source) {
+  return optionValue(source, MANAGED_DIR_OPTION) || MANAGED_SETTINGS_DEFAULT;
+}
+__name(managedSettingsDir, "managedSettingsDir");
+function managedSettingsHome(home) {
+  return join6(home, ".commandcode", "managed");
+}
+__name(managedSettingsHome, "managedSettingsHome");
+
 // src/worktree.ts
 import { dirname as dirname2, resolve, sep } from "node:path";
 function gitSeam(runtime) {
@@ -1938,7 +2088,7 @@ function guardToolCall(toolName, input, roots, toolCwd = roots.worktree) {
 __name(guardToolCall, "guardToolCall");
 
 // src/worktree-lifecycle.ts
-import { dirname as dirname3, join as join6 } from "node:path";
+import { dirname as dirname3, join as join7 } from "node:path";
 function sweepExpiredEntries(io, dir, now, options = {}) {
   let names;
   try {
@@ -1948,7 +2098,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join6(dir, name);
+    const file = join7(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -1970,7 +2120,7 @@ function createWorktreeLifecycle(ctx) {
     for (const base of [ctx.cwd, ctx.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join6(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join7(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -2015,7 +2165,7 @@ function createWorktreeLifecycle(ctx) {
     const alive = ctx.alive(record.workerPid) || ctx.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join6(ctx.controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join7(ctx.controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -2032,7 +2182,7 @@ function createWorktreeLifecycle(ctx) {
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join6(ctx.jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join7(ctx.jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -2047,18 +2197,18 @@ function createWorktreeLifecycle(ctx) {
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join6(ctx.logsDir, `${id}.log`));
+        spool.remove(join7(ctx.logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join6(ctx.transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join7(ctx.transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join6(ctx.worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join7(ctx.worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, ctx.logsDir, stamp, {
@@ -2093,7 +2243,7 @@ function createWorktreeLifecycle(ctx) {
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join6(ctx.worktreesDir, name);
+      const path = join7(ctx.worktreesDir, name);
       let old = false;
       try {
         old = stamp - spool.stat(path).mtimeMs > ttlMs;
@@ -2109,7 +2259,7 @@ function createWorktreeLifecycle(ctx) {
 __name(createWorktreeLifecycle, "createWorktreeLifecycle");
 
 // src/plan.ts
-import { join as join7 } from "node:path";
+import { join as join8 } from "node:path";
 function planFromInput(input, ctx) {
   const label = String(input.description ?? input.label ?? "").trim();
   if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
@@ -2377,7 +2527,7 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
       ...intent.oneShot === true ? {} : { agentId: id },
       agentType: intent.agentType ?? "general-purpose",
       sessionName: sessionNameOf(id),
-      transcriptPath: join7(ctx.transcriptsDir, `${id}.jsonl`),
+      transcriptPath: join8(ctx.transcriptsDir, `${id}.jsonl`),
       ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
     } : {},
     ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
@@ -2399,14 +2549,14 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
 __name(recordFromPlan, "recordFromPlan");
 
 // src/spawn.ts
-import { join as join9 } from "node:path";
+import { join as join10 } from "node:path";
 
 // src/permission.ts
-import { join as join8 } from "node:path";
+import { join as join9 } from "node:path";
 async function answerPendingPermission(controlDir, answered, ctx) {
   let request;
   try {
-    request = JSON.parse(ctx.fs.readFile(join8(controlDir, "permission.json")));
+    request = JSON.parse(ctx.fs.readFile(join9(controlDir, "permission.json")));
   } catch {
     return;
   }
@@ -2433,7 +2583,7 @@ async function answerPendingPermission(controlDir, answered, ctx) {
   const picked = choices.find((choice) => choice.label === chosen);
   const option = picked === void 0 ? void 0 : options[picked.index];
   const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-  const file = join8(controlDir, "permission-response.json");
+  const file = join9(controlDir, "permission-response.json");
   const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
   ctx.fs.writeFile(tmp, JSON.stringify(response));
   ctx.fs.rename(tmp, file);
@@ -2587,9 +2737,9 @@ async function fire(intent, ctx) {
     };
   }
   const id = `${ctx.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const logPath = join9(ctx.logsDir, `${id}.log`);
+  const logPath = join10(ctx.logsDir, `${id}.log`);
   const startedAt = ctx.now();
-  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join9(ctx.worktreesDir, id) }) : void 0;
+  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join10(ctx.worktreesDir, id) }) : void 0;
   const owner = intent.owner ?? ctx.owner();
   const record = ctx.recordFromPlan(
     { ...intent, depth, ...ctx.workerSpec?.id !== void 0 ? { parentJobId: ctx.workerSpec.id } : {} },
@@ -2631,7 +2781,7 @@ async function fire(intent, ctx) {
   const idleMs = Number(ctx.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
   if (live) {
     try {
-      ctx.fs.mkdir(join9(ctx.controlRoot, id));
+      ctx.fs.mkdir(join10(ctx.controlRoot, id));
     } catch {
     }
   }
@@ -2655,7 +2805,7 @@ async function fire(intent, ctx) {
       background: intent.background !== false,
       // A foreground caller answers permission prompts inline; a background run
       // settles with the request instead of holding a worker that nobody watches.
-      ...intent.background === false ? { interactive: true, controlDir: join9(ctx.jobsDir, "..", "control", id) } : {},
+      ...intent.background === false ? { interactive: true, controlDir: join10(ctx.jobsDir, "..", "control", id) } : {},
       depth,
       ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
       ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
@@ -2687,8 +2837,8 @@ async function fire(intent, ctx) {
       ...roster.roster !== void 0 ? { roster: roster.roster } : {},
       ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
       ...intent.background !== void 0 ? { background: intent.background } : {},
-      ...live ? { live: true, controlDir: join9(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-      ...isAgent ? { promptMarkerPath: join9(ctx.logsDir, `${id}.mod`) } : {},
+      ...live ? { live: true, controlDir: join10(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+      ...isAgent ? { promptMarkerPath: join10(ctx.logsDir, `${id}.mod`) } : {},
       ...isolation?.ok === true ? { worktree: isolation.path, mainCheckouts: isolation.mainCheckouts } : {}
     },
     ctx.modPath
@@ -2702,7 +2852,7 @@ async function settleForeground(launched, ctx) {
   const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
   let record = ctx.readJob(launched.id);
   const answered = /* @__PURE__ */ new Set();
-  const permissionDir = join9(ctx.controlRoot, launched.id);
+  const permissionDir = join10(ctx.controlRoot, launched.id);
   for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
     if (ctx.backgrounded.has(launched.id)) {
       ctx.refreshJobs();
@@ -2729,7 +2879,7 @@ async function settleForeground(launched, ctx) {
       error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
     };
   }
-  const log = ctx.readLog(String(record.logPath ?? join9(ctx.logsDir, `${launched.id}.log`)));
+  const log = ctx.readLog(String(record.logPath ?? join10(ctx.logsDir, `${launched.id}.log`)));
   const decision = ctx.finalizeJobWorktree(record);
   const outcome = ctx.foregroundOutcome(record, log);
   if (decision?.kept !== true) return { ...launched, result: outcome };
@@ -4025,11 +4175,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join10(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join11(cwd, path);
     let dir = dirname4(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join10(dir, "CLAUDE.md");
+      const filePath = join11(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -4048,25 +4198,22 @@ function claudeMdHierarchy(options) {
   const claudeMd = [];
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
+  const policy = policyFiles(env, options.home);
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join10(options.home, ".commandcode", "managed", "CLAUDE.md");
-    const managed = startupFile(fs, managedPath);
+    const managed = startupFile(fs, policy.managed);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
-    const user = startupFile(
-      fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join10(options.home, ".commandcode", "CLAUDE.md")
-    );
+    const user = startupFile(fs, policy.user);
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join10(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join11(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join10(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join11(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join10(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join11(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -4078,11 +4225,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join10(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join10(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join11(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join11(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join10(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join10(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join11(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join11(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -4090,8 +4237,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join10(options.home, ".commandcode", "agent-memory") : scope === "project" ? join10(options.cwd, ".commandcode", "agent-memory") : join10(options.cwd, ".commandcode", "agent-memory-local");
-  return join10(root, name);
+  const root = scope === "user" ? join11(options.home, ".commandcode", "agent-memory") : scope === "project" ? join11(options.cwd, ".commandcode", "agent-memory") : join11(options.cwd, ".commandcode", "agent-memory-local");
+  return join11(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -4128,14 +4275,14 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join10(dir, MEMORY_INDEX_FILE);
+  const path = join11(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
 __name(startupMemory, "startupMemory");
 function contextWindowForModel(model, env = {}) {
-  const override = Number(env.BETTER_SUBAGENTS_CONTEXT_WINDOW ?? env.CLAUDE_CODE_CONTEXT_WINDOW);
-  if (Number.isFinite(override) && override >= 1e3) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
+  const override = contextWindowOverride(env);
+  if (override !== void 0 && override >= 1e3) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
   const value = (model ?? "").toLowerCase();
   for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
     if (pattern.test(value)) return window;
@@ -4270,8 +4417,8 @@ function listAgentsVisible(options) {
 __name(listAgentsVisible, "listAgentsVisible");
 function resolveModel(input = {}) {
   const env = input.env ?? {};
-  const envModel = nonEmpty(env.BETTER_SUBAGENTS_SUBAGENT_MODEL) ?? nonEmpty(env.CLAUDE_CODE_SUBAGENT_MODEL);
-  const forced = env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === "1" || env.BETTER_SUBAGENTS_SUBAGENT_MODEL_FORCE === "true" || env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === "1" || env.CLAUDE_CODE_SUBAGENT_MODEL_FORCE === "true";
+  const envModel = subagentModel(env);
+  const forced = subagentModelForced(env);
   const main = nonEmpty(input.main);
   if (forced && envModel !== void 0) return { model: envModel, source: "forced" };
   const requested = nonEmpty(input.requested);
@@ -4284,18 +4431,13 @@ function resolveModel(input = {}) {
   return { model: main, source: "main" };
 }
 __name(resolveModel, "resolveModel");
-function effortLevel(value) {
-  const level = nonEmpty(value)?.toLowerCase();
-  return level !== void 0 && EFFORT_LEVELS.includes(level) ? level : void 0;
-}
-__name(effortLevel, "effortLevel");
 function resolveEffort(input = {}) {
   const env = input.env ?? {};
-  const requested = effortLevel(input.requested);
+  const requested = effortLevel(input.requested, EFFORT_LEVELS);
   if (requested !== void 0) return { effort: requested, source: "parameter" };
-  const definition = effortLevel(input.definition);
+  const definition = effortLevel(input.definition, EFFORT_LEVELS);
   if (definition !== void 0) return { effort: definition, source: "definition" };
-  const fromEnv = effortLevel(env.BETTER_SUBAGENTS_EFFORT_LEVEL) ?? effortLevel(env.CLAUDE_CODE_EFFORT_LEVEL);
+  const fromEnv = effortLevelFromEnv(env, EFFORT_LEVELS);
   if (fromEnv !== void 0) return { effort: fromEnv, source: "environment" };
   return { effort: void 0, source: "none" };
 }
@@ -4338,7 +4480,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join10(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join11(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -4367,20 +4509,16 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join10(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join11(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join10(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? managedSettingsHome(roots.home),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
 }
 __name(agentFolderTrusted, "agentFolderTrusted");
-function commaList(value) {
-  return String(value ?? "").split(",").map((item) => item.trim()).filter(Boolean);
-}
-__name(commaList, "commaList");
 function resolveAgentMcpServers(input = {}) {
   const env = input.env ?? {};
   const defined = input.defined ?? [];
@@ -4389,15 +4527,14 @@ function resolveAgentMcpServers(input = {}) {
     for (const spec of defined) dropped.push({ name: spec.name, reason: "plugin definitions ignore mcpServers" });
     return { servers: [], dropped };
   }
-  const bare = env.BETTER_SUBAGENTS_BARE ?? env.CLAUDE_CODE_BARE;
-  if (bare === "1" || bare === "true") {
+  const policy = mcpPolicy(env);
+  if (policy.bare) {
     for (const spec of defined) dropped.push({ name: spec.name, reason: "bare mode disables MCP" });
     return { servers: [], dropped };
   }
-  const strictConfig = env.BETTER_SUBAGENTS_STRICT_MCP_CONFIG ?? env.CLAUDE_CODE_STRICT_MCP_CONFIG;
-  const strict = strictConfig === "1" || strictConfig === "true";
-  const allow = commaList(env.BETTER_SUBAGENTS_MCP_ALLOW ?? env.CLAUDE_CODE_MCP_ALLOW);
-  const deny = commaList(env.BETTER_SUBAGENTS_MCP_DENY ?? env.CLAUDE_CODE_MCP_DENY);
+  const strict = policy.strict;
+  const allow = policy.allow;
+  const deny = policy.deny;
   const trusted = input.trusted !== false;
   const servers = [];
   const seen = /* @__PURE__ */ new Set();
@@ -4490,32 +4627,19 @@ var permissionModes = {
   resolve: resolvePermissionMode
 };
 function resolveExecutionPolicy(input) {
-  const isSet = /* @__PURE__ */ __name((value) => {
-    if (value === void 0) return false;
-    const normalized = value.trim().toLowerCase();
-    return normalized.length > 0 && normalized !== "0" && normalized !== "false" && normalized !== "no";
-  }, "isSet");
-  if (isSet(input.env[BACKGROUND_DISABLE_ENV]) || isSet(input.env[BACKGROUND_DISABLE_ENV_ALIAS])) return "foreground";
+  if (backgroundDisabled(input.env)) return "foreground";
   if (input.definitionBackground === true) return "background";
   if (input.requested === false) return "foreground";
   return "background";
 }
 __name(resolveExecutionPolicy, "resolveExecutionPolicy");
-function forkToggle(value) {
-  if (typeof value !== "string") return void 0;
-  const normalized = value.trim().toLowerCase();
-  if (["on", "true", "1", "yes"].includes(normalized)) return "on";
-  if (["off", "false", "0", "no"].includes(normalized)) return "off";
-  return void 0;
-}
-__name(forkToggle, "forkToggle");
 function resolveForkMode(input = {}) {
-  const flag = forkToggle(input.flag);
+  const flag = toggle(input.flag);
   if (flag !== void 0) return flag;
   const env = input.env ?? {};
-  const fromEnv = forkToggle(env[FORK_MODE_ENV]) ?? forkToggle(env[FORK_MODE_ENV_ALIAS]);
+  const fromEnv = forkModeFromEnv(env);
   if (fromEnv !== void 0) return fromEnv;
-  const inSdk = input.sdk === true || forkToggle(env[SDK_ENV]) === "on" || forkToggle(env[SDK_ENV_ALIAS]) === "on" || forkToggle(env.COMMANDCODE_SDK) === "on";
+  const inSdk = input.sdk === true || agentSdk(env);
   if (inSdk) return "off";
   return input.interactive === true ? "on" : "off";
 }
@@ -4691,17 +4815,8 @@ function index_default(cmd, overrides = {}) {
     default: "",
     description: "File whose text is appended to every subagent system prompt."
   });
-  const readFlag = /* @__PURE__ */ __name((name) => String(cmd.getFlag(name) ?? ""), "readFlag");
-  const pick = /* @__PURE__ */ __name((primary, primaryDefault, legacy, legacyDefault) => {
-    const value = readFlag(primary);
-    if (value.length > 0 && value !== primaryDefault) return value;
-    const old = readFlag(legacy);
-    if (old.length > 0 && old !== legacyDefault) return old;
-    return value.length > 0 ? value : legacyDefault;
-  }, "pick");
-  const splitFlag = /* @__PURE__ */ __name((name) => readFlag(name).split(",").map((value) => value.trim()).filter((value) => value.length > 0), "splitFlag");
-  const addDirs = splitFlag(ADD_DIRS_OPTION);
-  const workerMode = runtime.env[WORKER_ENV] === "1" || runtime.env.PUBSUB_WORKER === "1";
+  const addDirs = optionList(cmd, ADD_DIRS_OPTION);
+  const workerMode = workerModeFromEnv(runtime.env);
   const workerRoot = (() => {
     if (!workerMode) return void 0;
     try {
@@ -4711,27 +4826,27 @@ function index_default(cmd, overrides = {}) {
       return void 0;
     }
   })();
-  const root = workerRoot ?? resolve2(pick("subagent_dir", SUBAGENT_DIR_DEFAULT, "pubsub_dir", PUBSUB_DIR_DEFAULT));
+  const root = workerRoot ?? resolve2(pickOption(cmd, "subagent_dir", SUBAGENT_DIR_DEFAULT, "pubsub_dir", PUBSUB_DIR_DEFAULT));
   const forkMode = resolveForkMode({
     interactive: runtime.interactive === true,
     env: runtime.env,
-    flag: readFlag(FORK_MODE_FLAG)
+    flag: optionValue(cmd, FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join10(root, "inbox");
-  const claimedDir = join10(root, "claimed");
-  const orphanedDir = join10(root, "orphaned");
-  const logsDir = join10(root, "logs");
-  const jobsDir = join10(root, "jobs");
-  const transcriptsDir = join10(root, "transcripts");
-  const worktreesDir = join10(root, "worktrees");
-  const controlRoot = join10(root, "control");
-  const ledgerPath = join10(root, "delivered.jsonl");
+  const inboxDir = join11(root, "inbox");
+  const claimedDir = join11(root, "claimed");
+  const orphanedDir = join11(root, "orphaned");
+  const logsDir = join11(root, "logs");
+  const jobsDir = join11(root, "jobs");
+  const transcriptsDir = join11(root, "transcripts");
+  const worktreesDir = join11(root, "worktrees");
+  const controlRoot = join11(root, "control");
+  const ledgerPath = join11(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
   let mainPermissionMode = canonicalPermissionMode(
-    runtime.env.BETTER_SUBAGENTS_MAIN_PERMISSION_MODE
+    mainPermissionModeFromEnv(runtime.env)
   );
   function noteMainPermissionMode(value) {
     const mode = canonicalPermissionMode(value);
@@ -4743,13 +4858,13 @@ function index_default(cmd, overrides = {}) {
     cwd: runtime.cwd,
     home: runtime.home,
     builtins: builtinAgentDefinitions(runtime.env),
-    managedDir: readFlag("managed_dir") || MANAGED_SETTINGS_DEFAULT,
+    managedDir: managedSettingsDir(cmd),
     addDirs,
-    pluginRoots: splitFlag(PLUGIN_DIRS_OPTION),
-    cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
+    pluginRoots: optionList(cmd, PLUGIN_DIRS_OPTION),
+    cli: { value: optionValue(cmd, CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join10(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join11(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -4790,7 +4905,7 @@ function index_default(cmd, overrides = {}) {
   __name(resolveAgentDefinition, "resolveAgentDefinition");
   const sessionAgentName = /* @__PURE__ */ __name(() => {
     if (workerMode) return "";
-    return (readFlag("agent") || runtime.env.BETTER_SUBAGENTS_AGENT || runtime.env.CLAUDE_CODE_AGENT || "").trim();
+    return (optionValue(cmd, "agent") || agentNameFromEnv(runtime.env)).trim();
   }, "sessionAgentName");
   function sessionAgent() {
     const name = sessionAgentName();
@@ -4811,8 +4926,8 @@ function index_default(cmd, overrides = {}) {
   }
   __name(submitInitialPrompt, "submitInitialPrompt");
   const appendPromptText = workerMode && typeof workerSpec?.appendSystemPrompt === "string" ? workerSpec.appendSystemPrompt : resolveAppendSystemPrompt({
-    flag: readFlag("append_subagent_system_prompt"),
-    file: readFlag("append_subagent_system_prompt_file"),
+    flag: optionValue(cmd, "append_subagent_system_prompt"),
+    file: optionValue(cmd, "append_subagent_system_prompt_file"),
     env: runtime.env,
     fs: spool,
     cwd: cmd.cwd
@@ -4853,13 +4968,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join10(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join11(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join10(current, ".git"));
+        spool.stat(join11(current, ".git"));
         break;
       } catch {
       }
@@ -4870,7 +4985,7 @@ function index_default(cmd, overrides = {}) {
     return rules;
   }
   __name(projectHookRules, "projectHookRules");
-  const deliverAs = /* @__PURE__ */ __name(() => pick("subagent_deliver", "steer", "pubsub_deliver", "steer") === "follow-up" ? "follow-up" : "steer", "deliverAs");
+  const deliverAs = /* @__PURE__ */ __name(() => pickOption(cmd, "subagent_deliver", "steer", "pubsub_deliver", "steer") === "follow-up" ? "follow-up" : "steer", "deliverAs");
   let sessionId;
   let ownerToken;
   let ownerSaved = false;
@@ -5049,10 +5164,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(namedJob, "namedJob");
   function appendLive(id, from, message) {
-    const dir = join10(controlRoot, id);
+    const dir = join11(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join10(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join11(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -5084,9 +5199,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join10(inboxDir, `.tmp-${stamp}`);
+      const tmp = join11(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join10(inboxDir, stamp));
+      spool.rename(tmp, join11(inboxDir, stamp));
     } catch {
     }
   }
@@ -5211,8 +5326,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join10(controlRoot, id));
-        spool.writeFile(join10(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join11(controlRoot, id));
+        spool.writeFile(join11(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -5438,7 +5553,7 @@ function index_default(cmd, overrides = {}) {
     appendPromptText,
     forkMode,
     forkModeEnabled,
-    managedDir: readFlag("managed_dir") || MANAGED_SETTINGS_DEFAULT,
+    managedDir: managedSettingsDir(cmd),
     addDirs,
     sessionId: /* @__PURE__ */ __name(() => sessionId, "sessionId"),
     mainPermissionMode: /* @__PURE__ */ __name(() => mainPermissionMode, "mainPermissionMode"),
@@ -5522,7 +5637,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join10(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5545,7 +5660,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join10(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5577,8 +5692,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join10(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join10(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join11(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5679,7 +5794,7 @@ transcript ${transcriptPath}` : "") + `${timing}
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join10(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join11(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -5910,8 +6025,8 @@ The reply arrives here as its own signal.`
     async ({ input }) => okText(agentsToolText(typeof input.scope === "string" ? input.scope : void 0)),
     { readOnly: true }
   );
-  const crossSessionMessaging = runtime.env.BETTER_SUBAGENTS_CROSS_SESSION !== "0";
-  if (listAgentsVisible({ background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging })) {
+  const canMessageAcrossSessions = crossSessionEnabled(runtime.env);
+  if (listAgentsVisible({ background: workerMode ? workerSpec?.background === true : false, crossSessionMessaging: canMessageAcrossSessions })) {
     addSurface(
       "ListAgents",
       "List the agents this conversation can message with subagent_send: main plus every named agent, with its current state and job id.",
@@ -6199,7 +6314,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join10(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join11(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
