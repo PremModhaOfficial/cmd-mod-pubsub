@@ -129,8 +129,6 @@ import {
 import type {
 	ChildHandle,
 	CommandResult,
-	CompactBoundary,
-	JobIdentity,
 	JobPatch,
 	PermissionRequest,
 	Runtime,
@@ -141,6 +139,8 @@ import type {
 } from './types.ts';
 import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker} from './state.ts';
 import {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
+import {createJobStore} from './jobs.ts';
+import type {JobRecord} from './jobs.ts';
 import {createLedger} from './ledger.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Claim, Ownership, Settled} from './signals.ts';
@@ -3678,85 +3678,6 @@ export const permissionModes = {
 	resolve: resolvePermissionMode,
 };
 
-// The durable record behind a job: the shared identity plus its bookkeeping.
-interface JobRecord extends JobIdentity {
-	command?: string;
-	prompt?: string;
-	cwd?: string;
-	/** The persisted conversation for this agent; retention sweeps it with the record. */
-	transcriptPath?: string;
-	/** The maxTurns or max_tokens stop that produced a partial result. */
-	partial?: boolean;
-	/** The last compaction observed for this agent's own context window. */
-	compactBoundary?: CompactBoundary;
-	/** This job's nesting level, and the job that spawned it. */
-	depth?: number;
-	parentJobId?: string;
-	agentType?: string;
-	/** The addressable name from the spawn; absent for an anonymous agent. */
-	name?: string;
-	/** A fork: the main conversation's history, prompt, tools, model, cache. */
-	fork?: boolean;
-	/** The main conversation a fork copied. */
-	mainSessionId?: string;
-	/** The host's id for the fork session; follow-ups resume it. */
-	forkSessionId?: string;
-	/** `shared` for a fork, `own` for every other agent. */
-	promptCache?: string;
-	/** The team this teammate belongs to. */
-	teamName?: string;
-	/** Ctrl+B moved a foreground run to the background. */
-	backgroundedAt?: number;
-	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
-	 *  own end-of-turn signal is suppressed. */
-	handbackAt?: number;
-	/** The resolved execution policy: false is a foreground run. */
-	background?: boolean;
-	model?: string;
-	tools?: string[];
-	/** The MCP servers scoped to this agent; a resume keeps the same scope. */
-	mcpServers?: AgentMcpServer[];
-	autoCompactWindow?: number;
-	cacheTtl?: CacheTtl;
-	color?: string;
-	maxTurns?: number;
-	timeoutMs?: number;
-	sessionName?: string;
-	resumedFrom?: string;
-	/** The ACP session the worker created; a resume targets this id. */
-	acpSessionId?: string;
-	effort?: string;
-	permissionMode?: string;
-	isolation?: string;
-	/** The worktree this job ran in, when isolation created one. */
-	worktree?: string;
-	/** The repository root, used to remove the worktree. */
-	worktreeRepo?: string;
-	/** Checkout roots the worker must never enter. */
-	mainCheckouts?: string[];
-	/** Set once the project SubagentStop hook ran for this terminal job. */
-	subagentStopHook?: boolean;
-	/** Set once cleanup decided: the worktree was removed, or kept. */
-	worktreeFinalized?: boolean;
-	worktreeKept?: boolean;
-	/** The worktree's starting commit; a new HEAD means committed work. */
-	worktreeHead?: string;
-	/** A live agent may still accept a follow-up; its checkout must survive. */
-	live?: boolean;
-	exitCode?: number;
-	pid?: number;
-	workerPid?: number;
-	deliveredAt?: number;
-	updatedAt?: number;
-	failureReason?: string;
-	canceledAt?: number;
-	awaitingInput?: boolean;
-	question?: string;
-	permissionRequest?: PermissionRequest;
-	scanned?: boolean;
-	scanMatches?: string[];
-}
-
 // ---------------------------------------------------------------------------
 // Execution policy
 //
@@ -4604,25 +4525,14 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return `[subagent] ${title}\n${facts}${log}${boundary}${kept}` + (body.length > 0 ? `\n\n${body}` : '') + ask + `\n\n${next}`;
 	}
 
-	function readJob(id: string): JobRecord | undefined {
-		try {
-			const parsed = JSON.parse(spool.readFile(join(jobsDir, `${id}.json`))) as JobRecord;
-			return parsed && typeof parsed.id === 'string' ? parsed : undefined;
-		} catch {
-			return undefined;
-		}
-	}
-
-	function writeJob(record: JobRecord): void {
-		try {
-			const file = join(jobsDir, `${record.id}.json`);
-			const tmp = `${file}.mod-${runtime.pid}-${runtime.now()}`;
-			spool.writeFile(tmp, JSON.stringify(record, null, 2));
-			spool.rename(tmp, file);
-		} catch {
-			/* the in-memory list still shows it */
-		}
-	}
+	// The durable record store. The spool and the jobs path arrive explicitly, so
+	// the store names no ambient state and every read, write and scan agrees.
+	const {readJob, writeJob, readRecentJobs} = createJobStore({
+		fs: spool,
+		jobsDir,
+		pid: runtime.pid,
+		now: () => runtime.now(),
+	});
 
 	// One state-change choke point for the parent. The durable record is the source of
 	// truth, so a stale in-memory copy cannot skip a step, and an edge the state table
@@ -4635,25 +4545,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (from !== undefined && to !== undefined && !canTransition(from, to)) return false;
 		writeJob({...current, ...patch, ...(to !== undefined ? {state: to} : {}), updatedAt: stamp});
 		return true;
-	}
-
-	function readRecentJobs(limit: number): JobRecord[] {
-		let names: string[];
-		try {
-			names = spool.readdir(jobsDir).filter(name => name.endsWith('.json') && !name.includes('.tmp-'));
-		} catch {
-			return [];
-		}
-		names.sort();
-		const jobs: JobRecord[] = [];
-		for (const name of names.slice(-limit).reverse()) {
-			try {
-				jobs.push(JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord);
-			} catch {
-				/* skip a torn record */
-			}
-		}
-		return jobs;
 	}
 
 	// ------------------------------------------------------------------ live
