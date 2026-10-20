@@ -2140,7 +2140,7 @@ function createWorktreeLifecycle(ctx) {
   __name(retentionMs, "retentionMs");
   function discardCleanWorktree(job, path) {
     if (job?.worktreeKept === true) return;
-    if (worktreeChanged(git, path) !== false) return;
+    if (worktreeChanged(git, path, job?.worktreeHead) !== false) return;
     const roots = mainCheckoutRoots(git, path);
     const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname3(path);
     git.git(["worktree", "remove", "--force", path], repo);

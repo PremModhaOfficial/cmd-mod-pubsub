@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import {spawn} from 'node:child_process';
-import {appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync} from 'node:fs';
+import {appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {Script} from 'node:vm';
@@ -6444,6 +6444,72 @@ process.stdin.on('data', (data) => {
 		'a clean checkout is removed after the worker exits',
 	);
 	ok('greptile: a clean checkout is removed after the worker exits');
+
+	// 117. Greptile: retention keeps committed work in a held checkout ------
+	// A provisional hold does not write the "kept" flag, so retention must not
+	// rely on that flag. It has to ask git the same question the final decision
+	// asks: is there a commit the checkout did not start from? A committed
+	// change looks clean to `git status --porcelain`, and removing the checkout
+	// would leave that work reachable only through git recovery.
+	const keepDir = mkdtempSync(join(tmpdir(), 'subagent-worktree-keep-'));
+	const keepGit = gitSeam({
+		// The working tree is clean: the work was committed.
+		'status --porcelain': {code: 0, stdout: '', stderr: ''},
+		// But HEAD has moved past the commit the checkout started from.
+		'rev-parse HEAD': {code: 0, stdout: 'new-head\n', stderr: ''},
+	});
+	const keepRecord = {
+		id: 'kept-job',
+		kind: 'agent',
+		worktree: join(keepDir, 'worktrees', 'kept'),
+		worktreeRepo: keepDir,
+		worktreeHead: 'old-head',
+		live: true,
+		state: 'done',
+		startedAt: 1,
+		finishedAt: 2,
+	};
+	const keepRecords = new Map([[keepRecord.id, {...keepRecord}]]);
+	// The sweep reads the record from disk, so the record is a real file.
+	mkdirSync(join(keepDir, 'jobs'), {recursive: true});
+	writeFileSync(join(keepDir, 'jobs', `${keepRecord.id}.json`), JSON.stringify(keepRecord));
+	const keepLifecycle = createWorktreeLifecycle({
+		fs: {
+			readFile: file => readFileSync(file, 'utf8'),
+			writeFile: (file, data) => writeFileSync(file, data),
+			readdir: dir => readdirSync(dir),
+			exists: file => existsSync(file),
+			mkdir: dir => mkdirSync(dir, {recursive: true}),
+			remove: file => rmSync(file, {recursive: true, force: true}),
+			rename: (from, to) => renameSync(from, to),
+			stat: file => statSync(file),
+			appendFile: () => {},
+		},
+		git: keepGit,
+		// Past the retention window, so the record is expired and the sweep looks
+		// at its checkout.
+		now: () => 90 * 24 * 60 * 60 * 1000,
+		alive: () => false,
+		env: {},
+		cwd: keepDir,
+		home: keepDir,
+		jobsDir: join(keepDir, 'jobs'),
+		logsDir: join(keepDir, 'logs'),
+		transcriptsDir: join(keepDir, 'transcripts'),
+		worktreesDir: join(keepDir, 'worktrees'),
+		controlRoot: join(keepDir, 'control'),
+		workerMode: false,
+		readJob: id => keepRecords.get(id),
+		writeJob: job => {
+			keepRecords.set(job.id, job);
+		},
+	});
+	keepLifecycle.sweepExpired();
+	assert.ok(
+		!keepGit.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'),
+		'retention does not remove a checkout whose commits would be lost',
+	);
+	ok('greptile: retention keeps committed work in a held checkout');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

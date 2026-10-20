@@ -152,9 +152,17 @@ export function createWorktreeLifecycle(ctx: WorktreeLifecycleContext): Worktree
 	// unknowable) one is the user's work, so retention keeps it and its git
 	// metadata. Removal goes through `git worktree remove`, which also clears that
 	// metadata; a bare directory delete would leave a stale `git worktree list` row.
+	//
+	// "Clean" is two questions, not one. Uncommitted files are one; a commit the
+	// checkout did not start from is the other, and `git status --porcelain`
+	// cannot see it. The starting commit is therefore compared here too, so a
+	// committed change is never removed by retention.
+	//
+	// The record's "kept" flag is not the guard: a provisional hold does not write
+	// it, and the flag is only a report of the last decision, not the check.
 	function discardCleanWorktree(job: JobRecord | undefined, path: string): void {
 		if (job?.worktreeKept === true) return;
-		if (worktreeChanged(git, path) !== false) return;
+		if (worktreeChanged(git, path, job?.worktreeHead) !== false) return;
 		const roots = mainCheckoutRoots(git, path);
 		const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname(path);
 		git.git(['worktree', 'remove', '--force', path], repo);
