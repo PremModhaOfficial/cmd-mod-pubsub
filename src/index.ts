@@ -69,7 +69,6 @@ import {
 	AGENT_SCAN_MAX,
 	BACKGROUND_DISABLE_ENV,
 	BACKGROUND_DISABLE_ENV_ALIAS,
-	CLEANUP_PERIOD_SETTING,
 	CLI_AGENTS_OPTION,
 	DELIVERED_LEDGER_KEEP,
 	DELIVERED_LEDGER_MAX,
@@ -93,9 +92,6 @@ import {
 	PUBSUB_DIR_DEFAULT,
 	RECONCILE_SCAN_MAX,
 	REFRESH_INTERVAL_MS,
-	RETENTION_DAYS_DEFAULT,
-	RETENTION_ENV,
-	RETENTION_ENV_ALIAS,
 	RETENTION_SWEEP_INTERVAL_MS,
 	ROSTER_MAIN,
 	SDK_ENV,
@@ -128,17 +124,8 @@ import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Ownership} from './signals.ts';
 import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
-import {
-	createJobWorktree,
-	finalizeWorktree,
-	gitSeam,
-	guardToolCall,
-	isInside,
-	isolationRoots,
-	mainCheckoutRoots,
-	worktreeChanged,
-} from './worktree.ts';
-import type {WorktreeDecision} from './worktree.ts';
+import {createJobWorktree, gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
+import {createWorktreeLifecycle, sweepExpiredEntries} from './worktree-lifecycle.ts';
 import {planFromInput, planFromRecord, recordFromPlan, sessionNameOf} from './plan.ts';
 import type {PlanContext} from './plan.ts';
 import {answerPendingPermission as answerPermission, failJob, fire} from './spawn.ts';
@@ -177,6 +164,8 @@ export {
 } from './worktree.ts';
 export {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 export {ledgerFactory} from './ledger.ts';
+export {sweepExpiredEntries};
+export type {SweepIo, SweepOptions} from './worktree-lifecycle.ts';
 export {
 	BACKGROUND_BUILTIN_TOOLS,
 	EFFORT_LEVELS,
@@ -3781,50 +3770,6 @@ export function tasksHintVisible(jobs: readonly TaskRowLike[], now: number): boo
 	});
 }
 
-// ---------------------------------------------------------------------------
-// The shared TTL sweeper
-// ---------------------------------------------------------------------------
-
-// One TTL sweeper for every directory the spool grows: claimed/orphaned signals,
-// job records, logs and worktrees. `expired` covers entries whose age lives in
-// their contents (a job record's finishedAt); `ttlMs` covers the rest.
-export interface SweepIo {
-	readdir(dir: string): string[];
-	stat(file: string): {mtimeMs: number};
-	remove(file: string): void;
-}
-
-export interface SweepOptions {
-	ttlMs?: number;
-	expired?: (name: string) => boolean;
-	/** Keep an entry even when it is past the TTL (a live job owns its log). */
-	skip?: (name: string) => boolean;
-}
-
-export function sweepExpiredEntries(io: SweepIo, dir: string, now: number, options: SweepOptions = {}): string[] {
-	let names: string[];
-	try {
-		names = io.readdir(dir);
-	} catch {
-		return [];
-	}
-	const removed: string[] = [];
-	for (const name of names) {
-		const file = join(dir, name);
-		try {
-			if (options.skip?.(name) === true) continue;
-			const expired = options.expired?.(name) === true;
-			const old = options.ttlMs !== undefined && now - io.stat(file).mtimeMs > options.ttlMs;
-			if (!expired && !old) continue;
-			io.remove(file);
-			removed.push(name);
-		} catch {
-			/* another process won it */
-		}
-	}
-	return removed;
-}
-
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);
 	// Below this line the spool is touched only through the injected filesystem.
@@ -4247,30 +4192,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		compactBytes: LEDGER_COMPACT_BYTES,
 	});
 
-	// One cleanup decision per finished job, made wherever the terminal state is first
-	// observed - a delivered signal or a restart reconcile. The record write makes it
-	// idempotent, so a kept worktree is not reported twice.
-	function finalizeJobWorktree(job: JobRecord | undefined): WorktreeDecision | undefined {
-		if (job === undefined) return undefined;
-		const state = normalizeState(job.state);
-		if (state === undefined || !isTerminal(state)) return undefined;
-		if (typeof job.worktree !== 'string' || job.worktree.length === 0) return undefined;
-		// Already decided by the restart reconcile or an earlier format: report the kept
-		// path again without touching git, so delivery never loses the note.
-		if (job.worktreeFinalized === true) return {kept: job.worktreeKept === true, path: job.worktree};
-		// The record's `live` flag outlives the worker. Pass its actual liveness: a
-		// follow-up needs the checkout, but after exit a clean one is removed and a
-		// changed one is kept.
-		const live = job.live === true && liveState(job).alive;
-		const decision = finalizeWorktree(git, {...job, live});
-		if (decision === undefined) return undefined;
-		job.worktreeFinalized = true;
-		job.worktreeKept = decision.kept;
-		job.updatedAt = runtime.now();
-		writeJob(job);
-		return decision;
-	}
-
 	// The durable record store. The spool and the jobs path arrive explicitly, so
 	// the store names no ambient state and every read, write and scan agrees.
 	const {readJob, writeJob, readRecentJobs} = createJobStore({
@@ -4278,6 +4199,27 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		jobsDir,
 		pid: runtime.pid,
 		now: () => runtime.now(),
+	});
+
+	// The worktree decision and retention live in their own leaf. It receives the
+	// spool, the git seam, the clock, liveness and the record store, so the names it
+	// returns are the ones the rest of the entry calls.
+	const {finalizeJobWorktree, sweepExpired, liveState} = createWorktreeLifecycle({
+		fs: spool,
+		git,
+		now: () => runtime.now(),
+		alive: pid => runtime.alive(pid),
+		env: runtime.env,
+		cwd: runtime.cwd,
+		home: runtime.home,
+		jobsDir,
+		logsDir,
+		transcriptsDir,
+		worktreesDir,
+		controlRoot,
+		workerMode,
+		readJob,
+		writeJob,
 	});
 
 	// The permission handshake reads only the spool, the clock, and the human; the
@@ -4395,21 +4337,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		return matches.find(job => runtime.alive(job.workerPid) || runtime.alive(job.pid)) ?? matches[0];
 	}
 
-	// `alive` decides queue-vs-resume; `busy` decides the wording of a queue. No
-	// state file means the worker has not published yet, so a live worker is assumed
-	// to be in a turn.
-	function liveState(record: JobRecord): {alive: boolean; busy: boolean} {
-		const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
-		let busy = true;
-		try {
-			const state = JSON.parse(spool.readFile(join(controlRoot, record.id, 'state.json'))) as {busy?: unknown};
-			busy = state.busy !== false;
-		} catch {
-			/* no state file yet */
-		}
-		return {alive, busy};
-	}
-
 	function appendLive(id: string, from: string, message: string): boolean {
 		const dir = join(controlRoot, id);
 		try {
@@ -4454,143 +4381,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			spool.rename(tmp, join(inboxDir, stamp));
 		} catch {
 			/* a durable signal is best effort; the job record still has the result */
-		}
-	}
-
-	// Retention. A finished job keeps its record, its log and its transcript for
-	// RETENTION_DAYS_DEFAULT (or BETTER_SUBAGENTS_RETENTION_DAYS, its
-	// CLAUDE_CODE_CLEANUP_PERIOD_DAYS alias, or `cleanupPeriodDays` in settings), so
-	// `subagent_output` still works on a job from last week. A running job is never
-	// swept, however old its record is. The three artifacts are swept together.
-	function cleanupPeriodDays(): number | undefined {
-		// Project settings win over user settings, the same precedence the definition
-		// registry uses. A missing or malformed file contributes nothing.
-		for (const base of [runtime.cwd, runtime.home]) {
-			if (typeof base !== 'string' || base.length === 0) continue;
-			try {
-				const parsed = JSON.parse(spool.readFile(join(base, '.commandcode', 'settings.json'))) as Record<string, unknown>;
-				const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
-				if (Number.isFinite(value) && value > 0) return value;
-			} catch {
-				/* no settings here */
-			}
-		}
-		return undefined;
-	}
-
-	function retentionMs(): number {
-		const raw = runtime.env[RETENTION_ENV] ?? runtime.env[RETENTION_ENV_ALIAS];
-		const days = Number(raw);
-		const configured = Number.isFinite(days) && days > 0 ? days : cleanupPeriodDays();
-		const value =
-			configured !== undefined && Number.isFinite(configured) && configured > 0
-				? configured
-				: RETENTION_DAYS_DEFAULT;
-		return value * 24 * 60 * 60 * 1000;
-	}
-
-	// A worktree is removable only when git says it is clean. A changed (or
-	// unknowable) one is the user's work, so retention keeps it and its git
-	// metadata. Removal goes through `git worktree remove`, which also clears that
-	// metadata; a bare directory delete would leave a stale `git worktree list` row.
-	function discardCleanWorktree(job: JobRecord | undefined, path: string): void {
-		if (job?.worktreeKept === true) return;
-		if (worktreeChanged(git, path) !== false) return;
-		const roots = mainCheckoutRoots(git, path);
-		const repo = job?.worktreeRepo ?? roots[1] ?? roots[0] ?? dirname(path);
-		git.git(['worktree', 'remove', '--force', path], repo);
-	}
-
-	function sweepExpired(): void {
-		if (workerMode) return;
-		const now = runtime.now();
-		const ttlMs = retentionMs();
-		const cutoff = now - ttlMs;
-		const expired: JobRecord[] = [];
-		// A record's age lives in its timestamps, not its mtime: one sweeper, but the
-		// predicate decides. A running job is never expired.
-		sweepExpiredEntries(spool, jobsDir, now, {
-			expired: name => {
-				if (!name.endsWith('.json') || name.includes('.tmp-')) return false;
-				try {
-					const job = JSON.parse(spool.readFile(join(jobsDir, name))) as JobRecord;
-					const state = normalizeState(job.state);
-					if (state === undefined || !isTerminal(state)) return false;
-					const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
-					if (settledAt === 0 || settledAt > cutoff) return false;
-					if (typeof job.id === 'string' && job.id.length > 0) expired.push(job);
-					return true;
-				} catch {
-					return false;
-				}
-			},
-		});
-		for (const job of expired) {
-			const id = job.id;
-			try {
-				spool.remove(join(logsDir, `${id}.log`));
-			} catch {
-				/* the log is already gone */
-			}
-			try {
-				spool.remove(
-					typeof job.transcriptPath === 'string' && job.transcriptPath.length > 0
-						? job.transcriptPath
-						: join(transcriptsDir, `${id}.jsonl`),
-				);
-			} catch {
-				/* the transcript is already gone */
-			}
-			discardCleanWorktree(
-				job,
-				typeof job.worktree === 'string' && job.worktree.length > 0 ? job.worktree : join(worktreesDir, id),
-			);
-		}
-		// An abandoned log, transcript or worktree with no live record is bounded by
-		// the same TTL.
-		sweepExpiredEntries(spool, logsDir, now, {
-			ttlMs,
-			skip: name => {
-				const job = readJob(name.replace(/\.log$/, ''));
-				if (job === undefined) return false;
-				const state = normalizeState(job.state);
-				return state === undefined || !isTerminal(state);
-			},
-		});
-		sweepExpiredEntries(spool, transcriptsDir, now, {
-			ttlMs,
-			// A transcript belongs to a job, so a running job's transcript is never
-			// swept even when the file itself is old.
-			skip: name => {
-				const job = readJob(name.replace(/\.jsonl$/, ''));
-				if (job === undefined) return false;
-				const state = normalizeState(job.state);
-				return state === undefined || !isTerminal(state);
-			},
-		});
-		// A worktree is never removed by mtime alone: a changed one is the user's work
-		// and a running job's is still in use. Only a clean worktree past the TTL goes,
-		// through `git worktree remove`, which clears its metadata too.
-		let worktreeNames: string[] = [];
-		try {
-			worktreeNames = spool.readdir(worktreesDir);
-		} catch {
-			worktreeNames = [];
-		}
-		for (const name of worktreeNames) {
-			const job = readJob(name);
-			if (job !== undefined) {
-				const state = normalizeState(job.state);
-				if (state === undefined || !isTerminal(state)) continue;
-			}
-			const path = join(worktreesDir, name);
-			let old = false;
-			try {
-				old = now - spool.stat(path).mtimeMs > ttlMs;
-			} catch {
-				old = false;
-			}
-			if (old) discardCleanWorktree(job, path);
 		}
 	}
 
