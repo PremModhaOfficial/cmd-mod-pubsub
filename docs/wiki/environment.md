@@ -25,3 +25,29 @@ regenerated artifact.
 - Start from `AGENTS.md` (commands and the generated-file rule), `CODING_STANDARDS.md`
   (review rules), and `docs/split-map.md` (module ownership and seams). Behavior
   stays in `SPEC.md`; vocabulary stays in `GLOSSARY.md`.
+
+## 2026-10-20 — the module tree under `src/`
+
+At `b97cc1a` the source is a tree of ES modules, not one file. `src/index.ts` is
+the entry and the only composition root; the other files under `src/` are leaves
+that take their OS effects as arguments (`fs`, `run`, `now`, `env`, `cwd`) or
+through an explicit deps object. The root `better-sub-agents.ts` remains the
+generated, committed, published artifact — `npm run build` bundles `src/index.ts`
+into it — and the install path is unchanged.
+
+- `src/index.ts` is 4,711 lines, and there are 18 files under `src/` — 17
+  TypeScript modules plus the ambient `src/harness.d.ts`.
+  `docs/split-map.md` lists every file with its line count and its role.
+- The gate is four checks: `npm run check` (build, then `scripts/check-stale.mjs`
+  — the rebuilt bundle must equal `HEAD` byte for byte), `npm run typecheck`
+  (`tsc --noEmit` over `src/`), `npm run check:imports`
+  (`scripts/check-imports.mjs` — no non-entry `./index.ts` import, no runtime
+  import cycle, `types.ts` type-only), and the bundle contract plus the smoke
+  suite. `node test/e2e.mjs` stays a local run: it needs a signed-in `cmd` and
+  network.
+- `npm run check` fails on a stale bundle, so editing `src/` without
+  regenerating the root artifact fails before review.
+- The pointers are `AGENTS.md` (commands, the generated-file rule),
+  `CODING_STANDARDS.md` (review rules), and `docs/split-map.md` (module
+  ownership and the seam rules). `docs/adr/0003-source-modules.md` records why
+  the source is split while the mod still publishes one file.

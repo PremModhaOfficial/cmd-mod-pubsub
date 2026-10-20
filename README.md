@@ -558,6 +558,25 @@ transcript together, and a `maxTurns` stop that is partial and emits `compact_bo
 cover all six built-ins with their restricted tools and both disable switches, plus the 15,000-token
 description-limit warning. The parity ledger in `SPEC.md` names the check behind every row.
 
+## Contributing
+
+The root `better-sub-agents.ts` is **generated**. It is the file users install, and it is produced by
+bundling the modules under `src/` — so never edit it by hand.
+
+- **Edit `src/`.** `src/index.ts` is the entry and the only composition root; every other file under `src/`
+  is a leaf that takes its OS effects as arguments. `docs/split-map.md` lists which module owns which
+  symbol and the import seams (downward only, never `./index.ts`, `types.ts` is type-only).
+- **Run `npm run build`** to regenerate `better-sub-agents.ts`, and commit the regenerated file with the
+  source change.
+- **Gates:** `npm run gate` (build, stale-bundle check, typecheck, import check, bundle contract, smoke
+  suite) and `node test/e2e.mjs` (the real host — needs a signed-in `cmd` and network, so it stays local).
+- **`npm run check` fails on a stale bundle.** It rebuilds and compares the worktree bundle against
+  `HEAD` byte for byte, so a source edit without a regenerated `better-sub-agents.ts` fails the gate
+  before anyone reviews it.
+
+The published artifact name and the install steps above are unchanged: the mod is still one file with
+no dependencies and no build step for the user.
+
 ## License
 
 MIT © 2026 Prem Modha
