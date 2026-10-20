@@ -34,9 +34,14 @@ import {isTerminalState, normalizeState} from './state.ts';
 import {patchOf, signalOf} from './signals.ts';
 import {createJobWorktree} from './worktree.ts';
 import type {GitSeam, WorktreeDecision} from './worktree.ts';
-import type {ChildHandle, JobPatch, PermissionRequest, Signal, SpawnOptions, SpoolFs} from './types.ts';
+import type {ChildHandle, JobPatch, Signal, SpawnOptions, SpoolFs} from './types.ts';
 import type {JobRecord} from './jobs.ts';
 import type {JobPlan} from './plan.ts';
+
+// The permission round-trip lives in its own leaf; these re-exports keep the
+// spawn surface (and every existing importer) unchanged.
+export {answerPendingPermission} from './permission.ts';
+export type {PermissionContext} from './permission.ts';
 
 export type LimitEnv = Record<string, string | undefined>;
 
@@ -133,14 +138,6 @@ export type ForegroundResult =
 export type Launch =
 	| {readonly ok: true; readonly id: string; readonly pid: number; readonly result?: ForegroundResult}
 	| {readonly ok: false; readonly error: string};
-
-/** What answerPendingPermission reads: the spool, the clock, and the human. */
-export interface PermissionContext {
-	readonly fs: SpoolFs;
-	now(): number;
-	readonly pid: number;
-	readonly ui: unknown;
-}
 
 /** The activate state and levers a spawn reads, passed explicitly. */
 export interface SpawnContext {
@@ -498,56 +495,6 @@ export async function fire(intent: JobPlan, ctx: SpawnContext): Promise<Launch> 
 	const launched = startWorker(record, spec, ctx);
 	if (launched.ok === false || intent.background !== false) return launched;
 	return settleForeground(launched, ctx);
-}
-
-// A foreground worker cannot ask the human itself: it writes its permission
-// request to its control dir and waits, bounded. This process owns the human, so
-// it puts the request to them and writes the answer back. No answer (headless,
-// dismissed) leaves the worker's own bound in charge instead of inventing one.
-export async function answerPendingPermission(
-	controlDir: string,
-	answered: Set<string>,
-	ctx: PermissionContext,
-): Promise<void> {
-	let request: PermissionRequest;
-	try {
-		request = JSON.parse(ctx.fs.readFile(join(controlDir, 'permission.json'))) as PermissionRequest;
-	} catch {
-		return;
-	}
-	const key = String(request.requestId ?? '');
-	if (key.length === 0 || answered.has(key)) return;
-	const options = request.options ?? [];
-	const choices = options.map((option, index) => ({
-		label: option.name || option.kind || option.optionId || `option ${index + 1}`,
-		index,
-	}));
-	const ui = ctx.ui as unknown as {
-		select?: (ask: {title: string; options: Array<{label: string}>}) => Promise<string | undefined>;
-	};
-	if (typeof ui.select !== 'function') return;
-	let chosen: string | undefined;
-	try {
-		chosen = await ui.select({
-			title: `Approve "${String(request.title)}"?`,
-			options: choices.map(choice => ({label: choice.label})),
-		});
-	} catch {
-		// A UI that cannot ask leaves the worker's own bound in charge.
-		return;
-	}
-	if (typeof chosen !== 'string') return;
-	answered.add(key);
-	const picked = choices.find(choice => choice.label === chosen);
-	const option = picked === undefined ? undefined : options[picked.index];
-	const response =
-		option === undefined
-			? {requestId: request.requestId, outcome: 'cancelled'}
-			: {requestId: request.requestId, optionId: option.optionId};
-	const file = join(controlDir, 'permission-response.json');
-	const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
-	ctx.fs.writeFile(tmp, JSON.stringify(response));
-	ctx.fs.rename(tmp, file);
 }
 
 // Foreground is a bounded wait on the same durable record a background job

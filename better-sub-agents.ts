@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, isAbsolute as isAbsolute2, join as join7, resolve as resolve2 } from "node:path";
+import { dirname as dirname2, isAbsolute as isAbsolute2, join as join8, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -1307,7 +1307,48 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
 __name(recordFromPlan, "recordFromPlan");
 
 // src/spawn.ts
+import { join as join7 } from "node:path";
+
+// src/permission.ts
 import { join as join6 } from "node:path";
+async function answerPendingPermission(controlDir, answered, ctx) {
+  let request;
+  try {
+    request = JSON.parse(ctx.fs.readFile(join6(controlDir, "permission.json")));
+  } catch {
+    return;
+  }
+  const key = String(request.requestId ?? "");
+  if (key.length === 0 || answered.has(key)) return;
+  const options = request.options ?? [];
+  const choices = options.map((option2, index) => ({
+    label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
+    index
+  }));
+  const ui = ctx.ui;
+  if (typeof ui.select !== "function") return;
+  let chosen;
+  try {
+    chosen = await ui.select({
+      title: `Approve "${String(request.title)}"?`,
+      options: choices.map((choice) => ({ label: choice.label }))
+    });
+  } catch {
+    return;
+  }
+  if (typeof chosen !== "string") return;
+  answered.add(key);
+  const picked = choices.find((choice) => choice.label === chosen);
+  const option = picked === void 0 ? void 0 : options[picked.index];
+  const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
+  const file = join6(controlDir, "permission-response.json");
+  const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
+  ctx.fs.writeFile(tmp, JSON.stringify(response));
+  ctx.fs.rename(tmp, file);
+}
+__name(answerPendingPermission, "answerPendingPermission");
+
+// src/spawn.ts
 function buildArgs(spec, modPath) {
   if (spec.kind === "command") return ["-c", String(spec.command ?? "")];
   if (spec.kind === "fork") {
@@ -1454,9 +1495,9 @@ async function fire(intent, ctx) {
     };
   }
   const id = `${ctx.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-  const logPath = join6(ctx.logsDir, `${id}.log`);
+  const logPath = join7(ctx.logsDir, `${id}.log`);
   const startedAt = ctx.now();
-  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join6(ctx.worktreesDir, id) }) : void 0;
+  const isolation = intent.isolation === "worktree" ? createJobWorktree({ git: ctx.git.git, fs: ctx.fs }, { cwd: intent.cwd, path: join7(ctx.worktreesDir, id) }) : void 0;
   const owner = intent.owner ?? ctx.owner();
   const record = ctx.recordFromPlan(
     { ...intent, depth, ...ctx.workerSpec?.id !== void 0 ? { parentJobId: ctx.workerSpec.id } : {} },
@@ -1498,7 +1539,7 @@ async function fire(intent, ctx) {
   const idleMs = Number(ctx.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
   if (live) {
     try {
-      ctx.fs.mkdir(join6(ctx.controlRoot, id));
+      ctx.fs.mkdir(join7(ctx.controlRoot, id));
     } catch {
     }
   }
@@ -1522,7 +1563,7 @@ async function fire(intent, ctx) {
       background: intent.background !== false,
       // A foreground caller answers permission prompts inline; a background run
       // settles with the request instead of holding a worker that nobody watches.
-      ...intent.background === false ? { interactive: true, controlDir: join6(ctx.jobsDir, "..", "control", id) } : {},
+      ...intent.background === false ? { interactive: true, controlDir: join7(ctx.jobsDir, "..", "control", id) } : {},
       depth,
       ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
       ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
@@ -1554,8 +1595,8 @@ async function fire(intent, ctx) {
       ...roster.roster !== void 0 ? { roster: roster.roster } : {},
       ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
       ...intent.background !== void 0 ? { background: intent.background } : {},
-      ...live ? { live: true, controlDir: join6(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-      ...isAgent ? { promptMarkerPath: join6(ctx.logsDir, `${id}.mod`) } : {},
+      ...live ? { live: true, controlDir: join7(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+      ...isAgent ? { promptMarkerPath: join7(ctx.logsDir, `${id}.mod`) } : {},
       ...isolation?.ok === true ? { worktree: isolation.path, mainCheckouts: isolation.mainCheckouts } : {}
     },
     ctx.modPath
@@ -1565,47 +1606,11 @@ async function fire(intent, ctx) {
   return settleForeground(launched, ctx);
 }
 __name(fire, "fire");
-async function answerPendingPermission(controlDir, answered, ctx) {
-  let request;
-  try {
-    request = JSON.parse(ctx.fs.readFile(join6(controlDir, "permission.json")));
-  } catch {
-    return;
-  }
-  const key = String(request.requestId ?? "");
-  if (key.length === 0 || answered.has(key)) return;
-  const options = request.options ?? [];
-  const choices = options.map((option2, index) => ({
-    label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
-    index
-  }));
-  const ui = ctx.ui;
-  if (typeof ui.select !== "function") return;
-  let chosen;
-  try {
-    chosen = await ui.select({
-      title: `Approve "${String(request.title)}"?`,
-      options: choices.map((choice) => ({ label: choice.label }))
-    });
-  } catch {
-    return;
-  }
-  if (typeof chosen !== "string") return;
-  answered.add(key);
-  const picked = choices.find((choice) => choice.label === chosen);
-  const option = picked === void 0 ? void 0 : options[picked.index];
-  const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-  const file = join6(controlDir, "permission-response.json");
-  const tmp = `${file}.mod-${ctx.pid}-${ctx.now()}`;
-  ctx.fs.writeFile(tmp, JSON.stringify(response));
-  ctx.fs.rename(tmp, file);
-}
-__name(answerPendingPermission, "answerPendingPermission");
 async function settleForeground(launched, ctx) {
   const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
   let record = ctx.readJob(launched.id);
   const answered = /* @__PURE__ */ new Set();
-  const permissionDir = join6(ctx.controlRoot, launched.id);
+  const permissionDir = join7(ctx.controlRoot, launched.id);
   for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
     if (ctx.backgrounded.has(launched.id)) {
       ctx.refreshJobs();
@@ -1632,7 +1637,7 @@ async function settleForeground(launched, ctx) {
       error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
     };
   }
-  const log = ctx.readLog(String(record.logPath ?? join6(ctx.logsDir, `${launched.id}.log`)));
+  const log = ctx.readLog(String(record.logPath ?? join7(ctx.logsDir, `${launched.id}.log`)));
   const decision = ctx.finalizeJobWorktree(record);
   const outcome = ctx.foregroundOutcome(record, log);
   if (decision?.kept !== true) return { ...launched, result: outcome };
@@ -3499,7 +3504,7 @@ function createAgentRegistry(deps) {
   let entries = [];
   const loggedSkips = /* @__PURE__ */ new Set();
   const definitionWarnings = /* @__PURE__ */ new WeakMap();
-  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join7(deps.home, ".commandcode", "managed"), "managedDir");
+  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join8(deps.home, ".commandcode", "managed"), "managedDir");
   function pushEntry(entry) {
     entries.push(entry);
     const problem = entry.warning ?? entry.reason;
@@ -3556,7 +3561,7 @@ function createAgentRegistry(deps) {
     }
     for (const name of names) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join7(dir, name);
+      const full = join8(dir, name);
       if (name.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, scope);
         if (definition === void 0) continue;
@@ -3583,7 +3588,7 @@ function createAgentRegistry(deps) {
     }
     for (const child of children) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join7(dir, child);
+      const full = join8(dir, child);
       if (child.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, "plugin", {
           plugin: true,
@@ -3614,7 +3619,7 @@ function createAgentRegistry(deps) {
       return;
     }
     for (const pluginName of pluginNames) {
-      const agentsDir = join7(root, pluginName, "agents");
+      const agentsDir = join8(root, pluginName, "agents");
       if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
     }
   }
@@ -3634,9 +3639,9 @@ function createAgentRegistry(deps) {
   __name(projectBases, "projectBases");
   function pluginRoots() {
     const roots = [...deps.pluginRoots ?? []];
-    roots.push(join7(managedDir(), "plugins"));
-    for (const base of projectBases()) roots.push(join7(base, ".commandcode", "plugins"));
-    roots.push(join7(deps.home, ".commandcode", "plugins"));
+    roots.push(join8(managedDir(), "plugins"));
+    for (const base of projectBases()) roots.push(join8(base, ".commandcode", "plugins"));
+    roots.push(join8(deps.home, ".commandcode", "plugins"));
     return roots;
   }
   __name(pluginRoots, "pluginRoots");
@@ -3757,15 +3762,15 @@ function createAgentRegistry(deps) {
   function refresh() {
     entries = [];
     const found = [];
-    scanDir(join7(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join8(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
     scanCli(found);
     for (const base of projectBases()) {
-      scanDir(join7(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join8(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
     for (const dir of deps.addDirs ?? []) {
-      scanDir(join7(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join8(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
-    scanDir(join7(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join8(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
     for (const root of pluginRoots()) scanPlugins(root, found);
     found.push(...deps.builtins);
     const seen = /* @__PURE__ */ new Set();
@@ -3822,7 +3827,7 @@ function startupFile(fs, path) {
 __name(startupFile, "startupFile");
 function hasGitMarker(fs, dir) {
   try {
-    fs.stat(join7(dir, ".git"));
+    fs.stat(join8(dir, ".git"));
     return true;
   } catch {
     return false;
@@ -3846,11 +3851,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join7(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join8(cwd, path);
     let dir = dirname2(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname2(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join7(dir, "CLAUDE.md");
+      const filePath = join8(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -3870,24 +3875,24 @@ function claudeMdHierarchy(options) {
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join7(options.home, ".commandcode", "managed", "CLAUDE.md");
+    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join8(options.home, ".commandcode", "managed", "CLAUDE.md");
     const managed = startupFile(fs, managedPath);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
     const user = startupFile(
       fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join7(options.home, ".commandcode", "CLAUDE.md")
+      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join8(options.home, ".commandcode", "CLAUDE.md")
     );
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join7(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join8(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join7(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join8(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join7(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join8(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -3899,11 +3904,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join7(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join7(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join8(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join8(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join7(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join7(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join8(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join8(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -3911,8 +3916,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join7(options.home, ".commandcode", "agent-memory") : scope === "project" ? join7(options.cwd, ".commandcode", "agent-memory") : join7(options.cwd, ".commandcode", "agent-memory-local");
-  return join7(root, name);
+  const root = scope === "user" ? join8(options.home, ".commandcode", "agent-memory") : scope === "project" ? join8(options.cwd, ".commandcode", "agent-memory") : join8(options.cwd, ".commandcode", "agent-memory-local");
+  return join8(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -3949,7 +3954,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join7(dir, MEMORY_INDEX_FILE);
+  const path = join8(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -4159,7 +4164,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join7(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join8(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -4188,11 +4193,11 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join7(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join8(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join7(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? join8(roots.home, ".commandcode", "managed"),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
@@ -4457,7 +4462,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join7(dir, name);
+    const file = join8(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -4562,15 +4567,15 @@ function index_default(cmd, overrides = {}) {
     flag: readFlag(FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join7(root, "inbox");
-  const claimedDir = join7(root, "claimed");
-  const orphanedDir = join7(root, "orphaned");
-  const logsDir = join7(root, "logs");
-  const jobsDir = join7(root, "jobs");
-  const transcriptsDir = join7(root, "transcripts");
-  const worktreesDir = join7(root, "worktrees");
-  const controlRoot = join7(root, "control");
-  const ledgerPath = join7(root, "delivered.jsonl");
+  const inboxDir = join8(root, "inbox");
+  const claimedDir = join8(root, "claimed");
+  const orphanedDir = join8(root, "orphaned");
+  const logsDir = join8(root, "logs");
+  const jobsDir = join8(root, "jobs");
+  const transcriptsDir = join8(root, "transcripts");
+  const worktreesDir = join8(root, "worktrees");
+  const controlRoot = join8(root, "control");
+  const ledgerPath = join8(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -4593,7 +4598,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join7(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join8(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -4697,13 +4702,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join7(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join8(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join7(current, ".git"));
+        spool.stat(join8(current, ".git"));
         break;
       } catch {
       }
@@ -4895,7 +4900,7 @@ function index_default(cmd, overrides = {}) {
     const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join7(controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join8(controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -4903,10 +4908,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(liveState, "liveState");
   function appendLive(id, from, message) {
-    const dir = join7(controlRoot, id);
+    const dir = join8(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join7(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join8(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -4938,9 +4943,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join7(inboxDir, `.tmp-${stamp}`);
+      const tmp = join8(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join7(inboxDir, stamp));
+      spool.rename(tmp, join8(inboxDir, stamp));
     } catch {
     }
   }
@@ -4949,7 +4954,7 @@ function index_default(cmd, overrides = {}) {
     for (const base of [runtime.cwd, runtime.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join7(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join8(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -4984,7 +4989,7 @@ function index_default(cmd, overrides = {}) {
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join7(jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join8(jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -4999,18 +5004,18 @@ function index_default(cmd, overrides = {}) {
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join7(logsDir, `${id}.log`));
+        spool.remove(join8(logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join7(transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join8(transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join7(worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join8(worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, logsDir, now, {
@@ -5045,7 +5050,7 @@ function index_default(cmd, overrides = {}) {
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join7(worktreesDir, name);
+      const path = join8(worktreesDir, name);
       let old = false;
       try {
         old = now - spool.stat(path).mtimeMs > ttlMs;
@@ -5176,8 +5181,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join7(controlRoot, id));
-        spool.writeFile(join7(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join8(controlRoot, id));
+        spool.writeFile(join8(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -5487,7 +5492,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join7(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join8(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5510,7 +5515,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join7(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join8(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5542,8 +5547,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join7(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join7(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join8(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join8(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5644,7 +5649,7 @@ transcript ${transcriptPath}` : "") + `${timing}
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join7(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join8(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -6164,7 +6169,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join7(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join8(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
