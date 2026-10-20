@@ -8,8 +8,6 @@ import {join} from 'node:path';
 
 import {
 	ACTIVE_JOB_SCAN_MAX,
-	FORK_AGENT_TYPE,
-	HOST_RESERVED_AGENT_NAMES,
 	OUTPUT_MAX_CHARS_CAP,
 	OUTPUT_MAX_CHARS_DEFAULT,
 	ROSTER_MAIN,
@@ -18,8 +16,7 @@ import {
 	WAIT_POLL_MS,
 } from './constants.ts';
 import {crossSessionEnabled} from './config.ts';
-import {AGENT_SCOPES} from './definitions.ts';
-import type {AgentRegistry, AgentScope} from './definitions.ts';
+import type {AgentRegistry} from './definitions.ts';
 import type {JobRecord} from './jobs.ts';
 import {planFromInput, planFromRecord} from './plan.ts';
 import type {PlanContext} from './plan.ts';
@@ -29,7 +26,6 @@ import type {ForegroundResult, SpawnContext, WorkerSpec} from './spawn.ts';
 import {canonicalState, isTerminal, isTerminalState, normalizeState, stateMarker} from './state.ts';
 import type {Ledger} from './ledger.ts';
 import type {Runtime, Signal, SpoolFs} from './types.ts';
-import {isInside} from './worktree.ts';
 
 export type ToolResult = {ok: boolean; error?: string; content?: {type: string; text: string}[]};
 

@@ -6,6 +6,8 @@
 		"allowImportingTsExtensions": true,
 		"noEmit": true,
 		"strict": false,
+		"noUnusedLocals": true,
+		"noUnusedParameters": false,
 		"skipLibCheck": true,
 		"types": ["node"]
 	},

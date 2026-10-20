@@ -58,14 +58,11 @@ import {
 	writeFileSync,
 } from 'node:fs';
 import {homedir} from 'node:os';
-import {dirname, isAbsolute, join, resolve, sep} from 'node:path';
+import {dirname, isAbsolute, join, resolve} from 'node:path';
 import {
-	ACTIVE_JOB_SCAN_MAX,
 	ADD_DIRS_OPTION,
 	AGENT_API_ERROR,
 	AGENT_LOG_FILE,
-	AGENT_NAME_MAX,
-	AGENT_SCAN_DEPTH_MAX,
 	AGENT_SCAN_MAX,
 	CLI_AGENTS_OPTION,
 	DELIVERED_LEDGER_KEEP,
@@ -79,7 +76,6 @@ import {
 	LOST_GRACE_MS,
 	MANAGED_SETTINGS_DEFAULT,
 	MOD_PATH,
-	OUTPUT_MAX_CHARS_CAP,
 	OUTPUT_MAX_CHARS_DEFAULT,
 	OWNER_TYPE,
 	OWNER_TYPE_LEGACY,
@@ -93,16 +89,12 @@ import {
 	SUBAGENT_DIR_DEFAULT,
 	TASK_ROW_GRACE_MS,
 	TEAM_TOOL_NAMES,
-	WAIT_DEFAULT_MS,
-	WAIT_MAX_MS,
-	WAIT_POLL_MS,
 	WORKER_SPEC_ENV,
 } from './constants.ts';
 import type {
 	ChildHandle,
 	CommandResult,
 	JobPatch,
-	PermissionRequest,
 	Runtime,
 	RuntimeOverrides,
 	Signal,
@@ -134,7 +126,6 @@ import {
 	agentSdk,
 	backgroundDisabled,
 	contextWindowOverride,
-	crossSessionEnabled,
 	effortLevel,
 	effortLevelFromEnv,
 	forkModeFromEnv,
@@ -151,9 +142,9 @@ import {
 	toggle,
 	workerModeFromEnv,
 } from './config.ts';
-import {createJobWorktree, gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
+import {gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
 import {createWorktreeLifecycle, sweepExpiredEntries} from './worktree-lifecycle.ts';
-import {planFromInput, planFromRecord, recordFromPlan, sessionNameOf} from './plan.ts';
+import {recordFromPlan, sessionNameOf} from './plan.ts';
 import {createTools} from './tools.ts';
 import type {PlanContext} from './plan.ts';
 import {answerPendingPermission as answerPermission, failJob, fire} from './spawn.ts';
