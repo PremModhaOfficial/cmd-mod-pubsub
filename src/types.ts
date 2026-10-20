@@ -71,3 +71,80 @@ export interface Runtime {
 }
 
 export type RuntimeOverrides = Partial<Omit<Runtime, 'fs'>> & {fs?: Partial<SpoolFs>};
+
+// ---------------------------------------------------------------------------
+// The signal contract
+//
+// The identity a job record and its signal share, plus the two shapes built on
+// it: the signal that reaches the session and the record write that signal
+// implies. Declared once, so the record, the signal, and the worker's inlined
+// envelope cannot drift.
+// ---------------------------------------------------------------------------
+
+// An ACP `session/request_permission` as the parent sees it: enough to show the
+// prompt, name the tool call, and return the chosen option.
+export interface PermissionRequestOption {
+	readonly optionId: string;
+	readonly kind?: string;
+	readonly name?: string;
+}
+
+export interface PermissionRequest {
+	readonly requestId?: number | string;
+	readonly title: string;
+	readonly toolCall?: {readonly title?: string; readonly kind?: string};
+	readonly options: PermissionRequestOption[];
+}
+
+export interface JobIdentity {
+	id: string;
+	/** The durable resume handle. Absent for a one-shot agent (Explore, Plan). */
+	agentId?: string;
+	owner?: string;
+	description?: string;
+	kind?: string;
+	state?: string;
+	startedAt?: number;
+	finishedAt?: number;
+	durationMs?: number;
+	logPath?: string;
+	sessionId?: string;
+}
+
+/** One compaction observed in a subagent's own context window. */
+export interface CompactBoundary {
+	readonly trigger: 'auto' | 'manual';
+	/** The token count before compaction ran. */
+	readonly preTokens: number;
+	readonly at: number;
+}
+
+export interface Signal extends JobIdentity {
+	readonly exitCode?: number | null;
+	readonly title?: string;
+	readonly body?: string;
+	/** The report was scanned before it could reach the parent. */
+	readonly scanned?: boolean;
+	readonly scanMatches?: string[];
+	readonly question?: string;
+	readonly permissionRequest?: PermissionRequest;
+	/** A maxTurns or max_tokens stop: the output is partial and the job is resumable. */
+	readonly partial?: boolean;
+	readonly compactBoundary?: CompactBoundary;
+}
+
+// The record write a signal implies.
+export interface JobPatch {
+	state?: string;
+	exitCode?: number;
+	finishedAt?: number;
+	durationMs?: number;
+	failureReason?: string;
+	awaitingInput?: boolean;
+	question?: string;
+	permissionRequest?: PermissionRequest;
+	scanned?: boolean;
+	scanMatches?: string[];
+	partial?: boolean;
+	compactBoundary?: CompactBoundary;
+}

@@ -276,6 +276,62 @@ function createLedger(deps) {
 __name(createLedger, "createLedger");
 var ledgerFactory = createLedger;
 
+// src/signals.ts
+function signalOf(record, result) {
+  return signalEnvelope(record, { ...result, state: canonicalState(result.state) });
+}
+__name(signalOf, "signalOf");
+function signalEnvelope(record, result) {
+  const description = String(record.description ?? record.id);
+  const state = String(result.state);
+  return {
+    id: record.id,
+    ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
+    owner: record.owner,
+    description,
+    kind: String(record.kind ?? "command"),
+    state,
+    exitCode: typeof result.exitCode === "number" ? result.exitCode : null,
+    startedAt: record.startedAt,
+    finishedAt: result.finishedAt,
+    durationMs: result.durationMs,
+    logPath: record.logPath,
+    sessionId: record.sessionId,
+    title: result.title ?? `${description} ${state}`,
+    body: result.body,
+    ...typeof result.question === "string" ? { question: result.question } : {},
+    ...result.permissionRequest !== void 0 ? { permissionRequest: result.permissionRequest } : {},
+    // Omitted when the writer did not scan, so a legacy signal keeps its shape.
+    ...result.scanned === void 0 ? {} : { scanned: result.scanned === true, scanMatches: result.scanMatches ?? [] },
+    ...result.partial === true ? { partial: true } : {},
+    ...result.compactBoundary !== void 0 ? { compactBoundary: result.compactBoundary } : {}
+  };
+}
+__name(signalEnvelope, "signalEnvelope");
+function patchOf(signal) {
+  const patch = {
+    exitCode: typeof signal.exitCode === "number" ? signal.exitCode : void 0,
+    finishedAt: signal.finishedAt,
+    durationMs: signal.durationMs
+  };
+  if (signal.state !== void 0) {
+    const state = canonicalState(signal.state);
+    patch.state = state;
+    if (state === "failed" || state === "canceled") patch.failureReason = signal.body;
+    if (state === "waiting-input") patch.awaitingInput = true;
+  }
+  if (typeof signal.question === "string") patch.question = signal.question;
+  if (signal.permissionRequest !== void 0) patch.permissionRequest = signal.permissionRequest;
+  if (signal.scanned !== void 0) {
+    patch.scanned = signal.scanned;
+    patch.scanMatches = signal.scanMatches ?? [];
+  }
+  if (signal.partial === true) patch.partial = true;
+  if (signal.compactBoundary !== void 0) patch.compactBoundary = signal.compactBoundary;
+  return patch;
+}
+__name(patchOf, "patchOf");
+
 // src/tool-filter.ts
 var SUBAGENT_TOOL_UNIVERSE = [
   "Agent",
@@ -3506,60 +3562,6 @@ function tasksHintVisible(jobs, now) {
   });
 }
 __name(tasksHintVisible, "tasksHintVisible");
-function signalOf(record, result) {
-  return signalEnvelope(record, { ...result, state: canonicalState(result.state) });
-}
-__name(signalOf, "signalOf");
-function signalEnvelope(record, result) {
-  const description = String(record.description ?? record.id);
-  const state = String(result.state);
-  return {
-    id: record.id,
-    ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
-    owner: record.owner,
-    description,
-    kind: String(record.kind ?? "command"),
-    state,
-    exitCode: typeof result.exitCode === "number" ? result.exitCode : null,
-    startedAt: record.startedAt,
-    finishedAt: result.finishedAt,
-    durationMs: result.durationMs,
-    logPath: record.logPath,
-    sessionId: record.sessionId,
-    title: result.title ?? `${description} ${state}`,
-    body: result.body,
-    ...typeof result.question === "string" ? { question: result.question } : {},
-    ...result.permissionRequest !== void 0 ? { permissionRequest: result.permissionRequest } : {},
-    // Omitted when the writer did not scan, so a legacy signal keeps its shape.
-    ...result.scanned === void 0 ? {} : { scanned: result.scanned === true, scanMatches: result.scanMatches ?? [] },
-    ...result.partial === true ? { partial: true } : {},
-    ...result.compactBoundary !== void 0 ? { compactBoundary: result.compactBoundary } : {}
-  };
-}
-__name(signalEnvelope, "signalEnvelope");
-function patchOf(signal) {
-  const patch = {
-    exitCode: typeof signal.exitCode === "number" ? signal.exitCode : void 0,
-    finishedAt: signal.finishedAt,
-    durationMs: signal.durationMs
-  };
-  if (signal.state !== void 0) {
-    const state = canonicalState(signal.state);
-    patch.state = state;
-    if (state === "failed" || state === "canceled") patch.failureReason = signal.body;
-    if (state === "waiting-input") patch.awaitingInput = true;
-  }
-  if (typeof signal.question === "string") patch.question = signal.question;
-  if (signal.permissionRequest !== void 0) patch.permissionRequest = signal.permissionRequest;
-  if (signal.scanned !== void 0) {
-    patch.scanned = signal.scanned;
-    patch.scanMatches = signal.scanMatches ?? [];
-  }
-  if (signal.partial === true) patch.partial = true;
-  if (signal.compactBoundary !== void 0) patch.compactBoundary = signal.compactBoundary;
-  return patch;
-}
-__name(patchOf, "patchOf");
 function positiveInt(raw, fallback) {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;

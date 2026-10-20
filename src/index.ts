@@ -126,10 +126,24 @@ import {
 	WORKER_ENV,
 	WORKER_SPEC_ENV,
 } from './constants.ts';
-import type {ChildHandle, CommandResult, Runtime, RuntimeOverrides, SpawnOptions, SpoolFs} from './types.ts';
+import type {
+	ChildHandle,
+	CommandResult,
+	CompactBoundary,
+	JobIdentity,
+	JobPatch,
+	PermissionRequest,
+	Runtime,
+	RuntimeOverrides,
+	Signal,
+	SpawnOptions,
+	SpoolFs,
+} from './types.ts';
 import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker} from './state.ts';
 import {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 import {createLedger} from './ledger.ts';
+import {patchOf, signalEnvelope, signalOf} from './signals.ts';
+import type {Claim, Ownership, Settled} from './signals.ts';
 import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
 import {
 	createJobWorktree,
@@ -143,9 +157,20 @@ import {
 } from './worktree.ts';
 import type {WorktreeDecision} from './worktree.ts';
 
-export type {ChildHandle, CommandResult, Runtime, RuntimeOverrides, SpawnOptions, SpoolFs} from './types.ts';
+export type {
+	ChildHandle,
+	CommandResult,
+	CompactBoundary,
+	PermissionRequest,
+	PermissionRequestOption,
+	Runtime,
+	RuntimeOverrides,
+	SpawnOptions,
+	SpoolFs,
+} from './types.ts';
 export type {AppendPromptInput} from './append.ts';
 export type {Ledger, LedgerDeps} from './ledger.ts';
+export {signalEnvelope} from './signals.ts';
 export type {ToolFilterInput, ToolFilterResult} from './tool-filter.ts';
 export type {GitResult, GitSeam, IsolationResult, IsolationRoots, IsolationSpec, WorktreeDecision, WorktreeSeam} from './worktree.ts';
 export {jobStates} from './state.ts';
@@ -3653,61 +3678,7 @@ export const permissionModes = {
 	resolve: resolvePermissionMode,
 };
 
-// An ACP `session/request_permission` as the parent sees it: enough to show the
-// prompt, name the tool call, and return the chosen option.
-export interface PermissionRequestOption {
-	readonly optionId: string;
-	readonly kind?: string;
-	readonly name?: string;
-}
-
-export interface PermissionRequest {
-	readonly requestId?: number | string;
-	readonly title: string;
-	readonly toolCall?: {readonly title?: string; readonly kind?: string};
-	readonly options: PermissionRequestOption[];
-}
-
-// The identity a job record and its signal share. Declared once, so the two
-// shapes cannot drift: the record adds durable bookkeeping, the signal adds the
-// message that reaches the session.
-interface JobIdentity {
-	id: string;
-	/** The durable resume handle. Absent for a one-shot agent (Explore, Plan). */
-	agentId?: string;
-	owner?: string;
-	description?: string;
-	kind?: string;
-	state?: string;
-	startedAt?: number;
-	finishedAt?: number;
-	durationMs?: number;
-	logPath?: string;
-	sessionId?: string;
-}
-
-/** One compaction observed in a subagent's own context window. */
-export interface CompactBoundary {
-	readonly trigger: 'auto' | 'manual';
-	/** The token count before compaction ran. */
-	readonly preTokens: number;
-	readonly at: number;
-}
-
-interface Signal extends JobIdentity {
-	readonly exitCode?: number | null;
-	readonly title?: string;
-	readonly body?: string;
-	/** The report was scanned before it could reach the parent. */
-	readonly scanned?: boolean;
-	readonly scanMatches?: string[];
-	readonly question?: string;
-	readonly permissionRequest?: PermissionRequest;
-	/** A maxTurns or max_tokens stop: the output is partial and the job is resumable. */
-	readonly partial?: boolean;
-	readonly compactBoundary?: CompactBoundary;
-}
-
+// The durable record behind a job: the shared identity plus its bookkeeping.
 interface JobRecord extends JobIdentity {
 	command?: string;
 	prompt?: string;
@@ -3784,22 +3755,6 @@ interface JobRecord extends JobIdentity {
 	permissionRequest?: PermissionRequest;
 	scanned?: boolean;
 	scanMatches?: string[];
-}
-
-// The record write a signal implies.
-interface JobPatch {
-	state?: string;
-	exitCode?: number;
-	finishedAt?: number;
-	durationMs?: number;
-	failureReason?: string;
-	awaitingInput?: boolean;
-	question?: string;
-	permissionRequest?: PermissionRequest;
-	scanned?: boolean;
-	scanMatches?: string[];
-	partial?: boolean;
-	compactBoundary?: CompactBoundary;
 }
 
 // ---------------------------------------------------------------------------
@@ -4052,114 +4007,6 @@ export function tasksHintVisible(jobs: readonly TaskRowLike[], now: number): boo
 		if (!isTerminalState(state)) return false;
 		return now - finishedAt <= TASK_ROW_GRACE_MS;
 	});
-}
-
-// ---------------------------------------------------------------------------
-// Envelope
-//
-// One contract for "this job reached this state", in both directions:
-// signalOf(record, result) is the signal, patchOf(signal) is the record write the
-// signal implies. Both are pure, so no writer can invent its own field list.
-// ---------------------------------------------------------------------------
-
-function signalOf(
-	record: JobRecord,
-	result: {
-		state: string;
-		finishedAt?: number;
-		durationMs?: number;
-		exitCode?: number | null;
-		title?: string;
-		body?: string;
-		scanned?: boolean;
-		scanMatches?: string[];
-	},
-): Signal {
-	return signalEnvelope(record, {...result, state: canonicalState(result.state)});
-}
-
-// The envelope itself, shared with the detached worker: WORKER_SOURCE embeds this
-// function's source at module load, so the parent and the worker cannot construct
-// a signal with different fields. Keep the body plain JS and self-contained.
-export function signalEnvelope(
-	record: JobIdentity,
-	result: {
-		state: string;
-		finishedAt?: number;
-		durationMs?: number;
-		exitCode?: number | null;
-		title?: string;
-		body?: string;
-		question?: string;
-		permissionRequest?: PermissionRequest;
-		scanned?: boolean;
-		scanMatches?: string[];
-		partial?: boolean;
-		compactBoundary?: CompactBoundary;
-	},
-): Signal {
-	const description = String(record.description ?? record.id);
-	const state = String(result.state);
-	return {
-		id: record.id,
-		...(record.agentId !== undefined ? {agentId: record.agentId} : {}),
-		owner: record.owner,
-		description,
-		kind: String(record.kind ?? 'command'),
-		state,
-		exitCode: typeof result.exitCode === 'number' ? result.exitCode : null,
-		startedAt: record.startedAt,
-		finishedAt: result.finishedAt,
-		durationMs: result.durationMs,
-		logPath: record.logPath,
-		sessionId: record.sessionId,
-		title: result.title ?? `${description} ${state}`,
-		body: result.body,
-		...(typeof result.question === 'string' ? {question: result.question} : {}),
-		...(result.permissionRequest !== undefined ? {permissionRequest: result.permissionRequest} : {}),
-		// Omitted when the writer did not scan, so a legacy signal keeps its shape.
-		...(result.scanned === undefined
-			? {}
-			: {scanned: result.scanned === true, scanMatches: result.scanMatches ?? []}),
-		...(result.partial === true ? {partial: true} : {}),
-		...(result.compactBoundary !== undefined ? {compactBoundary: result.compactBoundary} : {}),
-	};
-}
-
-// One claimed inbox file: the signal, plus the two paths settle() needs to undo
-// or finish the claim. Ownership is what the drain decides; Settled is how the
-// claim ends.
-interface Claim {
-	readonly name: string;
-	readonly signal: Signal;
-	readonly live: string;
-	readonly claimed: string;
-}
-
-type Ownership = 'mine' | 'foreign' | 'orphan' | 'pending';
-type Settled = 'accepted' | 'held' | 'quarantined';
-
-function patchOf(signal: Signal): JobPatch {
-	const patch: JobPatch = {
-		exitCode: typeof signal.exitCode === 'number' ? signal.exitCode : undefined,
-		finishedAt: signal.finishedAt,
-		durationMs: signal.durationMs,
-	};
-	if (signal.state !== undefined) {
-		const state = canonicalState(signal.state);
-		patch.state = state;
-		if (state === 'failed' || state === 'canceled') patch.failureReason = signal.body;
-		if (state === 'waiting-input') patch.awaitingInput = true;
-	}
-	if (typeof signal.question === 'string') patch.question = signal.question;
-	if (signal.permissionRequest !== undefined) patch.permissionRequest = signal.permissionRequest;
-	if (signal.scanned !== undefined) {
-		patch.scanned = signal.scanned;
-		patch.scanMatches = signal.scanMatches ?? [];
-	}
-	if (signal.partial === true) patch.partial = true;
-	if (signal.compactBoundary !== undefined) patch.compactBoundary = signal.compactBoundary;
-	return patch;
 }
 
 // ---------------------------------------------------------------------------
