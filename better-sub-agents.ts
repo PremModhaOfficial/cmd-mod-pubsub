@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname, isAbsolute, join as join2, resolve, sep } from "node:path";
+import { dirname, isAbsolute as isAbsolute2, join as join3, resolve, sep } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -186,6 +186,42 @@ var jobStates = {
   marker: stateMarker,
   color: stateColor
 };
+
+// src/append.ts
+import { isAbsolute, join as join2 } from "node:path";
+var AUTO_COMPACT_MIN = 1e5;
+var AUTO_COMPACT_MAX = 1e6;
+function resolveAutoCompactWindow(inherited, requested, isMain) {
+  if (isMain || requested === void 0 || !Number.isFinite(requested)) return void 0;
+  const bounded = Math.min(AUTO_COMPACT_MAX, Math.max(AUTO_COMPACT_MIN, Math.round(requested)));
+  return Math.min(inherited, bounded);
+}
+__name(resolveAutoCompactWindow, "resolveAutoCompactWindow");
+function resolveAppendSystemPrompt(input) {
+  const env = input.env ?? {};
+  const file = (input.file || env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE || env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE || "").trim();
+  const value = (input.flag || env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT || env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT || "").trim();
+  const read = /* @__PURE__ */ __name((path) => {
+    try {
+      return input.fs.readFile(isAbsolute(path) ? path : join2(input.cwd, path)).trim();
+    } catch {
+      return "";
+    }
+  }, "read");
+  const parts = [];
+  if (file.length > 0) {
+    const text = read(file);
+    if (text.length > 0) parts.push(text);
+  }
+  if (value.startsWith("@")) {
+    const text = read(value.slice(1).trim());
+    if (text.length > 0) parts.push(text);
+  } else if (value.length > 0) {
+    parts.push(value);
+  }
+  return parts.join("\n\n");
+}
+__name(resolveAppendSystemPrompt, "resolveAppendSystemPrompt");
 
 // src/index.ts
 function scanOutput(text) {
@@ -1731,39 +1767,6 @@ function parseCacheTtl(value) {
   return ttl === "5m" || ttl === "1h" ? ttl : void 0;
 }
 __name(parseCacheTtl, "parseCacheTtl");
-var AUTO_COMPACT_MIN = 1e5;
-var AUTO_COMPACT_MAX = 1e6;
-function resolveAutoCompactWindow(inherited, requested, isMain) {
-  if (isMain || requested === void 0 || !Number.isFinite(requested)) return void 0;
-  const bounded = Math.min(AUTO_COMPACT_MAX, Math.max(AUTO_COMPACT_MIN, Math.round(requested)));
-  return Math.min(inherited, bounded);
-}
-__name(resolveAutoCompactWindow, "resolveAutoCompactWindow");
-function resolveAppendSystemPrompt(input) {
-  const env = input.env ?? {};
-  const file = (input.file || env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE || env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE || "").trim();
-  const value = (input.flag || env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT || env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT || "").trim();
-  const read = /* @__PURE__ */ __name((path) => {
-    try {
-      return input.fs.readFile(isAbsolute(path) ? path : join2(input.cwd, path)).trim();
-    } catch {
-      return "";
-    }
-  }, "read");
-  const parts = [];
-  if (file.length > 0) {
-    const text = read(file);
-    if (text.length > 0) parts.push(text);
-  }
-  if (value.startsWith("@")) {
-    const text = read(value.slice(1).trim());
-    if (text.length > 0) parts.push(text);
-  } else if (value.length > 0) {
-    parts.push(value);
-  }
-  return parts.join("\n\n");
-}
-__name(resolveAppendSystemPrompt, "resolveAppendSystemPrompt");
 function hookMatches(matcher, toolName) {
   const pattern = (matcher ?? "").trim();
   if (pattern.length === 0 || pattern === "*") return true;
@@ -2076,7 +2079,7 @@ function createAgentRegistry(deps) {
   let entries = [];
   const loggedSkips = /* @__PURE__ */ new Set();
   const definitionWarnings = /* @__PURE__ */ new WeakMap();
-  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join2(deps.home, ".commandcode", "managed"), "managedDir");
+  const managedDir = /* @__PURE__ */ __name(() => deps.managedDir ?? join3(deps.home, ".commandcode", "managed"), "managedDir");
   function pushEntry(entry) {
     entries.push(entry);
     const problem = entry.warning ?? entry.reason;
@@ -2133,7 +2136,7 @@ function createAgentRegistry(deps) {
     }
     for (const name of names) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join2(dir, name);
+      const full = join3(dir, name);
       if (name.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, scope);
         if (definition === void 0) continue;
@@ -2160,7 +2163,7 @@ function createAgentRegistry(deps) {
     }
     for (const child of children) {
       if (entries.length >= AGENT_SCAN_MAX) return;
-      const full = join2(dir, child);
+      const full = join3(dir, child);
       if (child.toLowerCase().endsWith(".md")) {
         const definition = scanFile(full, "plugin", {
           plugin: true,
@@ -2191,7 +2194,7 @@ function createAgentRegistry(deps) {
       return;
     }
     for (const pluginName of pluginNames) {
-      const agentsDir = join2(root, pluginName, "agents");
+      const agentsDir = join3(root, pluginName, "agents");
       if (deps.fs.exists(agentsDir)) scanPluginDir(agentsDir, pluginName, [], 0, found, /* @__PURE__ */ new Map());
     }
   }
@@ -2211,9 +2214,9 @@ function createAgentRegistry(deps) {
   __name(projectBases, "projectBases");
   function pluginRoots() {
     const roots = [...deps.pluginRoots ?? []];
-    roots.push(join2(managedDir(), "plugins"));
-    for (const base of projectBases()) roots.push(join2(base, ".commandcode", "plugins"));
-    roots.push(join2(deps.home, ".commandcode", "plugins"));
+    roots.push(join3(managedDir(), "plugins"));
+    for (const base of projectBases()) roots.push(join3(base, ".commandcode", "plugins"));
+    roots.push(join3(deps.home, ".commandcode", "plugins"));
     return roots;
   }
   __name(pluginRoots, "pluginRoots");
@@ -2334,15 +2337,15 @@ function createAgentRegistry(deps) {
   function refresh() {
     entries = [];
     const found = [];
-    scanDir(join2(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join3(managedDir(), "agents"), "managed", 0, found, /* @__PURE__ */ new Map());
     scanCli(found);
     for (const base of projectBases()) {
-      scanDir(join2(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join3(base, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
     for (const dir of deps.addDirs ?? []) {
-      scanDir(join2(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
+      scanDir(join3(dir, ".commandcode", "agents"), "project", 0, found, /* @__PURE__ */ new Map());
     }
-    scanDir(join2(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
+    scanDir(join3(deps.home, ".commandcode", "agents"), "user", 0, found, /* @__PURE__ */ new Map());
     for (const root of pluginRoots()) scanPlugins(root, found);
     found.push(...deps.builtins);
     const seen = /* @__PURE__ */ new Set();
@@ -2399,7 +2402,7 @@ function startupFile(fs, path) {
 __name(startupFile, "startupFile");
 function hasGitMarker(fs, dir) {
   try {
-    fs.stat(join2(dir, ".git"));
+    fs.stat(join3(dir, ".git"));
     return true;
   } catch {
     return false;
@@ -2423,11 +2426,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute(path) ? path : join2(cwd, path);
+    const absolute = isAbsolute2(path) ? path : join3(cwd, path);
     let dir = dirname(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join2(dir, "CLAUDE.md");
+      const filePath = join3(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -2447,24 +2450,24 @@ function claudeMdHierarchy(options) {
   const agentsMd = [];
   const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
   if (!skipHierarchy && definition?.scope !== "managed") {
-    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join2(options.home, ".commandcode", "managed", "CLAUDE.md");
+    const managedPath = env.BETTER_SUBAGENTS_MANAGED_CLAUDE_MD ?? join3(options.home, ".commandcode", "managed", "CLAUDE.md");
     const managed = startupFile(fs, managedPath);
     if (managed !== void 0) claudeMd.push(managed);
   }
   if (!skipHierarchy && definition?.omitClaudeMd !== true) {
     const user = startupFile(
       fs,
-      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join2(options.home, ".commandcode", "CLAUDE.md")
+      env.BETTER_SUBAGENTS_USER_CLAUDE_MD ?? join3(options.home, ".commandcode", "CLAUDE.md")
     );
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join2(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join3(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join2(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join3(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join2(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join3(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -2476,11 +2479,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join2(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join2(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join3(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join3(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join2(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join2(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join3(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join3(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -2488,8 +2491,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join2(options.home, ".commandcode", "agent-memory") : scope === "project" ? join2(options.cwd, ".commandcode", "agent-memory") : join2(options.cwd, ".commandcode", "agent-memory-local");
-  return join2(root, name);
+  const root = scope === "user" ? join3(options.home, ".commandcode", "agent-memory") : scope === "project" ? join3(options.cwd, ".commandcode", "agent-memory") : join3(options.cwd, ".commandcode", "agent-memory-local");
+  return join3(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -2526,7 +2529,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join2(dir, MEMORY_INDEX_FILE);
+  const path = join3(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -3156,7 +3159,7 @@ function mcpServerConfigs(fs, dirs) {
   for (const dir of dirs.slice(0, 4)) {
     if (typeof dir !== "string" || dir.length === 0) continue;
     try {
-      const parsed = JSON.parse(fs.readFile(join2(dir, ".commandcode", "mcp.json")));
+      const parsed = JSON.parse(fs.readFile(join3(dir, ".commandcode", "mcp.json")));
       for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
         if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
         if (config === null || typeof config !== "object") continue;
@@ -3185,11 +3188,11 @@ function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
   if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute(path) ? path : join2(roots.cwd, path);
+  const absolute = isAbsolute2(path) ? path : join3(roots.cwd, path);
   const trustedRoots = [
     roots.cwd,
     roots.home,
-    roots.managedDir ?? join2(roots.home, ".commandcode", "managed"),
+    roots.managedDir ?? join3(roots.home, ".commandcode", "managed"),
     ...roots.addDirs ?? []
   ];
   return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
@@ -3594,7 +3597,7 @@ function sweepExpiredEntries(io, dir, now, options = {}) {
   }
   const removed = [];
   for (const name of names) {
-    const file = join2(dir, name);
+    const file = join3(dir, name);
     try {
       if (options.skip?.(name) === true) continue;
       const expired = options.expired?.(name) === true;
@@ -3699,15 +3702,15 @@ function index_default(cmd, overrides = {}) {
     flag: readFlag(FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join2(root, "inbox");
-  const claimedDir = join2(root, "claimed");
-  const orphanedDir = join2(root, "orphaned");
-  const logsDir = join2(root, "logs");
-  const jobsDir = join2(root, "jobs");
-  const transcriptsDir = join2(root, "transcripts");
-  const worktreesDir = join2(root, "worktrees");
-  const controlRoot = join2(root, "control");
-  const ledgerPath = join2(root, "delivered.jsonl");
+  const inboxDir = join3(root, "inbox");
+  const claimedDir = join3(root, "claimed");
+  const orphanedDir = join3(root, "orphaned");
+  const logsDir = join3(root, "logs");
+  const jobsDir = join3(root, "jobs");
+  const transcriptsDir = join3(root, "transcripts");
+  const worktreesDir = join3(root, "worktrees");
+  const controlRoot = join3(root, "control");
+  const ledgerPath = join3(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -3730,7 +3733,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: readFlag(CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join2(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join3(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -3834,13 +3837,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join2(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join3(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join2(current, ".git"));
+        spool.stat(join3(current, ".git"));
         break;
       } catch {
       }
@@ -3973,7 +3976,7 @@ ${next2}`;
   __name(formatSignalMessage, "formatSignalMessage");
   function readJob(id) {
     try {
-      const parsed = JSON.parse(spool.readFile(join2(jobsDir, `${id}.json`)));
+      const parsed = JSON.parse(spool.readFile(join3(jobsDir, `${id}.json`)));
       return parsed && typeof parsed.id === "string" ? parsed : void 0;
     } catch {
       return void 0;
@@ -3982,7 +3985,7 @@ ${next2}`;
   __name(readJob, "readJob");
   function writeJob(record) {
     try {
-      const file = join2(jobsDir, `${record.id}.json`);
+      const file = join3(jobsDir, `${record.id}.json`);
       const tmp = `${file}.mod-${runtime.pid}-${runtime.now()}`;
       spool.writeFile(tmp, JSON.stringify(record, null, 2));
       spool.rename(tmp, file);
@@ -4011,7 +4014,7 @@ ${next2}`;
     const jobs = [];
     for (const name of names.slice(-limit).reverse()) {
       try {
-        jobs.push(JSON.parse(spool.readFile(join2(jobsDir, name))));
+        jobs.push(JSON.parse(spool.readFile(join3(jobsDir, name))));
       } catch {
       }
     }
@@ -4049,7 +4052,7 @@ ${next2}`;
     const alive = runtime.alive(record.workerPid) || runtime.alive(record.pid);
     let busy = true;
     try {
-      const state = JSON.parse(spool.readFile(join2(controlRoot, record.id, "state.json")));
+      const state = JSON.parse(spool.readFile(join3(controlRoot, record.id, "state.json")));
       busy = state.busy !== false;
     } catch {
     }
@@ -4057,10 +4060,10 @@ ${next2}`;
   }
   __name(liveState, "liveState");
   function appendLive(id, from, message) {
-    const dir = join2(controlRoot, id);
+    const dir = join3(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join2(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join3(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -4092,9 +4095,9 @@ ${next2}`;
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join2(inboxDir, `.tmp-${stamp}`);
+      const tmp = join3(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join2(inboxDir, stamp));
+      spool.rename(tmp, join3(inboxDir, stamp));
     } catch {
     }
   }
@@ -4124,8 +4127,8 @@ ${next2}`;
     for (const name of inboxNames()) {
       if (seen.has(name)) continue;
       seen.add(name);
-      const live = join2(inboxDir, name);
-      const claimed = join2(claimedDir, name);
+      const live = join3(inboxDir, name);
+      const claimed = join3(claimedDir, name);
       try {
         spool.rename(live, claimed);
       } catch {
@@ -4176,7 +4179,7 @@ ${next2}`;
       try {
         spool.rename(
           claim.claimed,
-          join2(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
+          join3(orphanedDir, `${runtime.now()}-${Math.random().toString(36).slice(2, 6)}-${claim.name}`)
         );
       } catch {
       }
@@ -4197,7 +4200,7 @@ ${next2}`;
   function answerLivePermissions() {
     for (const job of jobCache) {
       if (job.live !== true) continue;
-      void answerPendingPermission(join2(controlRoot, job.id), answeredPermissions);
+      void answerPendingPermission(join3(controlRoot, job.id), answeredPermissions);
     }
   }
   __name(answerLivePermissions, "answerLivePermissions");
@@ -4258,7 +4261,7 @@ ${next2}`;
     for (const base of [runtime.cwd, runtime.home]) {
       if (typeof base !== "string" || base.length === 0) continue;
       try {
-        const parsed = JSON.parse(spool.readFile(join2(base, ".commandcode", "settings.json")));
+        const parsed = JSON.parse(spool.readFile(join3(base, ".commandcode", "settings.json")));
         const value = Number(parsed?.[CLEANUP_PERIOD_SETTING]);
         if (Number.isFinite(value) && value > 0) return value;
       } catch {
@@ -4293,7 +4296,7 @@ ${next2}`;
       expired: /* @__PURE__ */ __name((name) => {
         if (!name.endsWith(".json") || name.includes(".tmp-")) return false;
         try {
-          const job = JSON.parse(spool.readFile(join2(jobsDir, name)));
+          const job = JSON.parse(spool.readFile(join3(jobsDir, name)));
           const state = normalizeState(job.state);
           if (state === void 0 || !isTerminal(state)) return false;
           const settledAt = Number(job.finishedAt ?? job.updatedAt ?? job.startedAt ?? 0) || 0;
@@ -4308,18 +4311,18 @@ ${next2}`;
     for (const job of expired) {
       const id = job.id;
       try {
-        spool.remove(join2(logsDir, `${id}.log`));
+        spool.remove(join3(logsDir, `${id}.log`));
       } catch {
       }
       try {
         spool.remove(
-          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join2(transcriptsDir, `${id}.jsonl`)
+          typeof job.transcriptPath === "string" && job.transcriptPath.length > 0 ? job.transcriptPath : join3(transcriptsDir, `${id}.jsonl`)
         );
       } catch {
       }
       discardCleanWorktree(
         job,
-        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join2(worktreesDir, id)
+        typeof job.worktree === "string" && job.worktree.length > 0 ? job.worktree : join3(worktreesDir, id)
       );
     }
     sweepExpiredEntries(spool, logsDir, now, {
@@ -4354,7 +4357,7 @@ ${next2}`;
         const state = normalizeState(job.state);
         if (state === void 0 || !isTerminal(state)) continue;
       }
-      const path = join2(worktreesDir, name);
+      const path = join3(worktreesDir, name);
       let old = false;
       try {
         old = now - spool.stat(path).mtimeMs > ttlMs;
@@ -4520,8 +4523,8 @@ ${next2}`;
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join2(controlRoot, id));
-        spool.writeFile(join2(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join3(controlRoot, id));
+        spool.writeFile(join3(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -4606,7 +4609,7 @@ ${next2}`;
         ...intent.oneShot === true ? {} : { agentId: id },
         agentType: intent.agentType ?? "general-purpose",
         sessionName: sessionNameOf(id),
-        transcriptPath: join2(transcriptsDir, `${id}.jsonl`),
+        transcriptPath: join3(transcriptsDir, `${id}.jsonl`),
         ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
       } : {},
       ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
@@ -4695,9 +4698,9 @@ ${next2}`;
       };
     }
     const id = `${runtime.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-    const logPath = join2(logsDir, `${id}.log`);
+    const logPath = join3(logsDir, `${id}.log`);
     const startedAt = runtime.now();
-    const isolation2 = intent.isolation === "worktree" ? createJobWorktree({ git: git.git, fs: spool }, { cwd: intent.cwd, path: join2(worktreesDir, id) }) : void 0;
+    const isolation2 = intent.isolation === "worktree" ? createJobWorktree({ git: git.git, fs: spool }, { cwd: intent.cwd, path: join3(worktreesDir, id) }) : void 0;
     const owner = intent.owner ?? currentOwner();
     const record = makeRecord(
       { ...intent, depth, ...workerSpec?.id !== void 0 ? { parentJobId: workerSpec.id } : {} },
@@ -4732,7 +4735,7 @@ ${next2}`;
     const idleMs = Number(runtime.env.BETTER_SUBAGENTS_LIVE_IDLE_MS);
     if (live) {
       try {
-        spool.mkdir(join2(controlRoot, id));
+        spool.mkdir(join3(controlRoot, id));
       } catch {
       }
     }
@@ -4756,7 +4759,7 @@ ${next2}`;
         background: intent.background !== false,
         // A foreground caller answers permission prompts inline; a background run
         // settles with the request instead of holding a worker that nobody watches.
-        ...intent.background === false ? { interactive: true, controlDir: join2(jobsDir, "..", "control", id) } : {},
+        ...intent.background === false ? { interactive: true, controlDir: join3(jobsDir, "..", "control", id) } : {},
         depth,
         ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
         ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
@@ -4788,8 +4791,8 @@ ${next2}`;
         ...roster.roster !== void 0 ? { roster: roster.roster } : {},
         ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
         ...intent.background !== void 0 ? { background: intent.background } : {},
-        ...live ? { live: true, controlDir: join2(controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
-        ...isAgent ? { promptMarkerPath: join2(logsDir, `${id}.mod`) } : {},
+        ...live ? { live: true, controlDir: join3(controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
+        ...isAgent ? { promptMarkerPath: join3(logsDir, `${id}.mod`) } : {},
         ...isolation2?.ok === true ? { worktree: isolation2.path, mainCheckouts: isolation2.mainCheckouts } : {}
       },
       MOD_PATH
@@ -4802,7 +4805,7 @@ ${next2}`;
   async function answerPendingPermission(controlDir, answered) {
     let request;
     try {
-      request = JSON.parse(spool.readFile(join2(controlDir, "permission.json")));
+      request = JSON.parse(spool.readFile(join3(controlDir, "permission.json")));
     } catch {
       return;
     }
@@ -4829,7 +4832,7 @@ ${next2}`;
     const picked = choices.find((choice) => choice.label === chosen);
     const option = picked === void 0 ? void 0 : options[picked.index];
     const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
-    const file = join2(controlDir, "permission-response.json");
+    const file = join3(controlDir, "permission-response.json");
     const tmp = `${file}.mod-${process.pid}-${runtime.now()}`;
     spool.writeFile(tmp, JSON.stringify(response));
     spool.rename(tmp, file);
@@ -4839,7 +4842,7 @@ ${next2}`;
     const rounds = Math.ceil(FOREGROUND_WAIT_MAX_MS / FOREGROUND_POLL_MS) + 1;
     let record = readJob(launched.id);
     const answered = /* @__PURE__ */ new Set();
-    const permissionDir = join2(controlRoot, launched.id);
+    const permissionDir = join3(controlRoot, launched.id);
     for (let round = 0; round < rounds && !isTerminalState(record?.state); round += 1) {
       if (backgroundedForegrounds.has(launched.id)) {
         refreshJobs();
@@ -4866,7 +4869,7 @@ ${next2}`;
         error: `foreground subagent ${launched.id} did not finish within ${Math.round(FOREGROUND_WAIT_MAX_MS / 1e3)}s; it continues in the background, and its result will arrive as a signal`
       };
     }
-    const log = readLog(String(record.logPath ?? join2(logsDir, `${launched.id}.log`)));
+    const log = readLog(String(record.logPath ?? join3(logsDir, `${launched.id}.log`)));
     const decision = finalizeJobWorktree(record);
     const outcome = foregroundOutcome(record, log);
     if (decision?.kept !== true) return { ...launched, result: outcome };
@@ -5212,7 +5215,7 @@ ${launched.result.text}` : launched.result.text
     return okText(
       `spawned ${launched.id} "${plan.description}" as ${kind}, pid ${launched.pid}.
 ` + (spawnedAgentId !== void 0 ? `agent id ${spawnedAgentId}
-` : "") + `log ${join2(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join3(logsDir, `${launched.id}.log`)}
 The result arrives here as a signal when it exits - do not wait for it. subagent_output ${launched.id} reads the live log; subagent_cancel ${launched.id} stops it.`
     );
   }, "spawnRun");
@@ -5235,7 +5238,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
   }
   __name(readLog, "readLog");
   function transcriptText(id, record) {
-    const file = String(record.transcriptPath ?? join2(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.transcriptPath ?? join3(transcriptsDir, `${id}.jsonl`));
     let raw = "";
     try {
       raw = spool.readFile(file);
@@ -5267,8 +5270,8 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const record = readJob(id);
     if (record === void 0) return badInput(`subagent: no job ${id}`);
     const state = canonicalState(record.state);
-    const file = String(record.logPath ?? join2(logsDir, `${id}.log`));
-    const transcriptPath = String(record.transcriptPath ?? join2(transcriptsDir, `${id}.jsonl`));
+    const file = String(record.logPath ?? join3(logsDir, `${id}.log`));
+    const transcriptPath = String(record.transcriptPath ?? join3(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
     const logText = readLog(file);
     const log = logText.length > 0 ? logText : transcript;
@@ -5463,7 +5466,7 @@ transcript ${transcriptPath}` : "") + `${timing}
       resumedAgentId,
       `resumed ${jobId} as ${launched.id} "${String(record.description ?? jobId)} (resume)", pid ${launched.pid}.
 ` + (resumedAgentId !== void 0 ? `agent id ${resumedAgentId}
-` : "") + `log ${join2(logsDir, `${launched.id}.log`)}
+` : "") + `log ${join3(logsDir, `${launched.id}.log`)}
 ` + (record.fork === true ? "The resumed fork reports back here as its own signal." : "The resumed run reports back here as its own signal.")
     );
   }, "resumeRun");
@@ -5980,7 +5983,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute(wanted) ? wanted : join2(cmd.cwd, wanted);
+      const dir = isAbsolute2(wanted) ? wanted : join3(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
