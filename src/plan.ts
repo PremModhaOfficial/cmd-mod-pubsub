@@ -10,6 +10,7 @@
 
 import {join} from 'node:path';
 import {FORK_AGENT_TYPE} from './constants.ts';
+import {backgroundDisabled} from './config.ts';
 import type {JobRecord} from './jobs.ts';
 import type {SpoolFs} from './types.ts';
 
@@ -303,12 +304,17 @@ export function planFromInput(
 		}
 	}
 	// Three inputs, one precedence table: the disable env, the definition's pinned
-	// background, then the caller's request. Fork mode overrides all of them for a
-	// model-spawned agent (the parameter is gone from the schema) and a teammate
-	// is always foreground.
+	// background, then the caller's request. Fork mode overrides the definition and
+	// the caller for a model-spawned agent (the parameter is gone from the
+	// schema) and a teammate is always foreground.
+	//
+	// The disable env beats fork mode. Fork mode is on by default for a human in
+	// a terminal, and it removes run_in_background from the schema, so a run under
+	// the disable env would be background with no way to ask for the foreground.
+	// The env is the user's explicit "run this in the foreground" switch.
 	const background = teammate
 		? false
-		: ctx.forkModeEnabled
+		: ctx.forkModeEnabled && !backgroundDisabled(ctx.env)
 			? true
 			: ctx.resolveExecutionPolicy({
 					...(requestedBackground !== undefined ? {requested: requestedBackground} : {}),
@@ -523,6 +529,13 @@ export function planFromRecord(
 			startup: ctx.startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
 			...(record.tools !== undefined ? {tools: record.tools} : {}),
+			// The definition's deny list travels with the resume. The restricted flag
+			// above is set from it, but the flag is not the list: without the list
+			// the worker enforces an empty deny set and the resumed agent keeps the
+			// tool its definition took away.
+			...(resumeDefinition?.disallowedTools !== undefined
+				? {disallowedTools: resumeDefinition.disallowedTools}
+				: {}),
 			...(mode === 'message'
 				? record.mcpServers !== undefined
 					? {mcpServers: record.mcpServers}

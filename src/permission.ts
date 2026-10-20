@@ -79,8 +79,12 @@ export async function answerPendingPermission(
 		// A UI that cannot ask leaves the worker's own bound in charge.
 		return;
 	}
-	if (typeof chosen !== 'string') return;
-	const picked = choices.find(choice => choice.label === chosen);
+	// A dismissed dialog is an answer: the tool call is refused. The worker is
+	// waiting for a response file, and it waits for its own timeout - 30 seconds
+	// in the background, minutes in the foreground - if none arrives. "The human
+	// said no" and "nobody answered" are the same outcome for the tool call, so
+	// the refusal is written either way.
+	const picked = typeof chosen === 'string' ? choices.find(choice => choice.label === chosen) : undefined;
 	const option = picked === undefined ? undefined : options[picked.index];
 	const response =
 		option === undefined

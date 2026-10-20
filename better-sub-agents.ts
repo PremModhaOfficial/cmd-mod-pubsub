@@ -2326,7 +2326,7 @@ function planFromInput(input, ctx) {
       permissionMode = modeResolution.mode;
     }
   }
-  const background = teammate ? false : ctx.forkModeEnabled ? true : ctx.resolveExecutionPolicy({
+  const background = teammate ? false : ctx.forkModeEnabled && !backgroundDisabled(ctx.env) ? true : ctx.resolveExecutionPolicy({
     ...requestedBackground !== void 0 ? { requested: requestedBackground } : {},
     definitionBackground: definition?.background,
     env: ctx.env
@@ -2484,6 +2484,11 @@ function planFromRecord(record, instruction, mode, ctx) {
       startup: ctx.startupFor(resumeDefinition, resumeCwd, instruction, record.model),
       model: record.model,
       ...record.tools !== void 0 ? { tools: record.tools } : {},
+      // The definition's deny list travels with the resume. The restricted flag
+      // above is set from it, but the flag is not the list: without the list
+      // the worker enforces an empty deny set and the resumed agent keeps the
+      // tool its definition took away.
+      ...resumeDefinition?.disallowedTools !== void 0 ? { disallowedTools: resumeDefinition.disallowedTools } : {},
       ...mode === "message" ? record.mcpServers !== void 0 ? { mcpServers: record.mcpServers } : {} : resumedMcp.length > 0 ? { mcpServers: resumedMcp } : {},
       ...resumeCompact !== void 0 ? { autoCompactWindow: resumeCompact } : {},
       ...resumeCacheTtl !== void 0 ? { cacheTtl: resumeCacheTtl } : {},
@@ -2590,8 +2595,7 @@ async function answerPendingPermission(controlDir, asked, ctx) {
   } catch {
     return;
   }
-  if (typeof chosen !== "string") return;
-  const picked = choices.find((choice) => choice.label === chosen);
+  const picked = typeof chosen === "string" ? choices.find((choice) => choice.label === chosen) : void 0;
   const option = picked === void 0 ? void 0 : options[picked.index];
   const response = option === void 0 ? { requestId: request.requestId, outcome: "cancelled" } : { requestId: request.requestId, optionId: option.optionId };
   const file = join9(controlDir, "permission-response.json");

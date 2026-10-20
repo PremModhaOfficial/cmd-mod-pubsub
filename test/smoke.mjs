@@ -6511,6 +6511,151 @@ process.stdin.on('data', (data) => {
 	);
 	ok('greptile: retention keeps committed work in a held checkout');
 
+	// 118. A dismissed approval is a denial, not a hang ---------------------
+	// The human pressing Esc is an answer: the tool call is refused. If the
+	// parent writes no response, the worker waits out its own permission
+	// timeout - 30 seconds in the background, minutes in the foreground - and
+	// then reports "waiting-input" as if nobody had answered.
+	const dismissDir = mkdtempSync(join(tmpdir(), 'subagent-perm-dismiss-'));
+	const dismissControl = join(dismissDir, 'control', 'dismissed-job');
+	mkdirSync(dismissControl, {recursive: true});
+	writeFileSync(
+		join(dismissControl, 'permission.json'),
+		JSON.stringify({
+			requestId: 41,
+			title: 'Write file',
+			options: [
+				{optionId: 'allow-once', kind: 'allow_once', name: 'Allow'},
+				{optionId: 'reject-once', kind: 'reject_once', name: 'Reject'},
+			],
+		}),
+	);
+	const dismissCase = modeCase(dismissDir);
+	// The job is this session's own, so the drain's owner check lets it through.
+	writeFileSync(
+		join(dismissDir, 'jobs', 'dismissed-job.json'),
+		JSON.stringify({
+			id: 'dismissed-job',
+			kind: 'agent',
+			live: true,
+			owner: ownerEntries(dismissCase.session)[0],
+			cwd: dismissDir,
+			logPath: join(dismissDir, 'logs', 'dismissed-job.log'),
+			inboxDir: join(dismissDir, 'inbox'),
+			jobsDir: join(dismissDir, 'jobs'),
+			startedAt: MODE_NOW,
+			sessionId: 'this-session',
+		}),
+	);
+	// The human dismisses the dialog: no option is chosen.
+	dismissCase.bundle.setSelectAnswer(() => undefined);
+	dismissCase.bundle.tickClock();
+	dismissCase.bundle.tickClock();
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.ok(
+		existsSync(join(dismissControl, 'permission-response.json')),
+		'a dismissed approval is answered, so the worker does not wait out its timeout',
+	);
+	const dismissResponse = JSON.parse(readFileSync(join(dismissControl, 'permission-response.json'), 'utf8'));
+	assert.equal(dismissResponse.outcome, 'cancelled', 'a dismissed approval is a denial');
+	ok('a dismissed approval is a denial, not a hang');
+
+	// 119. The disable env beats fork mode ----------------------------------
+	// Fork mode is on by default for a human in a terminal, and it removes the
+	// run_in_background parameter from the schema. So when the documented
+	// "force every run into the foreground" switch is set, the run must be
+	// foreground - otherwise it is background with no way to ask otherwise.
+	const disableDir = mkdtempSync(join(tmpdir(), 'subagent-disable-fork-'));
+	const disableRuntime = makeRuntime({
+		now: () => fixedNow,
+		env: {CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1'},
+	});
+	const disableApi = makeApi({
+		spoolDir: disableDir,
+		session: makeSession(),
+		runtime: disableRuntime.runtime,
+	});
+	disableApi.api.setFlag('fork_mode', 'on');
+	mod(disableApi.api, disableRuntime.runtime);
+	await toolOf(disableApi, 'subagent_spawn').run({input: {description: 'forced', prompt: 'work'}});
+	const disableSpec = JSON.parse(disableRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.equal(
+		disableSpec.background,
+		false,
+		'the documented disable switch forces the foreground even with fork mode on',
+	);
+	ok('the disable env beats fork mode');
+
+	// 120. A definition's denied tools reach the worker ----------------------
+	// A definition that says "this agent may not run Bash" must have that deny
+	// list in the spec the worker enforces. The definition's list was dropped:
+	// the plan carried the caller's list only, so the worker got an empty deny
+	// list and the agent kept the tool.
+	const denyDir = mkdtempSync(join(tmpdir(), 'subagent-deny-'));
+	const denyRuntime = makeRuntime({now: () => fixedNow});
+	const denyApi = makeApi({spoolDir: denyDir, session: makeSession(), runtime: denyRuntime.runtime});
+	// A project definition, in the directory the mod scans.
+	mkdirSync(join(denyDir, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(denyDir, '.commandcode', 'agents', 'restricted.md'),
+		'---\nname: restricted\ndescription: A definition that may not run Bash.\ndisallowedTools: Bash\n---\n\nA definition that may not run Bash.\n',
+	);
+	denyApi.api.setFlag('add_dir', denyDir);
+	mod(denyApi.api, denyRuntime.runtime);
+	await toolOf(denyApi, 'subagent_spawn').run({input: {description: 'denied', prompt: 'work', subagent_type: 'restricted'}});
+	const denySpec = JSON.parse(denyRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(
+		denySpec.disallowedTools,
+		['Bash'],
+		"the definition's denied tools reach the worker",
+	);
+	ok("a definition's denied tools reach the worker");
+
+	// 121. A resumed agent keeps the definition's denied tools ---------------
+	// The spawn path carries the definition's deny list. The resume path sets
+	// the restricted flag from the definition but never writes the list, so a
+	// resumed agent gets an empty deny list and keeps the tool its definition
+	// took away.
+	const denyResumeDir = mkdtempSync(join(tmpdir(), 'subagent-deny-resume-'));
+	const denyResumeRuntime = makeRuntime({now: () => fixedNow});
+	const denyResumeApi = makeApi({
+		spoolDir: denyResumeDir,
+		session: makeSession(),
+		runtime: denyResumeRuntime.runtime,
+	});
+	mkdirSync(join(denyResumeDir, '.commandcode', 'agents'), {recursive: true});
+	writeFileSync(
+		join(denyResumeDir, '.commandcode', 'agents', 'restricted.md'),
+		'---\nname: restricted\ndescription: A definition that may not run Bash.\ndisallowedTools: Bash\n---\n\nA definition that may not run Bash.\n',
+	);
+	denyResumeApi.api.setFlag('add_dir', denyResumeDir);
+	mod(denyResumeApi.api, denyResumeRuntime.runtime);
+	await toolOf(denyResumeApi, 'subagent_spawn').run({
+		input: {description: 'denied', prompt: 'work', subagent_type: 'restricted'},
+	});
+	const denyFirstSpec = JSON.parse(denyResumeRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC);
+	// The job finishes, and the resume continues it.
+	const denyRecordPath = join(denyResumeDir, 'jobs', `${denyFirstSpec.id}.json`);
+	writeFileSync(
+		denyRecordPath,
+		JSON.stringify({
+			...JSON.parse(readFileSync(denyRecordPath, 'utf8')),
+			state: 'done',
+			exitCode: 0,
+			finishedAt: fixedNow,
+			durationMs: 10,
+			acpSessionId: 'acp-session-deny',
+		}),
+	);
+	await toolOf(denyResumeApi, 'subagent_resume').run({input: {id: denyFirstSpec.id, prompt: 'continue'}});
+	const denyResumedSpec = JSON.parse(denyResumeRuntime.spawnCalls[1].options.env.SUBAGENT_SPEC);
+	assert.deepEqual(
+		denyResumedSpec.disallowedTools,
+		['Bash'],
+		"a resumed agent keeps the definition's denied tools",
+	);
+	ok("a resumed agent keeps the definition's denied tools");
+
 	process.stdout.write('\nPASS\n');
 } catch (error) {
 	fail(error);
