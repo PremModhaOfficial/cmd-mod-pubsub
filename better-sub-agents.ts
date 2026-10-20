@@ -1199,7 +1199,9 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
         configOptions = state && Array.isArray(state.configOptions) ? state.configOptions : [];
         logWrite('[acp] resumed ' + sessionId + '\\n');
       } catch (error) {
-        logWrite('[acp] resume failed: ' + String(error && error.message || error) + '\\n');
+        const detail = String(error && error.message || error);
+        logWrite('[acp] resume failed: ' + detail + '\\n');
+        throw new Error('session/resume failed: ' + detail);
       }
     }
     if (sessionId === undefined) {
@@ -1271,6 +1273,14 @@ if (spec.kind === 'agent' && child.stdout && child.stderr) {
     let hookReady = false;
     if (typeof spec.promptMarkerPath === 'string' && spec.promptMarkerPath.length > 0) {
       try { hookReady = fs.existsSync(spec.promptMarkerPath); } catch (e) { hookReady = false; }
+    }
+    // The tool check lives in this mod's beforeToolCall. If the ACP child did not
+    // load the mod, a restricted agent would keep every host tool; refuse it
+    // rather than run with a false sense of enforcement.
+    if (spec.restrictedTools === true && !hookReady) {
+      settle('failed', 'restricted tools require the worker hook; the ACP child did not load the mod', null, '', {});
+      shutdown();
+      return;
     }
     let promptText = spec.prompt;
     const preamble = [];
@@ -3315,6 +3325,10 @@ export interface WorkerSpecInput {
 	/** The team a teammate belongs to. */
 	teamName?: string;
 	systemPrompt?: string;
+	/** The resolved append text, carried so a nested worker keeps it. */
+	appendSystemPrompt?: string;
+	/** This agent's tools are restricted; the worker hook must enforce them. */
+	restrictedTools?: boolean;
 	/** PreToolUse/PostToolUse/Stop rules, active only while this agent runs. */
 	hooks?: AgentHooks;
 	model?: string;
@@ -4780,7 +4794,7 @@ export function foregroundOutcome(job: ForegroundJob, log: string): ForegroundRe
 		return {
 			ok: true,
 			partial: true,
-			text: `${text.length > 0 ? `${text}\n\n` : ''}${label} stopped with a question; answer it here or resume the job.`,
+			text: `${text.length > 0 ? `${text}\n\n` : ''}${label} stopped with a question; resume it with subagent_resume ${String(record.agentId ?? record.id)}.`,
 		};
 	}
 	const reason =
@@ -5122,8 +5136,15 @@ export function workerEnv(
 	delete env[WORKER_SPEC_ENV];
 	delete env[WORKER_ENV];
 	delete env.PUBSUB_WORKER;
+	delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT;
+	delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT;
+	delete env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT_FILE;
+	delete env.CLAUDE_CODE_APPEND_SUBAGENT_SYSTEM_PROMPT_FILE;
 	env[WORKER_SPEC_ENV] = JSON.stringify(spec);
 	env[WORKER_ENV] = '1';
+	if (typeof spec.appendSystemPrompt === 'string' && spec.appendSystemPrompt.length > 0) {
+		env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT = spec.appendSystemPrompt;
+	}
 	return env;
 }
 
@@ -5257,7 +5278,21 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// The flag's directories plus any `/add-dir` the user ran. One array, mutated in
 	// place, so the registry, the MCP trust roots and every refresh agree.
 	const addDirs = splitFlag(ADD_DIRS_OPTION);
-	const root = pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT);
+	// A headless worker loads this mod too. It has its own owner token and must never
+	// steal an unaddressed signal from the session that fired it.
+	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
+	// The worker carries the parent's absolute spool paths in its spec; derive the
+	// root from them so send, handback, and nested spawns use the same spool.
+	const workerRoot = (() => {
+		if (!workerMode) return undefined;
+		try {
+			const spec = JSON.parse(String(runtime.env[WORKER_SPEC_ENV] ?? '')) as WorkerSpec;
+			return typeof spec.inboxDir === 'string' ? dirname(spec.inboxDir) : undefined;
+		} catch {
+			return undefined;
+		}
+	})();
+	const root = workerRoot ?? resolve(pick('subagent_dir', SUBAGENT_DIR_DEFAULT, 'pubsub_dir', PUBSUB_DIR_DEFAULT));
 	const forkMode = resolveForkMode({
 		interactive: runtime.interactive === true,
 		env: runtime.env,
@@ -5276,10 +5311,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
 		spool.mkdir(dir);
 	}
-
-	// A headless worker loads this mod too. It has its own owner token and must never
-	// steal an unaddressed signal from the session that fired it.
-	const workerMode = runtime.env[WORKER_ENV] === '1' || runtime.env.PUBSUB_WORKER === '1';
 
 	// The main conversation's permission mode. There is no getter in the host API:
 	// the mode arrives through `permission_mode_changed` and the system-prompt hook
@@ -5390,15 +5421,16 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// The text every subagent's system prompt gets, from the flag, the file form,
 	// the @path form, or the environment alias. A fork is exempt because it reuses
 	// the main conversation's prompt (phase 15).
+	const appendPromptText = resolveAppendSystemPrompt({
+		flag: readFlag('append_subagent_system_prompt'),
+		file: readFlag('append_subagent_system_prompt_file'),
+		env: runtime.env,
+		fs: spool,
+		cwd: runtime.cwd,
+	});
+
 	function subagentSystemPrompt(base: string | undefined): string | undefined {
-		const appended = resolveAppendSystemPrompt({
-			flag: readFlag('append_subagent_system_prompt'),
-			file: readFlag('append_subagent_system_prompt_file'),
-			env: runtime.env,
-			fs: spool,
-			cwd: runtime.cwd,
-		});
-		const parts = [base ?? '', appended].filter(part => part.length > 0);
+		const parts = [base ?? '', appendPromptText].filter(part => part.length > 0);
 		return parts.length > 0 ? parts.join('\n\n') : undefined;
 	}
 
@@ -5636,7 +5668,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				: '';
 		const next =
 			state === 'waiting-input'
-				? 'The job is resumable: answer here, or fire a follow-up job. Nothing else arrives until then.'
+				? typeof message.agentId === 'string'
+					? `The job is resumable: subagent_resume {id: "${message.agentId}", prompt} continues it. Nothing else arrives until then.`
+					: 'The job is not resumable (no agent id); fire a follow-up job. Nothing else arrives until then.'
 				: state === 'canceled'
 					? 'The job was canceled; nothing else will arrive for it.'
 					: message.partial === true && typeof message.agentId === 'string'
@@ -6391,6 +6425,10 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		readonly mainSessionId?: string;
 		/** The team this teammate belongs to. */
 		readonly teamName?: string;
+		/** The resolved append text, carried to nested agents. */
+		readonly appendSystemPrompt?: string;
+		/** A tool restriction that only the worker hook can enforce. */
+		readonly restrictedTools?: boolean;
 		/** This job's nesting level, and the job that spawned it. */
 		readonly depth?: number;
 		readonly parentJobId?: string;
@@ -6687,6 +6725,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 						: {}),
 				...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
 				...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
+				...(intent.appendSystemPrompt !== undefined ? {appendSystemPrompt: intent.appendSystemPrompt} : {}),
+				...(intent.restrictedTools === true ? {restrictedTools: true} : {}),
 				...(intent.hooks !== undefined ? {hooks: intent.hooks} : {}),
 				...(intent.startup !== undefined ? {startup: intent.startup} : {}),
 				...(intent.model !== undefined ? {model: intent.model} : {}),
@@ -7175,6 +7215,11 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 				? {fork: true, ...(sessionId !== undefined ? {mainSessionId: sessionId} : {})}
 				: {}),
 			systemPrompt: forkRequested ? undefined : subagentSystemPrompt(definition?.prompt),
+			appendSystemPrompt: appendPromptText,
+			restrictedTools:
+				definition?.tools !== undefined ||
+				definition?.disallowedTools !== undefined ||
+				requestedDisallowed !== undefined,
 			hooks: forkRequested ? undefined : definition?.hooks,
 			startup: forkRequested ? undefined : startupFor(definition, runCwd, prompt, launch.model),
 			model: prompt === undefined || forkRequested ? undefined : launch.model,
@@ -7460,6 +7505,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			cwd: resumeCwd,
 			agentType: record.agentType,
 			systemPrompt: subagentSystemPrompt(resumeDefinition?.prompt),
+			appendSystemPrompt: appendPromptText,
+			restrictedTools:
+				resumeDefinition?.tools !== undefined || resumeDefinition?.disallowedTools !== undefined,
 			hooks: resumeDefinition?.hooks,
 			startup: startupFor(resumeDefinition, resumeCwd, instruction, record.model),
 			model: record.model,
@@ -7618,6 +7666,9 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			cwd: resumeCwd,
 			agentType: record.agentType,
 			systemPrompt: resumeDefinition?.prompt,
+			appendSystemPrompt: appendPromptText,
+			restrictedTools:
+				resumeDefinition?.tools !== undefined || resumeDefinition?.disallowedTools !== undefined,
 			hooks: resumeDefinition?.hooks,
 			startup: startupFor(resumeDefinition, resumeCwd, message, record.model),
 			model: record.model,

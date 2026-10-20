@@ -213,23 +213,40 @@ try {
 		input: {to: 'ponger', message: 'Reply with exactly the word banana and nothing else.'},
 	});
 	assert.equal(liveSend.ok, true, `live send must start: ${JSON.stringify(liveSend)}`);
+	const pongerIds = () =>
+		readdirSync(join(dir, 'jobs'))
+			.filter((file) => file.endsWith('.json'))
+			.map((file) => file.slice(0, -'.json'.length))
+			.filter((id) => {
+				try {
+					return JSON.parse(readFileSync(join(dir, 'jobs', `${id}.json`), 'utf8')).name === 'ponger';
+				} catch {
+					return false;
+				}
+			});
+	const assistantText = (id) => {
+		try {
+			return readFileSync(join(dir, 'transcripts', `${id}.jsonl`), 'utf8')
+				.trim()
+				.split('\n')
+				.map((line) => {
+					try {
+						return JSON.parse(line);
+					} catch {
+						return undefined;
+					}
+				})
+				.filter((entry) => entry && entry.update && entry.update.sessionUpdate === 'agent_message_chunk')
+				.map((entry) => String((entry.update.content && entry.update.content.text) || ''))
+				.join('');
+		} catch {
+			return '';
+		}
+	};
 	const liveText = await waitFor(() => {
-		const own = readFileSync(join(dir, 'logs', `${agentId}.log`), 'utf8');
-		if (/banana/i.test(own)) return own;
-		for (const name of readdirSync(join(dir, 'jobs')).filter((file) => file.endsWith('.json'))) {
-			let job;
-			try {
-				job = JSON.parse(readFileSync(join(dir, 'jobs', name), 'utf8'));
-			} catch {
-				continue;
-			}
-			if (job.name !== 'ponger' || job.id === agentId) continue;
-			try {
-				const text = readFileSync(join(dir, 'logs', `${job.id}.log`), 'utf8');
-				if (/banana/i.test(text)) return text;
-			} catch {
-				/* the resumed job has not opened its log yet */
-			}
+		for (const id of pongerIds()) {
+			const text = assistantText(id);
+			if (/banana/i.test(text)) return text;
 		}
 		return undefined;
 	}, 'the live message to be answered', 180_000);

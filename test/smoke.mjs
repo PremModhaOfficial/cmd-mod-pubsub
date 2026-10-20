@@ -4581,6 +4581,12 @@ process.stdin.on('data', (data) => {
 	};
 	const inlineAppend = await runAgent({append_subagent_system_prompt: 'EXTRA RULES'});
 	assert.match(inlineAppend.spec.systemPrompt, /EXTRA RULES$/, 'the inline append text is last');
+	assert.equal(inlineAppend.spec.appendSystemPrompt, 'EXTRA RULES', 'the resolved append travels on the spec');
+	assert.equal(
+		inlineAppend.env.BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT,
+		'EXTRA RULES',
+		'the worker environment carries the resolved append',
+	);
 	const fileAppend = await runAgent({append_subagent_system_prompt_file: appendFile});
 	assert.match(fileAppend.spec.systemPrompt, /FILE RULES$/, 'the file form appends its content');
 	const nestedAppend = await runAgent({}, {BETTER_SUBAGENTS_APPEND_SYSTEM_PROMPT: 'NESTED RULES'});
@@ -6152,6 +6158,37 @@ process.stdin.on('data', (data) => {
 	const grepMcpSpec = JSON.parse(grepMcpCase.rt.spawnCalls.at(-1).options.env.SUBAGENT_SPEC);
 	assert.deepEqual(grepMcpSpec.mcpServers, [{name: 'docs'}], 'the follow-up keeps the recorded MCP servers');
 	ok('greptile: a follow-up keeps the recorded MCP servers');
+
+	// 112. Greptile: a worker uses the parent's spool root -------------------
+	const grepSpoolRoot = mkdtempSync(join(tmpdir(), 'subagent-greptile-spool-'));
+	const grepSpoolSpec = {
+		id: 'spool-worker',
+		description: 'spool',
+		kind: 'agent',
+		owner: 'owner-spool',
+		cwd: grepSpoolRoot,
+		logPath: join(grepSpoolRoot, 'logs', 'spool-worker.log'),
+		inboxDir: join(grepSpoolRoot, 'inbox'),
+		jobsDir: join(grepSpoolRoot, 'jobs'),
+		startedAt: 1,
+		tailMax: 1000,
+		sessionId: 'sess',
+		systemPrompt: 'body',
+		promptMarkerPath: join(grepSpoolRoot, 'logs', 'spool-worker.mod'),
+	};
+	const grepSpoolRuntime = makeRuntime({
+		env: {SUBAGENT_SPEC: JSON.stringify(grepSpoolSpec), BETTER_SUBAGENTS_WORKER: '1'},
+		now: () => 1,
+	});
+	const grepSpoolApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-greptile-spool-default-')),
+		session: makeSession(),
+		runtime: grepSpoolRuntime.runtime,
+	});
+	mod(grepSpoolApi.api, grepSpoolApi.runtime);
+	assert.ok(existsSync(join(grepSpoolRoot, 'claimed')), 'the worker uses the spec spool root');
+	assert.ok(existsSync(join(grepSpoolRoot, 'jobs')), 'the worker resolves jobs under the spec root');
+	ok('greptile: the worker uses the parent spool root');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

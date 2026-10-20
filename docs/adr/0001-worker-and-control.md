@@ -88,9 +88,9 @@ The first fork turn is not streamed. The task view sees the result at the end. F
 
 The spool signal remains the only result channel. The owner token remains the only delivery boundary.
 
-The control directory holds three files per job: `send.jsonl`, `cancel`, and `permission.json`. The adapter reads them. The parent writes them.
+The control directory holds four files per job: `send.jsonl`, `cancel`, `permission.json`, and `permission-response.json`. The parent writes `send.jsonl` and `cancel`; the adapter reads them. The adapter writes `permission.json`; the parent reads it and writes `permission-response.json`.
 
-The adapter writes `permission.json` with the request id, the tool call, and the options. The parent writes `permission-response.json` with the selected option. The adapter maps the selection to the ACP response.
+The adapter writes `permission.json` with the request id, the tool call, and the options. For a foreground run the parent puts the request to the person with `cmd.ui.select` and writes `permission-response.json` with the selected option; a headless/print parent resolves `undefined` and the worker's own bound applies. The adapter maps the selection to the ACP response.
 
 ## Deviations
 
