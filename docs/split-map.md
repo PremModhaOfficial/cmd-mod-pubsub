@@ -1,9 +1,9 @@
 # Module split map
 
 Where every declaration lives, and the seams that keep the split safe. The
-line counts below are the `wc -l` of the tree at `b97cc1a`: 18 files under
-`src/`, of which 17 are TypeScript modules and one (`src/harness.d.ts`) is an
-ambient declaration, with the entry at 4,711 lines. They are a reading aid, not
+line counts below are the `wc -l` of the tree at `56b6418`: 19 files under
+`src/`, of which 18 are TypeScript modules and one (`src/harness.d.ts`) is an
+ambient declaration, with the entry at 4,184 lines. They are a reading aid, not
 an API — re-scan after a commit instead of trusting an offset.
 
 ## Artifact and build
@@ -18,14 +18,15 @@ an API — re-scan after a commit instead of trusting an offset.
   re-exports the public surface the host, `test/e2e.mjs`, and `test/harness.mjs`
   import.
 - `scripts/check-imports.mjs` enforces the module rules: only the entry may
-  name `./index.ts`, runtime imports may not cycle, and `./types.ts` is
-  type-only.
+  name `./index.ts`, runtime imports may not cycle, `./types.ts` is type-only,
+  and every file has a top-level import or export (a file without one is a
+  script, and its declarations leak as globals).
 
 ## Modules
 
 | File | Lines | Role | Imports from |
 |---|---|---|---|
-| `src/index.ts` | 4711 | Composition root: the worker string, the runtime adapter, the startup context, model/MCP/permission resolution, task rows, limits, and `activate` | every leaf below |
+| `src/index.ts` | 4184 | Composition root: the worker string, the runtime adapter, the startup context, model/MCP/permission resolution, task rows, limits, and `activate` | every leaf below |
 | `src/types.ts` | 151 | Runtime seam: `Runtime`, `SpoolFs`, `CommandResult`, `ChildHandle`, and the record shapes (`JobIdentity`, `Signal`, `JobPatch`, `PermissionRequest`, `CompactBoundary`) | — (leaf of the DAG) |
 | `src/constants.ts` | 142 | Bounds, env names, option names, default directories, `TEAM_TOOL_NAMES`, `MOD_PATH` | node:os, node:path, node:url |
 | `src/state.ts` | 109 | The six job states, aliases, transitions, markers, colors, `jobStates` | — |
@@ -42,6 +43,7 @@ an API — re-scan after a commit instead of trusting an offset.
 | `src/spawn.ts` | 559 | The worker spec and argv, the concurrency limits, `fire`, `failJob`, and the re-export of the permission bridge | `./constants.ts`, `./state.ts`, `./signals.ts`, `./worktree.ts`, `./permission.ts`; `./types.ts`, `./jobs.ts`, `./plan.ts` (type-only) |
 | `src/permission.ts` | 76 | The permission bridge: put the worker's question to the human and write the answer back | `./types.ts` (type-only) |
 | `src/config.ts` | 294 | The configuration readers: one reader per documented setting, over the env record and the host options | `./constants.ts` |
+| `src/tools.ts` | 706 | The tool surface: the `subagent_*` tools, their handlers, and the `outputText`/`sendToRecord` readers the entry's panel and commands also use | `./constants.ts`, `./config.ts`, `./definitions.ts`, `./plan.ts`, `./signals.ts`, `./spawn.ts`, `./state.ts`, `./worktree.ts`; `./jobs.ts`, `./ledger.ts`, `./types.ts` (type-only) |
 
 `src/harness.d.ts` (5 lines) is the ambient declaration for
 `@commandcode/harness`; it emits nothing and imports nothing.
@@ -77,7 +79,8 @@ an explicit deps object, and touches no session state. Its groups:
 - `activate`: the runtime/spool/git bootstrap, the identity and prompt, the
   owner token, the job store and `createDelivery` wiring, the maintenance and
   reconcile, the launch (`fire`, `startWorker`, the foreground settle), the
-  dashboard and the tool runs, the commands, the hooks, and the timers
+  dashboard and the `createTools` wiring, the commands, the hooks, and the
+  timers
 
 ## Seam rules
 
@@ -95,15 +98,28 @@ an explicit deps object, and touches no session state. Its groups:
    `index → every leaf`; `delivery → {constants, state}`;
    `worktree-lifecycle → {constants, state, worktree}`;
    `spawn → {constants, state, signals, worktree, permission}`;
-   `plan → constants`; `definitions → constants`; `config → constants`;
-   `tool-filter → constants`; `signals → state`; the rest are leaves.
-   `types.ts` is a type-only leaf: import it with `import type`. A new shared
-   symbol goes in the lowest module that needs it, not in the entry.
-4. **Embedded source stays self-contained.** `WORKER_SOURCE` calls
+   `tools → {constants, config, definitions, plan, signals, spawn, state,
+   worktree}`; `plan → constants`; `definitions → constants`;
+   `config → constants`; `tool-filter → constants`; `signals → state`; the
+   rest are leaves. `types.ts` is a type-only leaf: import it with
+   `import type`. A new shared symbol goes in the lowest module that needs it,
+   not in the entry.
+4. **Every file is a module, never a script.** A file with no top-level
+   `import` or `export` is a script: its declarations land in the global scope
+   and every other file can use them without importing. That silently hides
+   errors, because a name the entry uses but never imports resolves against the
+   leaked global. `scripts/check-imports.mjs` fails the gate on such a file.
+5. **A late-bound value crosses the seam as a function.** The entry binds
+   `sessionId` and `workerSpec` after the tool module is created, so the
+   context carries `sessionId: () => sessionId` and
+   `workerSpec: () => workerSpec`, never their current value. A value captured
+   by value is a snapshot: the tool would keep reading the session id that was
+   current when the module was built.
+6. **Embedded source stays self-contained.** `WORKER_SOURCE` calls
    `.toString()` on `signalEnvelope` and `scanOutput` at module load, so both
    bodies must stay plain, reference-free JavaScript. Do not "clean up"
    `import.meta.url`, the template literal, the `require(...)` calls inside it,
    `process.pid`, or `node -e`.
-5. **Side effects arrive as arguments.** A leaf takes `fs`/`run`/`now`/`env`
+7. **Side effects arrive as arguments.** A leaf takes `fs`/`run`/`now`/`env`
    or a deps object. Only the entry (via the runtime adapter) touches the real
    OS.
