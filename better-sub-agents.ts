@@ -2151,8 +2151,13 @@ function createWorktreeLifecycle(ctx) {
     const state = normalizeState(job.state);
     if (state === void 0 || !isTerminal(state)) return void 0;
     if (typeof job.worktree !== "string" || job.worktree.length === 0) return void 0;
-    if (job.worktreeFinalized === true) return { kept: job.worktreeKept === true, path: job.worktree };
     const live = job.live === true && liveState(job).alive;
+    if (live) {
+      const held = finalizeWorktree(git, { ...job, live: true });
+      if (held === void 0) return void 0;
+      return { kept: true, path: job.worktree };
+    }
+    if (job.worktreeFinalized === true) return { kept: job.worktreeKept === true, path: job.worktree };
     const decision = finalizeWorktree(git, { ...job, live });
     if (decision === void 0) return void 0;
     job.worktreeFinalized = true;
@@ -2564,8 +2569,10 @@ async function answerPendingPermission(controlDir, asked, ctx) {
   } catch {
     return;
   }
-  const key = String(request.requestId ?? "");
-  if (key.length === 0 || asked.has(key)) return;
+  const requestId = String(request.requestId ?? "");
+  if (requestId.length === 0) return;
+  const key = `${controlDir}\0${requestId}`;
+  if (asked.has(key)) return;
   const options = request.options ?? [];
   const choices = options.map((option2, index) => ({
     label: option2.name || option2.kind || option2.optionId || `option ${index + 1}`,
@@ -6602,6 +6609,7 @@ export {
   contextWindowForModel,
   createAgentRegistry,
   createJobWorktree,
+  createWorktreeLifecycle,
   index_default as default,
   defaultBranch,
   descriptionLimit,

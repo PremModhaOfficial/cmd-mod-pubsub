@@ -26,6 +26,7 @@ import mod, {
 	buildRoster,
 	commandEscapesWorktree,
 	createJobWorktree,
+	createWorktreeLifecycle,
 	defaultBranch,
 	finalizeWorktree,
 	foregroundOutcome,
@@ -6304,6 +6305,145 @@ process.stdin.on('data', (data) => {
 		'another conversation\'s request is not answered here',
 	);
 	ok('greptile: an approval does not cross conversations');
+
+	// 115. Greptile: two jobs can ask for the same request id ---------------
+	// Every worker numbers its own ACP messages from one, so two jobs both ask
+	// for "request 1". The shared tracker must key on the job as well, or the
+	// first job's answer suppresses the second job's question: its dialog never
+	// opens and the worker stops as waiting-input.
+	const twoDir = mkdtempSync(join(tmpdir(), 'subagent-perm-two-'));
+	const twoCase = modeCase(twoDir);
+	const twoIds = ['job-one', 'job-two'];
+	// The jobs are this session's own, so the drain's owner check lets them
+	// through: this is about one request id shared by two jobs, not about
+	// another conversation's job. The mod mints its owner token at startup and
+	// saves it to the session, so the records carry that token.
+	const twoOwner = ownerEntries(twoCase.session)[0];
+	for (const id of twoIds) {
+		const controlDir = join(twoDir, 'control', id);
+		mkdirSync(controlDir, {recursive: true});
+		// Both workers ask for request id 1. The request id is per-connection.
+		writeFileSync(
+			join(controlDir, 'permission.json'),
+			JSON.stringify({
+				requestId: 1,
+				title: `Approve ${id}?`,
+				options: [{optionId: 'allow-once', kind: 'allow_once', name: 'Allow'}],
+			}),
+		);
+		writeFileSync(
+			join(twoDir, 'jobs', `${id}.json`),
+			JSON.stringify({
+				id,
+				kind: 'agent',
+				live: true,
+				owner: twoOwner,
+				cwd: twoDir,
+				logPath: join(twoDir, 'logs', `${id}.log`),
+				inboxDir: join(twoDir, 'inbox'),
+				jobsDir: join(twoDir, 'jobs'),
+				startedAt: MODE_NOW,
+				sessionId: 'this-session',
+			}),
+		);
+	}
+	twoCase.bundle.setSelectAnswer(() => 'Allow');
+	// The drain polls every live job in the cache, so both jobs are asked.
+	twoCase.bundle.tickClock();
+	twoCase.bundle.tickClock();
+	assert.equal(
+		twoCase.bundle.selectCalls.length,
+		2,
+		`two jobs asking for the same request id must both reach the human (asked ${twoCase.bundle.selectCalls.length} times)`,
+	);
+	// The answer is written after the dialog closes, so the write is still in
+	// flight when the drain returns. Let it land.
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	for (const id of twoIds) {
+		assert.ok(
+			existsSync(join(twoDir, 'control', id, 'permission-response.json')),
+			`${id} is answered`,
+		);
+	}
+	ok('greptile: two jobs can ask for the same request id');
+
+	// 116. Greptile: a clean checkout is removed after the worker exits ------
+	// The checkout is held while the worker is alive, because a follow-up needs
+	// it. That hold is not a final answer: once the worker is gone the decision
+	// has to be made again, and a clean checkout is removed.
+	//
+	// The seam is the lifecycle, not the git helper: the bug was that the
+	// record's "finalized" flag made the hold permanent, so nothing ever looked
+	// at the checkout again.
+	const holdDir = mkdtempSync(join(tmpdir(), 'subagent-worktree-hold-'));
+	const holdGit = gitSeam({
+		'status --porcelain': {code: 0, stdout: '', stderr: ''},
+		'rev-parse HEAD': {code: 0, stdout: 'same-head\n', stderr: ''},
+	});
+	const holdRecord = {
+		id: 'held-job',
+		kind: 'agent',
+		worktree: join(holdDir, 'worktrees', 'held'),
+		worktreeRepo: holdDir,
+		worktreeHead: 'same-head',
+		live: true,
+		state: 'done',
+		startedAt: MODE_NOW,
+	};
+	let workerAlive = true;
+	const holdRecords = new Map([[holdRecord.id, {...holdRecord}]]);
+	const holdLifecycle = createWorktreeLifecycle({
+		fs: {
+			readFile: () => {
+				throw new Error('no file');
+			},
+			writeFile: () => {},
+			readdir: () => [],
+			exists: () => false,
+			mkdir: () => {},
+			remove: () => {},
+			rename: () => {},
+			stat: () => ({mtimeMs: 0, size: 0}),
+			appendFile: () => {},
+		},
+		git: holdGit,
+		now: () => MODE_NOW,
+		alive: () => workerAlive,
+		env: {},
+		cwd: holdDir,
+		home: holdDir,
+		jobsDir: join(holdDir, 'jobs'),
+		logsDir: join(holdDir, 'logs'),
+		transcriptsDir: join(holdDir, 'transcripts'),
+		worktreesDir: join(holdDir, 'worktrees'),
+		controlRoot: join(holdDir, 'control'),
+		workerMode: false,
+		readJob: id => holdRecords.get(id),
+		writeJob: job => {
+			holdRecords.set(job.id, job);
+		},
+	});
+	// The worker is alive, so the checkout is held for the follow-up.
+	const held = holdLifecycle.finalizeJobWorktree(holdRecords.get(holdRecord.id));
+	assert.equal(held.kept, true, 'a live worker keeps its checkout');
+	assert.ok(
+		!holdGit.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'),
+		'a live checkout is not removed',
+	);
+	// The worker exits. The record still says live, so the hold has to be
+	// re-decided against the worker's actual liveness, not the stale flag.
+	workerAlive = false;
+	const afterExit = holdLifecycle.finalizeJobWorktree(holdRecords.get(holdRecord.id));
+	assert.equal(
+		afterExit.kept,
+		false,
+		'a clean checkout is removed once the worker has exited',
+	);
+	assert.ok(
+		holdGit.calls.some((call) => call.args[0] === 'worktree' && call.args[1] === 'remove'),
+		'a clean checkout is removed after the worker exits',
+	);
+	ok('greptile: a clean checkout is removed after the worker exits');
 
 	process.stdout.write('\nPASS\n');
 } catch (error) {

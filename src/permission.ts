@@ -34,6 +34,13 @@ export interface PermissionContext {
 // and the delivery drain both poll the same control dir, and a request must
 // reach the human once. The key is reserved BEFORE the dialog opens, so a
 // second poll cannot open a competing dialog for the same request.
+//
+// The key is the request id SCOPED BY THE CONTROL DIR. The request id is the
+// worker's own ACP message id, and every worker numbers its messages from one.
+// Two unrelated jobs therefore ask for "request 1" at the same time, and a key
+// of the bare request id would let the first job's answer suppress the second
+// job's question - its dialog would never open and the worker would stop as
+// waiting-input.
 export async function answerPendingPermission(
 	controlDir: string,
 	asked: Set<string>,
@@ -45,8 +52,10 @@ export async function answerPendingPermission(
 	} catch {
 		return;
 	}
-	const key = String(request.requestId ?? '');
-	if (key.length === 0 || asked.has(key)) return;
+	const requestId = String(request.requestId ?? '');
+	if (requestId.length === 0) return;
+	const key = `${controlDir}\u0000${requestId}`;
+	if (asked.has(key)) return;
 	const options = request.options ?? [];
 	const choices = options.map((option, index) => ({
 		label: option.name || option.kind || option.optionId || `option ${index + 1}`,

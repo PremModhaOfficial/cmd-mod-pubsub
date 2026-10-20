@@ -168,13 +168,23 @@ export function createWorktreeLifecycle(ctx: WorktreeLifecycleContext): Worktree
 		const state = normalizeState(job.state);
 		if (state === undefined || !isTerminal(state)) return undefined;
 		if (typeof job.worktree !== 'string' || job.worktree.length === 0) return undefined;
-		// Already decided by the restart reconcile or an earlier format: report the kept
-		// path again without touching git, so delivery never loses the note.
-		if (job.worktreeFinalized === true) return {kept: job.worktreeKept === true, path: job.worktree};
 		// The record's `live` flag outlives the worker. Pass its actual liveness: a
 		// follow-up needs the checkout, but after exit a clean one is removed and a
 		// changed one is kept.
 		const live = job.live === true && liveState(job).alive;
+		// A hold for a live worker is PROVISIONAL. The worker may still take a
+		// follow-up, so the checkout is kept - but the worker will not ask again,
+		// and nothing would ever look at the checkout a second time. The decision
+		// is therefore only final once the worker is gone: a hold does not write
+		// the finalized flag, so the next observation decides it for real.
+		if (live) {
+			const held = finalizeWorktree(git, {...job, live: true});
+			if (held === undefined) return undefined;
+			return {kept: true, path: job.worktree};
+		}
+		// Already decided, and the worker is gone: report the kept path again
+		// without touching git, so delivery never loses the note.
+		if (job.worktreeFinalized === true) return {kept: job.worktreeKept === true, path: job.worktree};
 		const decision = finalizeWorktree(git, {...job, live});
 		if (decision === undefined) return undefined;
 		job.worktreeFinalized = true;

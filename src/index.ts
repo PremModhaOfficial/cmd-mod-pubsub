@@ -184,6 +184,7 @@ export {
 export {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 export {ledgerFactory} from './ledger.ts';
 export {sweepExpiredEntries};
+export {createWorktreeLifecycle};
 export type {SweepIo, SweepOptions} from './worktree-lifecycle.ts';
 export {
 	BACKGROUND_BUILTIN_TOOLS,

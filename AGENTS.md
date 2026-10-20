@@ -16,8 +16,10 @@ The root `better-sub-agents.ts` is generated from `src/`. Edit `src/` only, run
 
 ## Moving a group of code into a module
 
-1. `node scripts/extract-region.mjs src/index.ts <start> <end> src/<name>.ts`
-   cuts the range out and writes the new module in one command.
+1. `node scripts/extract-region.mjs src/index.ts src/<name>.ts <start>-<end>`
+   cuts the range out and writes the new module in one command. The range is
+   `<start>-<end>,` 1-based and inclusive; pass several ranges separated by
+   spaces to move one group that is not contiguous.
 2. `npx tsc --noEmit` lists every name the new module still needs. Each is
    either an import from a lower module or a field on the context object the
    entry passes in. Add them; the checker says which, so do not re-read the
