@@ -223,6 +223,59 @@ function resolveAppendSystemPrompt(input) {
 }
 __name(resolveAppendSystemPrompt, "resolveAppendSystemPrompt");
 
+// src/ledger.ts
+function createLedger(deps) {
+  const ids = /* @__PURE__ */ new Map();
+  const ordered = /* @__PURE__ */ __name(() => [...ids.entries()].sort((left, right) => left[1] - right[1]), "ordered");
+  function write() {
+    const body = ordered().map(([id, at]) => JSON.stringify({ id, at })).join("\n");
+    try {
+      deps.fs.writeFile(deps.path, body.length > 0 ? `${body}
+` : "");
+    } catch {
+    }
+  }
+  __name(write, "write");
+  function retain(limit) {
+    const keep = ordered().slice(-Math.max(0, limit));
+    ids.clear();
+    for (const [id, at] of keep) ids.set(id, at);
+    write();
+  }
+  __name(retain, "retain");
+  try {
+    for (const line of deps.fs.readFile(deps.path).split("\n").filter(Boolean).slice(-deps.max)) {
+      try {
+        const entry = JSON.parse(line);
+        if (typeof entry.id === "string") ids.set(entry.id, typeof entry.at === "number" ? entry.at : 0);
+      } catch {
+      }
+    }
+  } catch {
+  }
+  try {
+    if (deps.fs.stat(deps.path).size > deps.compactBytes) retain(deps.keep);
+  } catch {
+  }
+  return {
+    has: /* @__PURE__ */ __name((id) => ids.has(id), "has"),
+    accept: /* @__PURE__ */ __name((id) => {
+      if (ids.has(id)) return;
+      const at = deps.now();
+      ids.set(id, at);
+      try {
+        deps.fs.appendFile(deps.path, JSON.stringify({ id, at }) + "\n");
+      } catch {
+      }
+      if (ids.size > deps.max) retain(deps.keep);
+    }, "accept"),
+    retain,
+    size: /* @__PURE__ */ __name(() => ids.size, "size")
+  };
+}
+__name(createLedger, "createLedger");
+var ledgerFactory = createLedger;
+
 // src/tool-filter.ts
 var SUBAGENT_TOOL_UNIVERSE = [
   "Agent",
@@ -3507,57 +3560,6 @@ function patchOf(signal) {
   return patch;
 }
 __name(patchOf, "patchOf");
-function createLedger(deps) {
-  const ids = /* @__PURE__ */ new Map();
-  const ordered = /* @__PURE__ */ __name(() => [...ids.entries()].sort((left, right) => left[1] - right[1]), "ordered");
-  function write() {
-    const body = ordered().map(([id, at]) => JSON.stringify({ id, at })).join("\n");
-    try {
-      deps.fs.writeFile(deps.path, body.length > 0 ? `${body}
-` : "");
-    } catch {
-    }
-  }
-  __name(write, "write");
-  function retain(limit) {
-    const keep = ordered().slice(-Math.max(0, limit));
-    ids.clear();
-    for (const [id, at] of keep) ids.set(id, at);
-    write();
-  }
-  __name(retain, "retain");
-  try {
-    for (const line of deps.fs.readFile(deps.path).split("\n").filter(Boolean).slice(-deps.max)) {
-      try {
-        const entry = JSON.parse(line);
-        if (typeof entry.id === "string") ids.set(entry.id, typeof entry.at === "number" ? entry.at : 0);
-      } catch {
-      }
-    }
-  } catch {
-  }
-  try {
-    if (deps.fs.stat(deps.path).size > deps.compactBytes) retain(deps.keep);
-  } catch {
-  }
-  return {
-    has: /* @__PURE__ */ __name((id) => ids.has(id), "has"),
-    accept: /* @__PURE__ */ __name((id) => {
-      if (ids.has(id)) return;
-      const at = deps.now();
-      ids.set(id, at);
-      try {
-        deps.fs.appendFile(deps.path, JSON.stringify({ id, at }) + "\n");
-      } catch {
-      }
-      if (ids.size > deps.max) retain(deps.keep);
-    }, "accept"),
-    retain,
-    size: /* @__PURE__ */ __name(() => ids.size, "size")
-  };
-}
-__name(createLedger, "createLedger");
-var ledgerFactory = createLedger;
 function positiveInt(raw, fallback) {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 1 ? Math.floor(value) : fallback;
