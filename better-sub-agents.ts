@@ -103,6 +103,90 @@ var FOREGROUND_WAIT_MAX_MS = 30 * 60 * 1e3;
 var FOREGROUND_POLL_MS = 200;
 var AGENT_API_ERROR = "Agent terminated early due to an API error";
 
+// src/state.ts
+var JOB_STATES = ["queued", "running", "waiting-input", "done", "failed", "canceled"];
+var STATE_ALIASES = {
+  completed: "done",
+  "agent-done": "done",
+  "command-done": "done"
+};
+var STATE_TRANSITIONS = {
+  queued: ["running", "failed", "canceled"],
+  running: ["waiting-input", "done", "failed", "canceled"],
+  "waiting-input": [],
+  done: [],
+  failed: [],
+  canceled: []
+};
+var STATE_MARKERS = {
+  queued: "\u25CC",
+  running: "\u25CF",
+  "waiting-input": "?",
+  done: "\u2713",
+  failed: "\u2717",
+  canceled: "\u2298",
+  note: "\u25C8"
+};
+var STATE_COLORS = {
+  queued: "gray",
+  running: "cyan",
+  "waiting-input": "yellow",
+  done: "green",
+  failed: "red",
+  canceled: "gray",
+  note: "gray"
+};
+function isState(value) {
+  return typeof value === "string" && JOB_STATES.includes(value);
+}
+__name(isState, "isState");
+function normalizeState(value) {
+  if (typeof value !== "string" || value.length === 0) return void 0;
+  const alias = STATE_ALIASES[value];
+  if (alias !== void 0) return alias;
+  return isState(value) ? value : void 0;
+}
+__name(normalizeState, "normalizeState");
+function isSignalState(value) {
+  return value === "note" || isState(value);
+}
+__name(isSignalState, "isSignalState");
+function canTransition(from, to) {
+  if (from === to) return true;
+  return STATE_TRANSITIONS[from].includes(to);
+}
+__name(canTransition, "canTransition");
+function isTerminal(state) {
+  return STATE_TRANSITIONS[state].length === 0;
+}
+__name(isTerminal, "isTerminal");
+function isTerminalState(value) {
+  const state = normalizeState(value);
+  return state !== void 0 && isTerminal(state);
+}
+__name(isTerminalState, "isTerminalState");
+function canonicalState(value) {
+  return normalizeState(value) ?? String(value ?? "unknown");
+}
+__name(canonicalState, "canonicalState");
+function stateMarker(state) {
+  return isSignalState(state) ? STATE_MARKERS[state] : "\u26A0";
+}
+__name(stateMarker, "stateMarker");
+function stateColor(state) {
+  return isSignalState(state) ? STATE_COLORS[state] : "red";
+}
+__name(stateColor, "stateColor");
+var jobStates = {
+  list: JOB_STATES,
+  isState,
+  normalize: normalizeState,
+  canTransition,
+  isTerminal,
+  marker: stateMarker,
+  color: stateColor
+};
+
 // src/index.ts
 function scanOutput(text) {
   const marker = "[harness: subagent output matched instruction-shaped pattern(s): ";
@@ -3222,88 +3306,6 @@ var permissionModes = {
   table: PERMISSION_MODE_TABLE,
   canonical: canonicalPermissionMode,
   resolve: resolvePermissionMode
-};
-var JOB_STATES = ["queued", "running", "waiting-input", "done", "failed", "canceled"];
-var STATE_ALIASES = {
-  completed: "done",
-  "agent-done": "done",
-  "command-done": "done"
-};
-var STATE_TRANSITIONS = {
-  queued: ["running", "failed", "canceled"],
-  running: ["waiting-input", "done", "failed", "canceled"],
-  "waiting-input": [],
-  done: [],
-  failed: [],
-  canceled: []
-};
-var STATE_MARKERS = {
-  queued: "\u25CC",
-  running: "\u25CF",
-  "waiting-input": "?",
-  done: "\u2713",
-  failed: "\u2717",
-  canceled: "\u2298",
-  note: "\u25C8"
-};
-var STATE_COLORS = {
-  queued: "gray",
-  running: "cyan",
-  "waiting-input": "yellow",
-  done: "green",
-  failed: "red",
-  canceled: "gray",
-  note: "gray"
-};
-function isState(value) {
-  return typeof value === "string" && JOB_STATES.includes(value);
-}
-__name(isState, "isState");
-function normalizeState(value) {
-  if (typeof value !== "string" || value.length === 0) return void 0;
-  const alias = STATE_ALIASES[value];
-  if (alias !== void 0) return alias;
-  return isState(value) ? value : void 0;
-}
-__name(normalizeState, "normalizeState");
-function isSignalState(value) {
-  return value === "note" || isState(value);
-}
-__name(isSignalState, "isSignalState");
-function canTransition(from, to) {
-  if (from === to) return true;
-  return STATE_TRANSITIONS[from].includes(to);
-}
-__name(canTransition, "canTransition");
-function isTerminal(state) {
-  return STATE_TRANSITIONS[state].length === 0;
-}
-__name(isTerminal, "isTerminal");
-function isTerminalState(value) {
-  const state = normalizeState(value);
-  return state !== void 0 && isTerminal(state);
-}
-__name(isTerminalState, "isTerminalState");
-function canonicalState(value) {
-  return normalizeState(value) ?? String(value ?? "unknown");
-}
-__name(canonicalState, "canonicalState");
-function stateMarker(state) {
-  return isSignalState(state) ? STATE_MARKERS[state] : "\u26A0";
-}
-__name(stateMarker, "stateMarker");
-function stateColor(state) {
-  return isSignalState(state) ? STATE_COLORS[state] : "red";
-}
-__name(stateColor, "stateColor");
-var jobStates = {
-  list: JOB_STATES,
-  isState,
-  normalize: normalizeState,
-  canTransition,
-  isTerminal,
-  marker: stateMarker,
-  color: stateColor
 };
 function resolveExecutionPolicy(input) {
   const isSet = /* @__PURE__ */ __name((value) => {
