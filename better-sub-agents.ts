@@ -5446,7 +5446,7 @@ function index_default(cmd, overrides = {}) {
       workerSpec = void 0;
     }
   }
-  if (workerMode && workerSpec?.systemPrompt !== void 0 && workerSpec.promptMarkerPath !== void 0) {
+  if (workerMode && workerSpec?.promptMarkerPath !== void 0) {
     try {
       spool.writeFile(workerSpec.promptMarkerPath, "1");
     } catch {

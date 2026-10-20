@@ -6204,6 +6204,45 @@ process.stdin.on('data', (data) => {
 	assert.ok(existsSync(join(grepSpoolRoot, 'jobs')), 'the worker resolves jobs under the spec root');
 	ok('greptile: the worker uses the parent spool root');
 
+	// 112b. Greptile: an agent with an empty body still starts --------------
+	// The marker says "the mod loaded in the ACP child". It is what proves the
+	// worker's tool hook is live, and a restricted agent refuses to run without
+	// it. The marker was written only when the definition had a body, so an
+	// agent with an empty body and no appended text got no marker: the worker
+	// reported that the mod did not load and stopped before the task.
+	const emptyBodyDir = mkdtempSync(join(tmpdir(), 'subagent-empty-body-'));
+	const emptyBodySpec = {
+		id: 'empty-body-worker',
+		description: 'empty',
+		kind: 'agent',
+		owner: 'owner-empty',
+		cwd: emptyBodyDir,
+		logPath: join(emptyBodyDir, 'empty-body.log'),
+		inboxDir: join(emptyBodyDir, 'inbox'),
+		jobsDir: join(emptyBodyDir, 'jobs'),
+		startedAt: 1,
+		tailMax: 1000,
+		sessionId: 'sess',
+		// No systemPrompt: the definition has an empty body.
+		restrictedTools: true,
+		promptMarkerPath: join(emptyBodyDir, 'empty-body.mod'),
+	};
+	const emptyBodyRuntime = makeRuntime({
+		env: {SUBAGENT_SPEC: JSON.stringify(emptyBodySpec), BETTER_SUBAGENTS_WORKER: '1'},
+		now: () => 1,
+	});
+	const emptyBodyApi = makeApi({
+		spoolDir: mkdtempSync(join(tmpdir(), 'subagent-empty-body-default-')),
+		session: makeSession(),
+		runtime: emptyBodyRuntime.runtime,
+	});
+	mod(emptyBodyApi.api, emptyBodyApi.runtime);
+	assert.ok(
+		existsSync(emptyBodySpec.promptMarkerPath),
+		'an agent with an empty body still writes the readiness marker',
+	);
+	ok('greptile: an agent with an empty body still starts');
+
 	// 113. Greptile: one permission request reaches the human once ------------
 	// The foreground wait and the delivery drain both poll the same control dir.
 	// Before the fix each had its own "already asked" set, so the drain opened a

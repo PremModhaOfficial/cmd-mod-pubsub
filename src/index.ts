@@ -2727,9 +2727,15 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	}
 
 	// `cmd acp` in this host version loads installed mods but ignores `--mod`. The
-	// marker tells the worker whether appendSystemPrompt is actually live in the ACP
-	// child; without it the worker carries the body in the prompt instead.
-	if (workerMode && workerSpec?.systemPrompt !== undefined && workerSpec.promptMarkerPath !== undefined) {
+	// marker tells the worker whether the mod is actually live in the ACP child;
+	// without it the worker carries the body in the prompt instead, and a
+	// restricted agent refuses to run at all.
+	//
+	// The marker says "the mod loaded", not "the definition has a body". An agent
+	// with an empty definition body and no appended text has no system prompt, and
+	// gating the marker on that left the worker believing the mod had not loaded:
+	// it stopped before the task, and the tool hook was never enforced.
+	if (workerMode && workerSpec?.promptMarkerPath !== undefined) {
 		try {
 			spool.writeFile(workerSpec.promptMarkerPath, '1');
 		} catch {
