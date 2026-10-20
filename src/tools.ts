@@ -236,9 +236,12 @@ export function createTools(ctx: ToolsContext): Tools {
 				const logText = readLog(file);
 				const log = logText.length > 0 ? logText : transcript;
 				const requested = Number(input.max_chars);
+				// The request is a bound, so it is honored as given. It used to have a
+				// floor of 200, which meant a request for three characters returned
+				// two hundred: the caller asked for a bound and got a different one.
 				const maxChars = Math.min(
 					OUTPUT_MAX_CHARS_CAP,
-					Number.isFinite(requested) && requested > 0 ? Math.max(200, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT,
+					Number.isFinite(requested) && requested > 0 ? Math.max(1, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT,
 				);
 				const offset = Number(input.offset);
 				let body: string;

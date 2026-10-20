@@ -5953,9 +5953,23 @@ process.stdin.on('data', (data) => {
 	await toolOf(page, 'subagent_spawn').run({input: {description: 'page', command: 'true'}});
 	const pageId = JSON.parse(pageRuntime.spawnCalls[0].options.env.SUBAGENT_SPEC).id;
 	writeFileSync(join(pageDir, 'logs', `${pageId}.log`), 'START' + 'x'.repeat(1000) + 'END');
-	const firstPage = await toolOf(page, 'subagent_output').run({input: {id: pageId, offset: 0, max_chars: 3}});
+	const firstPage = await toolOf(page, 'subagent_output').run({input: {id: pageId, offset: 0, max_chars: 5}});
 	assert.match(firstPage.content[0].text, /START/, 'offset 0 returns the first page, not the tail');
 	ok('greptile: offset 0 reads the first page');
+
+	// 104b. A small max_chars is honored, not raised to 200 ------------------
+	// The bound was a floor of 200, so a request for three characters returned
+	// two hundred. The caller asked for a bound, and the tool's own description
+	// says max_chars bounds the slice.
+	const tinyPage = await toolOf(page, 'subagent_output').run({input: {id: pageId, offset: 0, max_chars: 3}});
+	const tinyText = String(tinyPage.content[0].text);
+	// The facts line and the note are part of the answer, so the SLICE is what
+	// is bounded: the log text it carries must be exactly three characters.
+	assert.ok(
+		tinyText.includes('STA') && !tinyText.includes('STARTx'),
+		`a max_chars of 3 returns three characters of the log, not 200: ${JSON.stringify(tinyText.slice(0, 200))}`,
+	);
+	ok('greptile: a small max_chars is honored');
 
 	// 105. Greptile: the documented disable names remove built-ins ------------
 	assert.equal(

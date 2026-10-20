@@ -3052,7 +3052,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const requested = Number(input.max_chars);
     const maxChars = Math.min(
       OUTPUT_MAX_CHARS_CAP,
-      Number.isFinite(requested) && requested > 0 ? Math.max(200, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT
+      Number.isFinite(requested) && requested > 0 ? Math.max(1, Math.round(requested)) : OUTPUT_MAX_CHARS_DEFAULT
     );
     const offset = Number(input.offset);
     let body;
