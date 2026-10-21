@@ -1339,7 +1339,7 @@ ${next2}`;
     return inboxCursor;
   }
   __name(startCursor, "startCursor");
-  function next(seen, budget, names, cursor) {
+  function next(seen, budget, names, cursor, claimedIds) {
     while (cursor.at < names.length) {
       if (budget.left <= 0) return void 0;
       const name = names[cursor.at];
@@ -1369,6 +1369,10 @@ ${next2}`;
         settle(claim, "accepted");
         continue;
       }
+      if (claimedIds.has(signal.id)) {
+        settle(claim, "accepted");
+        continue;
+      }
       const owner = deps.ownerVerdict(signal.owner);
       if (owner === "orphan") {
         settle(claim, "quarantined");
@@ -1384,6 +1388,7 @@ ${next2}`;
         settle(claim, "accepted");
         continue;
       }
+      claimedIds.add(signal.id);
       return claim;
     }
     return void 0;
@@ -1441,10 +1446,11 @@ ${next2}`;
     const budget = { left: FILES_PER_DRAIN_MAX };
     const names = inboxNames();
     const cursor = { at: startCursor(names) };
+    const claimed = /* @__PURE__ */ new Set();
     try {
       answerLivePermissions();
       for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-        const claim = next(seen, budget, names, cursor);
+        const claim = next(seen, budget, names, cursor, claimed);
         if (claim === void 0) return;
         if (!deps.hasSession()) {
           settle(claim, "held");
@@ -1476,9 +1482,10 @@ ${next2}`;
     const budget = { left: Math.max(limit, FILES_PER_DRAIN_MAX) };
     const names = inboxNames();
     const cursor = { at: startCursor(names) };
+    const claimed = /* @__PURE__ */ new Set();
     const claims = [];
     while (claims.length < limit) {
-      const claim = next(seen, budget, names, cursor);
+      const claim = next(seen, budget, names, cursor, claimed);
       if (claim === void 0) break;
       claims.push(claim);
     }
@@ -1491,9 +1498,10 @@ ${next2}`;
     const budget = { left: FILES_PER_DRAIN_MAX };
     const names = inboxNames();
     const cursor = { at: startCursor(names) };
+    const claimed = /* @__PURE__ */ new Set();
     let count = 0;
     while (count < PENDING_SCAN_MAX) {
-      const claim = next(seen, budget, names, cursor);
+      const claim = next(seen, budget, names, cursor, claimed);
       if (claim === void 0) break;
       count += 1;
       settle(claim, "held");

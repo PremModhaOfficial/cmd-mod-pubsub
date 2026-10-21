@@ -533,6 +533,40 @@ try {
 	);
 	ok('a session\'s own result arrives even behind a foreign backlog');
 
+	// 11f. The same result is not delivered twice -----------------------------
+	// The claim collects the whole batch before anything is marked as delivered.
+	// The ledger guard is checked while the batch is being built, so two files
+	// carrying the same signal id both pass it: the batch holds the same result
+	// twice, and the continuation reason reports it twice.
+	//
+	// A failed spawn produces exactly this pair: the missing-pid branch emits
+	// one failure and the error handler emits another.
+	const dupDir = mkdtempSync(join(tmpdir(), 'pubsub-duplicate-'));
+	const dupSession = makeSession();
+	const dupApi = makeApi({spoolDir: dupDir, session: dupSession, runtime: makeRuntime().runtime});
+	mod(dupApi.api, dupApi.runtime);
+	const dupOwner = ownerEntries(dupSession)[0];
+	assert.ok(typeof dupOwner === 'string', 'the test needs an owner token');
+	for (const dupName of ['first.json', 'second.json']) {
+		writeFileSync(
+			join(dupDir, 'inbox', dupName),
+			JSON.stringify({id: 'same-signal-id', owner: dupOwner, description: 'dup', kind: 'command', state: 'done', title: 'dup', body: 'the one result'}),
+		);
+	}
+	const dupStop = dupApi.registeredHooks.onStop();
+	const dupShown = dupApi.shownEntries.filter((entry) => entry.data?.id === 'same-signal-id');
+	assert.equal(
+		dupShown.length,
+		1,
+		`the same result is delivered once, not once per file: ${JSON.stringify(dupApi.shownEntries.map((entry) => entry.data?.id))}`,
+	);
+	assert.equal(
+		String(dupStop?.reason ?? '').split('[subagent]').length - 1,
+		1,
+		`the continuation reason carries the result once, not once per file: ${JSON.stringify(dupStop?.reason)}`,
+	);
+	ok('the same result is not delivered twice');
+
 	// The pending count reads the same spool, so it cannot disagree with delivery.
 	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'subagents');
 	const raceCommandB = raceB.commandDefs.find((def) => def.name === 'subagents');

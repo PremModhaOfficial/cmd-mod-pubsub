@@ -193,6 +193,11 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// delivered, untagged, foreign, or not classifiable yet - is settled right here,
 	// so the caller only ever sees its own work. `seen` bounds one pass.
 	//
+	// `claimedIds` holds the signal ids this pass has already claimed. Two files can
+	// carry the same signal id - a failed spawn writes a failure from the missing-pid
+	// branch and another from the error handler - and the batch would hold the same
+	// result twice. The duplicate is settled as delivered, so the caller sees it once.
+	//
 	// `budget` bounds the FILES this call may look at, not the signals it returns.
 	// A foreign signal costs a claim, a read and a restore, and it is not
 	// returned, so a cap on returned signals left the work unbounded: an
@@ -216,6 +221,7 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		budget: {left: number},
 		names: string[],
 		cursor: {at: number},
+		claimedIds: Set<string>,
 	): Claim | undefined {
 		while (cursor.at < names.length) {
 			// The budget is checked BEFORE the cursor moves, so the pass stops
@@ -251,6 +257,13 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 				settle(claim, 'accepted');
 				continue;
 			}
+			if (claimedIds.has(signal.id)) {
+				// The same result twice in one pass: the first file carries it, this
+				// one is a copy. Settle it as delivered so the caller sees the
+				// result once.
+				settle(claim, 'accepted');
+				continue;
+			}
 			const owner = deps.ownerVerdict(signal.owner);
 			if (owner === 'orphan') {
 				settle(claim, 'quarantined');
@@ -269,6 +282,7 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 				settle(claim, 'accepted');
 				continue;
 			}
+			claimedIds.add(signal.id);
 			return claim;
 		}
 		return undefined;
@@ -349,10 +363,11 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		const budget = {left: FILES_PER_DRAIN_MAX};
 		const names = inboxNames();
 		const cursor = {at: startCursor(names)};
+		const claimed = new Set<string>();
 		try {
 			answerLivePermissions();
 			for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-				const claim = next(seen, budget, names, cursor);
+				const claim = next(seen, budget, names, cursor, claimed);
 				if (claim === undefined) return;
 				// No bound session is a state, not an exception: sending here would
 				// degrade to a silent queue push in a headless run. Hold it instead.
@@ -398,9 +413,10 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		const budget = {left: Math.max(limit, FILES_PER_DRAIN_MAX)};
 		const names = inboxNames();
 		const cursor = {at: startCursor(names)};
+		const claimed = new Set<string>();
 		const claims: Claim[] = [];
 		while (claims.length < limit) {
-			const claim = next(seen, budget, names, cursor);
+			const claim = next(seen, budget, names, cursor, claimed);
 			if (claim === undefined) break;
 			claims.push(claim);
 		}
@@ -419,9 +435,10 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		const budget = {left: FILES_PER_DRAIN_MAX};
 		const names = inboxNames();
 		const cursor = {at: startCursor(names)};
+		const claimed = new Set<string>();
 		let count = 0;
 		while (count < PENDING_SCAN_MAX) {
-			const claim = next(seen, budget, names, cursor);
+			const claim = next(seen, budget, names, cursor, claimed);
 			if (claim === undefined) break;
 			count += 1;
 			settle(claim, 'held');
