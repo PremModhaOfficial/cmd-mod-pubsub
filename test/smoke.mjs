@@ -6298,6 +6298,51 @@ process.stdin.on('data', (data) => {
 	);
 	ok('greptile: a backgrounded grandchild does not outlive the timeout');
 
+	// 103c. Greptile: a command whose shell exits first still stops its group --
+	// The group signal fixed the case where the shell was still running. But a
+	// command can also exit IMMEDIATELY and leave a background child behind:
+	// "(sleep 5; do_work) &" makes the shell exit at once. The shell's exit
+	// reported success and cleared the pending SIGKILL, so the background work
+	// kept running with nobody stopping it and the caller already had its
+	// result.
+	//
+	// The worker must not report the result until the group is really gone.
+	const earlyDir = mkdtempSync(join(tmpdir(), 'subagent-early-exit-'));
+	const earlyFile = join(earlyDir, 'survived.txt');
+	const earlySpec = {
+		id: 'early',
+		description: 'early',
+		kind: 'command',
+		owner: 'owner-greptile',
+		cwd: earlyDir,
+		logPath: join(earlyDir, 'logs', 'early.log'),
+		inboxDir: join(earlyDir, 'inbox'),
+		jobsDir: join(earlyDir, 'jobs'),
+		startedAt: 1000,
+		tailMax: 4000,
+		bin: '/bin/sh',
+		// The shell exits at once; the background child would write the file
+		// three seconds later.
+		args: ['-c', `(sleep 3; printf survived > ${earlyFile}) & printf started`],
+		timeoutMs: 1000,
+	};
+	mkdirSync(join(earlyDir, 'logs'), {recursive: true});
+	mkdirSync(join(earlyDir, 'inbox'), {recursive: true});
+	mkdirSync(join(earlyDir, 'jobs'), {recursive: true});
+	writeFileSync(join(earlyDir, 'jobs', 'early.json'), JSON.stringify({id: 'early', state: 'queued'}));
+	const earlyChild = spawn(process.execPath, ['-e', workerText], {
+		cwd: earlyDir,
+		env: {...process.env, SUBAGENT_SPEC: JSON.stringify(earlySpec), BETTER_SUBAGENTS_WORKER: '1'},
+	});
+	await new Promise((resolve) => earlyChild.on('exit', resolve));
+	// Give the background child more than enough time to write the file.
+	await new Promise((resolve) => setTimeout(resolve, 3500));
+	assert.ok(
+		!existsSync(earlyFile),
+		'a command that exits at once must not leave its background work running',
+	);
+	ok('greptile: a command whose shell exits first still stops its group');
+
 	// 104. Greptile: offset 0 reads the first page, not the tail --------------
 	const pageDir = mkdtempSync(join(tmpdir(), 'subagent-greptile-page-'));
 	const pageRuntime = makeRuntime({now: () => fixedNow});

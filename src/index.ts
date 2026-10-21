@@ -511,6 +511,51 @@ const clearTimers = () => {
   clearTimeout(hardTimer);
 };
 
+// Is anything left in the command's process group? A command can exit at once
+// and leave a background child behind, so the shell's exit does not mean the
+// work is done. The group is asked, not guessed.
+const groupAlive = () => {
+  if (!isCommand || typeof child.pid !== 'number') return false;
+  try {
+    // Signal 0 tests for existence without delivering anything.
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (e) {
+    return false;
+  }
+};
+
+// The group has to actually stop before the result is reported. A command that
+// exits at once - "(sleep 30; ...) &" - leaves a background child running, and
+// the caller would get its result while that work kept going. The group is
+// signalled, then given a moment to stop, then killed outright. The result is
+// only written once the group is gone.
+const drainGroup = (onDone) => {
+  if (!groupAlive()) {
+    onDone();
+    return;
+  }
+  let escalated = false;
+  signalChild('SIGTERM');
+  const poll = setInterval(() => {
+    if (!groupAlive()) {
+      clearInterval(poll);
+      onDone();
+      return;
+    }
+    if (!escalated) {
+      escalated = true;
+      signalChild('SIGKILL');
+    }
+  }, 100);
+  if (poll.unref) poll.unref();
+  // A group that cannot be killed must not hang the worker forever.
+  setTimeout(() => {
+    clearInterval(poll);
+    onDone();
+  }, 3000);
+};
+
 // The ACP child is long-lived only for the turn. After the signal is written,
 // close its stdin, then make sure it cannot outlive the worker.
 const shutdown = () => {
@@ -524,19 +569,37 @@ const shutdown = () => {
 
 const finish = (code, spawnError, signal) => {
   if (settled) return;
-  clearTimers();
   const record = readRecord();
   // The cancel tool has already written the record and emitted its own signal.
   if (record.state === 'canceled') {
     settled = true;
+    clearTimers();
     shutdown();
     return;
   }
   if (spec.kind === 'fork') {
+    clearTimers();
     finishFork(code, spawnError, signal);
     return;
   }
 
+  // A command's group is stopped first. The result is not reported until the
+  // group is gone, so the caller never gets "done" while the command's work is
+  // still running. The timeout's own escalation is left alone: it is the thing
+  // that stops a group that ignores SIGTERM.
+  if (isCommand) {
+    drainGroup(() => {
+      clearTimers();
+      finishCommand(code, spawnError, signal);
+    });
+    return;
+  }
+  clearTimers();
+  finishCommand(code, spawnError, signal);
+};
+
+const finishCommand = (code, spawnError, signal) => {
+  if (settled) return;
   const tail = readTail();
   const timeoutLabel = spec.timeoutMs >= 1000 ? Math.round(spec.timeoutMs / 1000) + 's' : spec.timeoutMs + 'ms';
   if (spec.kind === 'agent') {
