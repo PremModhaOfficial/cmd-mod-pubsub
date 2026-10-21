@@ -567,6 +567,48 @@ try {
 	);
 	ok('the same result is not delivered twice');
 
+	// 11g. A pending count does not swallow the result -----------------------
+	// The count walks the same files the drain does, and it settles what it
+	// finds. A duplicate file was settled as DELIVERED, which records the id in
+	// the ledger before the result was ever delivered. The first file, held for
+	// the count, is then deleted by the next drain as already delivered, and the
+	// conversation gets neither copy.
+	//
+	// The count must not record a result as delivered. It only counts.
+	const pendDir = mkdtempSync(join(tmpdir(), 'pubsub-pending-duplicate-'));
+	const pendSession = makeSession();
+	const pendApi = makeApi({spoolDir: pendDir, session: pendSession, runtime: makeRuntime().runtime});
+	mod(pendApi.api, pendApi.runtime);
+	const pendOwner = ownerEntries(pendSession)[0];
+	assert.ok(typeof pendOwner === 'string', 'the test needs an owner token');
+	for (const pendName of ['first.json', 'second.json']) {
+		writeFileSync(
+			join(pendDir, 'inbox', pendName),
+			JSON.stringify({id: 'pending-signal-id', owner: pendOwner, description: 'pend', kind: 'command', state: 'done', title: 'pend', body: 'the one result'}),
+		);
+	}
+	// The status line counts what is waiting. It must not consume the result.
+	const pendList = pendApi.commandDefs.find((def) => def.name === 'subagents').handler({args: 'list'});
+	assert.match(
+		pendList.message,
+		/1 signal\(s\) waiting for this session/,
+		`the count reports one waiting signal, not two: ${pendList.message}`,
+	);
+	// The result must still be deliverable afterwards.
+	const pendStop = pendApi.registeredHooks.onStop();
+	const pendShown = pendApi.shownEntries.filter((entry) => entry.data?.id === 'pending-signal-id');
+	assert.equal(
+		pendShown.length,
+		1,
+		`the result survives the count and is delivered once: ${JSON.stringify(pendApi.shownEntries.map((entry) => entry.data?.id))}`,
+	);
+	assert.match(
+		String(pendStop?.reason ?? ''),
+		/the one result/,
+		'the continuation reason carries the result body',
+	);
+	ok('a pending count does not swallow the result');
+
 	// The pending count reads the same spool, so it cannot disagree with delivery.
 	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'subagents');
 	const raceCommandB = raceB.commandDefs.find((def) => def.name === 'subagents');

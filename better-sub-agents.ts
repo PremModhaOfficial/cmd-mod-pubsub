@@ -1370,7 +1370,7 @@ ${next2}`;
         continue;
       }
       if (claimedIds.has(signal.id)) {
-        settle(claim, "accepted");
+        settle(claim, "discarded");
         continue;
       }
       const owner = deps.ownerVerdict(signal.owner);
@@ -1397,6 +1397,10 @@ ${next2}`;
   function settle(claim, outcome) {
     if (outcome === "accepted") {
       deps.ledger.accept(claim.signal.id);
+      deps.fs.remove(claim.claimed);
+      return;
+    }
+    if (outcome === "discarded") {
       deps.fs.remove(claim.claimed);
       return;
     }

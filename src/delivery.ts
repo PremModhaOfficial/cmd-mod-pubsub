@@ -258,10 +258,11 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 				continue;
 			}
 			if (claimedIds.has(signal.id)) {
-				// The same result twice in one pass: the first file carries it, this
-				// one is a copy. Settle it as delivered so the caller sees the
-				// result once.
-				settle(claim, 'accepted');
+				// The same result twice in one pass. This file is the copy: the
+				// first one is still waiting to be delivered. The copy is removed
+				// WITHOUT recording the id as delivered, or the next drain would
+				// delete that first copy and the result would never arrive.
+				settle(claim, 'discarded');
 				continue;
 			}
 			const owner = deps.ownerVerdict(signal.owner);
@@ -291,6 +292,15 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	function settle(claim: Claim, outcome: Settled): void {
 		if (outcome === 'accepted') {
 			deps.ledger.accept(claim.signal.id);
+			deps.fs.remove(claim.claimed);
+			return;
+		}
+		if (outcome === 'discarded') {
+			// A duplicate copy of a signal that is still waiting. The copy is
+			// removed, but the id is NOT recorded as delivered: the first copy is
+			// still in the inbox, and recording the id would make the next drain
+			// delete that first copy as already delivered. The result would never
+			// arrive.
 			deps.fs.remove(claim.claimed);
 			return;
 		}

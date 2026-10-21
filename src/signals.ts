@@ -88,7 +88,12 @@ export interface Claim {
 }
 
 export type Ownership = 'mine' | 'foreign' | 'orphan' | 'pending';
-export type Settled = 'accepted' | 'held' | 'quarantined';
+// `discarded` is a duplicate copy of a signal that is still waiting to be
+// delivered. The copy is removed, but the id is NOT recorded as delivered:
+// the first copy is still in the inbox, and recording the id would make the
+// next drain delete that first copy as already delivered. The result would
+// never arrive.
+export type Settled = 'accepted' | 'held' | 'quarantined' | 'discarded';
 
 export function patchOf(signal: Signal): JobPatch {
 	const patch: JobPatch = {
