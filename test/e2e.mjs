@@ -84,6 +84,29 @@ async function waitForWorkerExit(dir, id, label, timeout = 60_000) {
 	throw new Error(`timed out after ${timeout}ms waiting for ${label} to exit`);
 }
 
+// The agent's own answer, read from the persisted transcript. The LOG holds the
+// whole conversation - the prompt, the tool calls and the answer - so a
+// transcript is what says what the agent ANSWERED rather than what it was told.
+const answerText = (dir, id) => {
+	try {
+		return readFileSync(join(dir, 'transcripts', `${id}.jsonl`), 'utf8')
+			.trim()
+			.split('\n')
+			.map((line) => {
+				try {
+					return JSON.parse(line);
+				} catch {
+					return undefined;
+				}
+			})
+			.filter((entry) => entry && entry.update && entry.update.sessionUpdate === 'agent_message_chunk')
+			.map((entry) => String((entry.update.content && entry.update.content.text) || ''))
+			.join('');
+	} catch {
+		return '';
+	}
+};
+
 try {
 	// Keep the idle live session short so a later explicit resume is exercised on a
 	// worker that has already exited, not one still waiting for messages.
@@ -208,13 +231,23 @@ try {
 	// Two codes, so each resume can ask for a DIFFERENT one. The second resume
 	// then cannot pass by echoing what the first resume said: the code it asks
 	// for was never in any prompt but the first run's.
+	//
+	// The codes are LABELLED, and each resume asks for one BY ITS LABEL. An
+	// unlabelled pair is ambiguous: "the secret code" names neither of them, so
+	// a correctly resumed agent can answer with either one, or with both. The
+	// history survived in that case, and the test would still fail - a failure
+	// that says nothing about the thing under test. With labels, one code has
+	// exactly one name, so the answer is unambiguous.
 	const secretCode = 'zephyr-4417';
 	const secondCode = 'quartz-8823';
+	const secretLabel = 'ALPHA';
+	const secondLabel = 'BRAVO';
 	const agentSpawned = await toolOf(api, 'subagent_spawn').run({
 		input: {
 			description: 'acp job',
 			prompt:
-				`Remember these two codes exactly: ${secretCode} and ${secondCode}. ` +
+				`Remember these two codes exactly, each with its label: ` +
+				`${secretLabel} is ${secretCode}, and ${secondLabel} is ${secondCode}. ` +
 				'Then reply with exactly the word pong and nothing else.',
 			subagent_type: 'general-purpose',
 			name: 'ponger',
@@ -262,28 +295,9 @@ try {
 					return false;
 				}
 			});
-	const assistantText = (id) => {
-		try {
-			return readFileSync(join(dir, 'transcripts', `${id}.jsonl`), 'utf8')
-				.trim()
-				.split('\n')
-				.map((line) => {
-					try {
-						return JSON.parse(line);
-					} catch {
-						return undefined;
-					}
-				})
-				.filter((entry) => entry && entry.update && entry.update.sessionUpdate === 'agent_message_chunk')
-				.map((entry) => String((entry.update.content && entry.update.content.text) || ''))
-				.join('');
-		} catch {
-			return '';
-		}
-	};
 	const liveText = await waitFor(() => {
 		for (const id of pongerIds()) {
-			const text = assistantText(id);
+			const text = answerText(dir, id);
 			if (/banana/i.test(text)) return text;
 		}
 		return undefined;
@@ -334,6 +348,11 @@ try {
 	// from the resumed session's own history. Asking for a word that is in the
 	// prompt would pass even if the resume silently started a new session.
 	//
+	// The question names the code by its LABEL, so exactly one code answers it.
+	// The answer must be that one code and not the other: an answer carrying
+	// both codes would be a correct recall of the wrong thing, and the second
+	// resume would then have nothing left that only the first run knew.
+	//
 	// The wait is on the worker's PROCESS, not on a fixed sleep: the record says
 	// `done` while the live worker still holds the session, and a resume of a job
 	// whose worker is alive is refused in favour of a live message.
@@ -341,7 +360,7 @@ try {
 	const resumed = await toolOf(api, 'subagent_resume').run({
 		input: {
 			id: agentId,
-			prompt: 'What is the secret code you were given earlier? Reply with only the code.',
+			prompt: `What is the code labelled ${secretLabel}? Reply with only that code.`,
 		},
 	});
 	assert.equal(resumed.ok, true, `resume must start: ${JSON.stringify(resumed)}`);
@@ -360,6 +379,16 @@ try {
 		new RegExp(secretCode, 'i'),
 		`the resumed session remembered the code it was given earlier: ${resumedLog.slice(-800)}`,
 	);
+	// The answer is the code that was ASKED for. Answering with both is a
+	// correct recall of the wrong thing: the second resume asks for the other
+	// code, and it can only answer from the first run's history if this one
+	// left it there.
+	const resumedAnswer = answerText(dir, resumedId);
+	assert.doesNotMatch(
+		resumedAnswer,
+		new RegExp(secondCode, 'i'),
+		`the resume answered with the code it asked for, not both: ${resumedAnswer}`,
+	);
 	ok(`resumed job completed: jobs/${resumedId}.json, logs/${resumedId}.log`);
 
 	// 4b. a SECOND resume ----------------------------------------------------
@@ -368,6 +397,10 @@ try {
 	// code: the second code was in the FIRST run's prompt and in no prompt
 	// since. A resume that started a fresh conversation - or one that answered
 	// from the previous resume's text - could not produce it.
+	//
+	// It asks for the other code BY ITS LABEL, so the answer is one code and
+	// not both: the first resume already proved it can name one code, and this
+	// one proves the OTHER one survived the hop as well.
 	//
 	// The session NAME changes with every hop: the first run is
 	// `subagent-<id>`, the first resume is `subagent-<resumedId>`, and this one
@@ -378,7 +411,7 @@ try {
 	const twice = await toolOf(api, 'subagent_resume').run({
 		input: {
 			id: resumedId,
-			prompt: 'What is the OTHER code you were given, the one you have not been asked for yet? Reply with only that code.',
+			prompt: `What is the code labelled ${secondLabel}? Reply with only that code.`,
 		},
 	});
 	assert.equal(twice.ok, true, `the second resume must start: ${JSON.stringify(twice)}`);
@@ -397,6 +430,13 @@ try {
 		twiceLog,
 		new RegExp(secondCode, 'i'),
 		`the second resumed session remembered the other code: ${twiceLog.slice(-800)}`,
+	);
+	// The answer is the code that was ASKED for, and only that one.
+	const twiceAnswer = answerText(dir, twiceId);
+	assert.doesNotMatch(
+		twiceAnswer,
+		new RegExp(secretCode, 'i'),
+		`the second resume answered with the code it asked for, not both: ${twiceAnswer}`,
 	);
 	// The session name follows the job id, so every hop names its own session.
 	assert.equal(
