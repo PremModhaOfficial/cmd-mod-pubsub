@@ -174,10 +174,14 @@ try {
 	ok(`real worktree: branched from ${fresh.base}, removed unchanged, kept changed at ${keptReal.path}`);
 
 	// 2. a real ACP agent job ------------------------------------------------
+	// The first run is given a code that only it knows. A later resume asks for
+	// it back, so the answer proves the session's history survived the resume
+	// rather than a fresh conversation being started.
+	const secretCode = 'zephyr-4417';
 	const agentSpawned = await toolOf(api, 'subagent_spawn').run({
 		input: {
 			description: 'acp job',
-			prompt: 'Reply with exactly the word pong and nothing else.',
+			prompt: `Remember this secret code exactly: ${secretCode}. Then reply with exactly the word pong and nothing else.`,
 			subagent_type: 'general-purpose',
 			name: 'ponger',
 		},
@@ -290,9 +294,17 @@ try {
 	// 4. a real resume ------------------------------------------------------
 	// The live worker (original or resumed by the message) owns the session until its
 	// idle window passes; wait it out, then resume explicitly.
+	//
+	// The resume asks for a fact the FIRST run was told and this prompt does not
+	// carry. A fresh conversation would not know it, so the answer can only come
+	// from the resumed session's own history. Asking for a word that is in the
+	// prompt would pass even if the resume silently started a new session.
 	await sleep(1500);
 	const resumed = await toolOf(api, 'subagent_resume').run({
-		input: {id: agentId, prompt: 'Reply with exactly the word ping and nothing else.'},
+		input: {
+			id: agentId,
+			prompt: 'What is the secret code you were given earlier? Reply with only the code.',
+		},
 	});
 	assert.equal(resumed.ok, true, `resume must start: ${JSON.stringify(resumed)}`);
 	const resumedId = resumed.content[0].text.match(/as (\S+)/)[1];
@@ -305,7 +317,11 @@ try {
 	assert.equal(resumedRecord.resumedFrom, agentId, 'the resume records what it continued');
 	assert.equal(resumedRecord.agentId, resumedId, 'the resumed job has its own agent id');
 	assert.ok(existsSync(join(dir, 'transcripts', `${resumedId}.jsonl`)), 'the resumed job persists its transcript');
-	assert.match(resumedLog, /ping/i, 'the resumed session answered the new instruction');
+	assert.match(
+		resumedLog,
+		new RegExp(secretCode, 'i'),
+		`the resumed session remembered the code it was given earlier: ${resumedLog.slice(-800)}`,
+	);
 	ok(`resumed job completed: jobs/${resumedId}.json, logs/${resumedId}.log`);
 
 	process.stdout.write(`\nPASS (artifacts under ${dir})\n`);
