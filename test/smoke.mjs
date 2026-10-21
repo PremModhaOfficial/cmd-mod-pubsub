@@ -412,11 +412,16 @@ try {
 	const backlogDir = mkdtempSync(join(tmpdir(), 'pubsub-backlog-'));
 	const backlogSessionA = makeSession();
 	const backlogSessionB = makeSession();
-	const backlogOwner = ownerEntries(backlogSessionA)[0];
 	const backlogA = makeApi({spoolDir: backlogDir, session: backlogSessionA, runtime: makeRuntime().runtime});
 	const backlogB = makeApi({spoolDir: backlogDir, session: backlogSessionB, runtime: makeRuntime().runtime});
 	mod(backlogA.api, backlogA.runtime);
 	mod(backlogB.api, backlogB.runtime);
+	// The owner token only exists once the mod has registered it.
+	const backlogOwner = ownerEntries(backlogSessionA)[0];
+	assert.ok(
+		typeof backlogOwner === 'string',
+		'the test needs an owner token for the session that owns the backlog',
+	);
 	// Another session drains and counts over that backlog. Each pass must touch
 	// a bounded number of files, not the whole backlog.
 	const backlogOps = [];
@@ -458,6 +463,75 @@ try {
 		`one pass must not do unbounded work on the foreign backlog: ${backlogOps.length} file operations`,
 	);
 	ok('a foreign backlog does not cost unbounded work per pass');
+
+	// 11e. A session's OWN result is still delivered past a foreign backlog ---
+	// The pass has a budget of files it may look at, and a cursor that carries
+	// over between passes so the backlog is worked through. But the cursor must
+	// not step OVER a file it never looked at.
+	//
+	// The inbox order is fixed by the fake fs, so the test does not depend on
+	// what the real filesystem happens to return: exactly FILES_PER_DRAIN_MAX
+	// foreign files come first, and this session's own result is the one file
+	// right behind them. A cursor that steps over the file it never looked at
+	// skips it in every later pass, and the result never arrives.
+	const starveDir = mkdtempSync(join(tmpdir(), 'pubsub-starve-'));
+	const starveSessionA = makeSession();
+	const starveSessionB = makeSession();
+	const starveA = makeApi({spoolDir: starveDir, session: starveSessionA, runtime: makeRuntime().runtime});
+	const starveB = makeApi({spoolDir: starveDir, session: starveSessionB, runtime: makeRuntime().runtime});
+	mod(starveA.api, starveA.runtime);
+	mod(starveB.api, starveB.runtime);
+	// The owner token only exists once the mod has registered it.
+	const starveOwnerA = ownerEntries(starveSessionA)[0];
+	const starveOwnerB = ownerEntries(starveSessionB)[0];
+	assert.ok(
+		typeof starveOwnerA === 'string' && typeof starveOwnerB === 'string',
+		'the test needs an owner token for each session',
+	);
+	const starveForeignCount = 50;
+	const starveOrder = [];
+	for (let index = 0; index < starveForeignCount; index += 1) {
+		const name = `${String(index).padStart(4, '0')}-foreign.json`;
+		starveOrder.push(name);
+		writeFileSync(
+			join(starveDir, 'inbox', name),
+			JSON.stringify({id: `starve-foreign-${index}`, owner: starveOwnerA, description: 'foreign', kind: 'command', state: 'done', title: 'foreign', body: 'ok'}),
+		);
+	}
+	starveOrder.push('mine.json');
+	writeFileSync(
+		join(starveDir, 'inbox', 'mine.json'),
+		JSON.stringify({id: 'starve-mine', owner: starveOwnerB, description: 'mine', kind: 'command', state: 'done', title: 'mine', body: 'the result'}),
+	);
+	// The inbox always reads in this order, so the position of this session's
+	// own result is the same on every pass.
+	const starveInbox = join(starveDir, 'inbox');
+	const starveFs = {
+		...realFs,
+		readdir(dir) {
+			if (dir === starveInbox) return [...starveOrder];
+			return realFs.readdir(dir);
+		},
+	};
+	const starveC = makeApi({
+		spoolDir: starveDir,
+		session: starveSessionB,
+		runtime: makeRuntime({fs: starveFs}).runtime,
+	});
+	mod(starveC.api, starveC.runtime);
+	// Drain until the signal arrives. A pass may look at a bounded number of
+	// files, so several passes are expected; what must not happen is the pass
+	// stepping over the file it never looked at.
+	let starveDelivered = false;
+	for (let pass = 0; pass < 10 && !starveDelivered; pass += 1) {
+		starveC.registeredHooks.onStop();
+		starveDelivered = starveC.shownEntries.some((entry) => entry.data?.id === 'starve-mine');
+	}
+	assert.ok(
+		starveDelivered,
+		`a session's own result must arrive even behind a foreign backlog: ${JSON.stringify(starveB.shownEntries.map((entry) => entry.data?.id))}`,
+	);
+	ok('a session\'s own result arrives even behind a foreign backlog');
 
 	// The pending count reads the same spool, so it cannot disagree with delivery.
 	const raceCommandA = raceA.commandDefs.find((def) => def.name === 'subagents');

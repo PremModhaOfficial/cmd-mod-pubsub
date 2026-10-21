@@ -1341,10 +1341,10 @@ ${next2}`;
   __name(startCursor, "startCursor");
   function next(seen, budget, names, cursor) {
     while (cursor.at < names.length) {
+      if (budget.left <= 0) return void 0;
       const name = names[cursor.at];
       cursor.at += 1;
       if (seen.has(name)) continue;
-      if (budget.left <= 0) return void 0;
       budget.left -= 1;
       seen.add(name);
       const live = join5(deps.inboxDir, name);
@@ -1460,7 +1460,7 @@ ${next2}`;
         settle(claim, "accepted");
       }
     } finally {
-      inboxCursor = cursor.at % Math.max(1, names.length);
+      inboxCursor = cursor.at;
       draining = false;
     }
   }
@@ -1482,7 +1482,7 @@ ${next2}`;
       if (claim === void 0) break;
       claims.push(claim);
     }
-    inboxCursor = cursor.at % Math.max(1, names.length);
+    inboxCursor = cursor.at;
     return claims;
   }
   __name(claimPending, "claimPending");
@@ -1498,7 +1498,7 @@ ${next2}`;
       count += 1;
       settle(claim, "held");
     }
-    inboxCursor = cursor.at % Math.max(1, names.length);
+    inboxCursor = cursor.at;
     return count;
   }
   __name(countPending, "countPending");

@@ -207,6 +207,10 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// `cursor` says where the pass started, so a bounded pass still ADVANCES
 	// through a long backlog. Without it, every pass looked at the same first
 	// files and the ones behind them were never reached.
+	//
+	// The cursor must only ever point at a file the pass has actually looked
+	// at. Stepping over a file that the budget never reached would skip it in
+	// every later pass too, and a session's own result would never arrive.
 	function next(
 		seen: Set<string>,
 		budget: {left: number},
@@ -214,10 +218,13 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		cursor: {at: number},
 	): Claim | undefined {
 		while (cursor.at < names.length) {
+			// The budget is checked BEFORE the cursor moves, so the pass stops
+			// on the first file it did not look at and the next pass starts
+			// there. The file is never stepped over.
+			if (budget.left <= 0) return undefined;
 			const name = names[cursor.at];
 			cursor.at += 1;
 			if (seen.has(name)) continue;
-			if (budget.left <= 0) return undefined;
 			budget.left -= 1;
 			seen.add(name);
 			const live = join(deps.inboxDir, name);
@@ -363,9 +370,10 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 				settle(claim, 'accepted');
 			}
 		} finally {
-			// The next pass carries on from here, so a long backlog is worked
-			// through instead of the same head being examined every tick.
-			inboxCursor = cursor.at % Math.max(1, names.length);
+			// The next pass carries on from the first file this pass did NOT
+			// look at, so a long backlog is worked through and no file is
+			// stepped over.
+			inboxCursor = cursor.at;
 			draining = false;
 		}
 	}
@@ -396,7 +404,7 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 			if (claim === undefined) break;
 			claims.push(claim);
 		}
-		inboxCursor = cursor.at % Math.max(1, names.length);
+		inboxCursor = cursor.at;
 		return claims;
 	}
 
@@ -418,7 +426,7 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 			count += 1;
 			settle(claim, 'held');
 		}
-		inboxCursor = cursor.at % Math.max(1, names.length);
+		inboxCursor = cursor.at;
 		return count;
 	}
 
