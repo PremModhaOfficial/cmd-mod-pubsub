@@ -57,6 +57,33 @@ const signalsFor = (dir, id) => {
 const isTerminal = (record) =>
 	record !== undefined && ['done', 'failed', 'waiting-input', 'canceled'].includes(record.state);
 
+// Is the job's worker process still running? A live agent keeps its worker alive
+// after the record says `done`, because the session stays open for messages. A
+// resume of that job is refused while the worker holds it, so a test that wants
+// to resume waits for the process to go, not for a fixed sleep.
+const isAlive = (pid) => {
+	if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return error?.code === 'EPERM';
+	}
+};
+
+// Wait until the job's worker has exited. The record can be `done` while the
+// process is still alive, so the record is not the signal; the process is.
+async function waitForWorkerExit(dir, id, label, timeout = 60_000) {
+	const deadline = Date.now() + timeout;
+	while (Date.now() < deadline) {
+		const record = recordOf(dir, id);
+		if (record === undefined) return;
+		if (!isAlive(record.workerPid) && !isAlive(record.pid)) return;
+		await sleep(100);
+	}
+	throw new Error(`timed out after ${timeout}ms waiting for ${label} to exit`);
+}
+
 try {
 	// Keep the idle live session short so a later explicit resume is exercised on a
 	// worker that has already exited, not one still waiting for messages.
@@ -174,14 +201,21 @@ try {
 	ok(`real worktree: branched from ${fresh.base}, removed unchanged, kept changed at ${keptReal.path}`);
 
 	// 2. a real ACP agent job ------------------------------------------------
-	// The first run is given a code that only it knows. A later resume asks for
-	// it back, so the answer proves the session's history survived the resume
-	// rather than a fresh conversation being started.
+	// The first run is given two codes that only it knows. A later resume asks
+	// for one back, so the answer proves the session's history survived the
+	// resume rather than a fresh conversation being started.
+	//
+	// Two codes, so each resume can ask for a DIFFERENT one. The second resume
+	// then cannot pass by echoing what the first resume said: the code it asks
+	// for was never in any prompt but the first run's.
 	const secretCode = 'zephyr-4417';
+	const secondCode = 'quartz-8823';
 	const agentSpawned = await toolOf(api, 'subagent_spawn').run({
 		input: {
 			description: 'acp job',
-			prompt: `Remember this secret code exactly: ${secretCode}. Then reply with exactly the word pong and nothing else.`,
+			prompt:
+				`Remember these two codes exactly: ${secretCode} and ${secondCode}. ` +
+				'Then reply with exactly the word pong and nothing else.',
 			subagent_type: 'general-purpose',
 			name: 'ponger',
 		},
@@ -299,7 +333,11 @@ try {
 	// carry. A fresh conversation would not know it, so the answer can only come
 	// from the resumed session's own history. Asking for a word that is in the
 	// prompt would pass even if the resume silently started a new session.
-	await sleep(1500);
+	//
+	// The wait is on the worker's PROCESS, not on a fixed sleep: the record says
+	// `done` while the live worker still holds the session, and a resume of a job
+	// whose worker is alive is refused in favour of a live message.
+	await waitForWorkerExit(dir, agentId, 'the first agent worker');
 	const resumed = await toolOf(api, 'subagent_resume').run({
 		input: {
 			id: agentId,
@@ -323,6 +361,67 @@ try {
 		`the resumed session remembered the code it was given earlier: ${resumedLog.slice(-800)}`,
 	);
 	ok(`resumed job completed: jobs/${resumedId}.json, logs/${resumedId}.log`);
+
+	// 4b. a SECOND resume ----------------------------------------------------
+	// The first resume proved the context survived one hop. This one resumes the
+	// RESUMED job, so the chain is two hops deep, and it asks for the OTHER
+	// code: the second code was in the FIRST run's prompt and in no prompt
+	// since. A resume that started a fresh conversation - or one that answered
+	// from the previous resume's text - could not produce it.
+	//
+	// The session NAME changes with every hop: the first run is
+	// `subagent-<id>`, the first resume is `subagent-<resumedId>`, and this one
+	// is `subagent-<twiceId>`. The name is derived from the job id, so a second
+	// resume that reused the first one's name would mean it resumed the same
+	// job twice rather than continuing the chain.
+	await waitForWorkerExit(dir, resumedId, 'the first resumed worker');
+	const twice = await toolOf(api, 'subagent_resume').run({
+		input: {
+			id: resumedId,
+			prompt: 'What is the OTHER code you were given, the one you have not been asked for yet? Reply with only that code.',
+		},
+	});
+	assert.equal(twice.ok, true, `the second resume must start: ${JSON.stringify(twice)}`);
+	const twiceId = twice.content[0].text.match(/as (\S+)/)[1];
+	assert.notEqual(twiceId, resumedId, 'the second resume is a new job with a new id');
+	const twiceRecord = await waitFor(() => {
+		const record = recordOf(dir, twiceId);
+		return isTerminal(record) ? record : undefined;
+	}, 'the second resumed job', 240_000);
+	const twiceLog = readFileSync(join(dir, 'logs', `${twiceId}.log`), 'utf8');
+	assert.equal(twiceRecord.state, 'done', `second resumed state ${twiceRecord.state}: ${twiceLog.slice(-800)}`);
+	assert.equal(twiceRecord.resumedFrom, resumedId, 'the second resume continues the FIRST resume');
+	assert.equal(twiceRecord.agentId, twiceId, 'the second resumed job has its own agent id');
+	assert.ok(existsSync(join(dir, 'transcripts', `${twiceId}.jsonl`)), 'the second resumed job persists its transcript');
+	assert.match(
+		twiceLog,
+		new RegExp(secondCode, 'i'),
+		`the second resumed session remembered the other code: ${twiceLog.slice(-800)}`,
+	);
+	// The session name follows the job id, so every hop names its own session.
+	assert.equal(
+		twiceRecord.sessionName,
+		`subagent-${twiceId}`,
+		`the second resume names its own session: ${String(twiceRecord.sessionName)}`,
+	);
+	assert.equal(
+		resumedRecord.sessionName,
+		`subagent-${resumedId}`,
+		`the first resume named its own session: ${String(resumedRecord.sessionName)}`,
+	);
+	assert.equal(
+		agentRecord.sessionName,
+		`subagent-${agentId}`,
+		`the first run named its own session: ${String(agentRecord.sessionName)}`,
+	);
+	// The ACP session is the same one through the chain: the history the second
+	// resume answered from is the first run's session, resumed twice.
+	assert.equal(
+		twiceRecord.acpSessionId,
+		agentRecord.acpSessionId,
+		'the whole chain continued one ACP session',
+	);
+	ok(`second resume completed: jobs/${twiceId}.json, logs/${twiceId}.log`);
 
 	process.stdout.write(`\nPASS (artifacts under ${dir})\n`);
 } catch (error) {

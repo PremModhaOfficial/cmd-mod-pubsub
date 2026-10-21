@@ -726,6 +726,10 @@ try {
 	// 15. one spawn-failure choke point -------------------------------------
 	// Three different ways a spawn can fail, one contract: a failed record, exactly
 	// one failed signal, exactly one delivery.
+	//
+	// `expectedReason` is the reason the FIRST failure saved. A later failure on
+	// the same job must not overwrite it: the job keeps its result, so the reason
+	// a user reads is the one that actually happened first.
 	const failureModes = [
 		{
 			name: 'sync throw',
@@ -738,6 +742,7 @@ try {
 				return {...bundle, trigger() {}};
 			},
 			toolFails: true,
+			expectedReason: /EAGAIN/,
 		},
 		{
 			name: 'async error event',
@@ -747,6 +752,7 @@ try {
 				return {...bundle, trigger: () => child.emit('error', new Error('EPIPE'))};
 			},
 			toolFails: false,
+			expectedReason: /EPIPE/,
 		},
 		{
 			name: 'missing pid',
@@ -755,6 +761,28 @@ try {
 				return {...bundle, trigger() {}};
 			},
 			toolFails: true,
+			expectedReason: /did not start/,
+		},
+		{
+			// The two failure paths on ONE child. The spawn returns a handle with
+			// no pid, so the missing-pid branch fails the job; the handle then
+			// emits its async 'error', which is the other failure path. Both run
+			// against the same job.
+			//
+			// A job that has already failed keeps its result: the state table
+			// refuses a terminal job, so the second failure is rejected. Without
+			// that, two signals were written, the second one overwrote the saved
+			// reason and the finish time, and the reason a user saw was the
+			// second failure's, not the one that actually happened.
+			name: 'missing pid then an async error',
+			make() {
+				const child = makeChild({pid: null});
+				const bundle = makeRuntime({spawn: () => child});
+				return {...bundle, trigger: () => child.emit('error', new Error('EPIPE'))};
+			},
+			toolFails: true,
+			// The FIRST failure's reason survives the second one.
+			expectedReason: /did not start/,
 		},
 	];
 
@@ -781,6 +809,11 @@ try {
 		assert.equal(record.state, 'failed', `${mode.name}: the record is failed too`);
 		assert.equal(record.failureReason, signal.body, `${mode.name}: record and signal carry the same reason`);
 		assert.equal(record.id, signal.id, `${mode.name}: the signal belongs to the record`);
+		assert.match(
+			String(record.failureReason),
+			mode.expectedReason,
+			`${mode.name}: the saved reason is the first failure's, not a later one: ${String(record.failureReason)}`,
+		);
 
 		api.listeners.get('run_start')[0]({sessionId: 'failure'});
 		const delivered = api.userMessages.filter((message) => message.text.includes('boom failed'));
