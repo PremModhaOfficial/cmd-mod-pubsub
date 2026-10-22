@@ -31,7 +31,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Add the two-session owner isolation test first. (smoke checks 5, 12, 13)
 - [x] Add a resume and hot reload owner test. (smoke check 18: the persisted token survives a resume and
   is the token the job carries; check 26: the 0.1.0 transcript entry is reused instead of re-minted)
-- [ ] Run the suite and confirm the two new tests fail for the right reason. (Done by the pre-owner
+- [x] Run the suite and confirm the two new tests fail for the right reason. (Done by the pre-owner
   baseline in Stage A; it cannot be re-run now without reverting the owner changes.)
 - Gate: the isolation tests fail before the owner changes. (Historical; see above.)
 
@@ -100,26 +100,26 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 
 ## Phase 6: Agent registry
 
-- [ ] Read `.commandcode/agents/*.md`.
-- [ ] Read `~/.commandcode/agents/*.md`.
-- [ ] Parse frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`, `skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`.
-- [ ] Register built-ins: `explore`, `plan`, `general-purpose`, `claude`.
-- [ ] Mark `explore` and `plan` read-only and one-shot.
-- [ ] Skip invalid files with a warning.
-- [ ] Resolve duplicate names with project scope first.
+- [x] Read `.commandcode/agents/*.md`.
+- [x] Read `~/.commandcode/agents/*.md`.
+- [x] Parse frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `permissionMode`, `maxTurns`, `skills`, `isolation`, `background`, `color`, `omitClaudeMd`, `effort`.
+- [x] Register built-ins: `explore`, `plan`, `general-purpose`, `claude`.
+- [x] Mark `explore` and `plan` read-only and one-shot.
+- [x] Skip invalid files with a warning.
+- [x] Resolve duplicate names with project scope first.
 - Gate: precedence, invalid frontmatter, and built-in tests pass.
 
 ## Phase 7: Limits and isolation
 
-- [ ] Add the concurrency pool. Default 20.
-- [ ] Add `BETTER_SUBAGENTS_MAX_CONCURRENT`.
-- [ ] Fail the 21st spawn with `Concurrent subagent limit reached`.
-- [ ] Add the nesting depth limit. Default 3.
-- [ ] Add `BETTER_SUBAGENTS_MAX_DEPTH`.
+- [x] Add the concurrency pool. Default 20.
+- [x] Add `BETTER_SUBAGENTS_MAX_CONCURRENT`.
+- [x] Fail the 21st spawn with `Concurrent subagent limit reached`.
+- [x] Add the nesting depth limit. Default 3.
+- [x] Add `BETTER_SUBAGENTS_MAX_DEPTH`.
 - [x] Add `isolation: worktree` with `git worktree`.
 - [x] Remove an unchanged worktree.
 - [x] Keep and report a changed worktree.
-- [ ] Add `BETTER_SUBAGENTS_DISABLE_BACKGROUND=1`.
+- [x] Add `BETTER_SUBAGENTS_DISABLE_BACKGROUND=1`.
 - Gate: the concurrency, nesting, and worktree tests pass.
 
 ## Phase 8: Output and permissions
@@ -144,7 +144,7 @@ Parity note (2026-10-19): `SPEC.md` was expanded to the full Claude Code parity 
 - [x] Add the footer running count. (T10 adds the 30-second `/tasks` hint.)
 - [x] Add `/subagents list`, `jobs`, `cancel`, and `open`.
 - [x] Add transcript open from the pane. (T10: pane Enter renders the transcript; `/tasks enter` also sends a follow-up.)
-- [ ] Add hot reload recovery.
+- [x] Add hot reload recovery.
 - Gate: two sessions stay isolated. (smoke 4-5 and 12-13, plus the real two-session e2e step 1a. No interactive TUI pass is needed for the invariant.)
 
 ## Phase 10: Release
