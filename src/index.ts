@@ -112,7 +112,7 @@ import {
 	stringMapField,
 } from './definitions.ts';
 import type {AgentDefinition, AgentHookRule, AgentMcpServer, AgentMemoryScope, AgentScope} from './definitions.ts';
-import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker} from './state.ts';
+import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker, terminalState} from './state.ts';
 import {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 import {createJobStore} from './jobs.ts';
 import type {JobRecord} from './jobs.ts';
@@ -3348,8 +3348,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (workerMode) return;
 		const owner = currentOwner();
 		for (const job of jobCache) {
-			const state = normalizeState(job.state);
-			if (state === undefined || !isTerminal(state) || job.subagentStopHook === true) continue;
+			const state = terminalState(job.state);
+			if (state === undefined || job.subagentStopHook === true) continue;
 			if (typeof job.owner === 'string' && job.owner.length > 0 && job.owner !== owner) continue;
 			runHookRules(runtime.run, projectHookRules('SubagentStop'), {
 				event: 'SubagentStop',

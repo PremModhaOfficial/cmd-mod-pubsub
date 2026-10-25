@@ -1087,6 +1087,16 @@ function isTerminalState(value) {
   return state !== void 0 && isTerminal(state);
 }
 __name(isTerminalState, "isTerminalState");
+function terminalState(value) {
+  const state = normalizeState(value);
+  return state !== void 0 && isTerminal(state) ? state : void 0;
+}
+__name(terminalState, "terminalState");
+function isLiveState(value) {
+  const state = normalizeState(value);
+  return state === "queued" || state === "running";
+}
+__name(isLiveState, "isLiveState");
 function canonicalState(value) {
   return normalizeState(value) ?? String(value ?? "unknown");
 }
@@ -1102,9 +1112,14 @@ __name(stateColor, "stateColor");
 var jobStates = {
   list: JOB_STATES,
   isState,
+  isSignalState,
   normalize: normalizeState,
+  canonical: canonicalState,
   canTransition,
   isTerminal,
+  isTerminalState,
+  terminalState,
+  isLive: isLiveState,
   marker: stateMarker,
   color: stateColor
 };
@@ -6005,8 +6020,8 @@ function index_default(cmd, overrides = {}) {
     if (workerMode) return;
     const owner = currentOwner();
     for (const job of jobCache) {
-      const state = normalizeState(job.state);
-      if (state === void 0 || !isTerminal(state) || job.subagentStopHook === true) continue;
+      const state = terminalState(job.state);
+      if (state === void 0 || job.subagentStopHook === true) continue;
       if (typeof job.owner === "string" && job.owner.length > 0 && job.owner !== owner) continue;
       runHookRules(runtime.run, projectHookRules("SubagentStop"), {
         event: "SubagentStop",
