@@ -1830,9 +1830,14 @@ var MAIN_PERMISSION_MODE_ENV = "BETTER_SUBAGENTS_MAIN_PERMISSION_MODE";
 var PUB_SUB_WORKER_ENV = "PUBSUB_WORKER";
 var COMMANDCODE_SDK_ENV = "COMMANDCODE_SDK";
 var MANAGED_DIR_OPTION = "managed_dir";
+function aliased(env, primary, alias, read) {
+  const primaryValue = read(env[primary]);
+  if (primaryValue !== void 0) return primaryValue;
+  return read(env[alias]);
+}
+__name(aliased, "aliased");
 function aliasValue(env, name, alias) {
-  const value = env[name];
-  return value !== void 0 ? value : env[alias];
+  return aliased(env, name, alias, (value) => value);
 }
 __name(aliasValue, "aliasValue");
 function commaList(value) {
@@ -1844,14 +1849,14 @@ function isOn(value) {
 }
 __name(isOn, "isOn");
 function subagentModel(env) {
-  const primary = env[SUBAGENT_MODEL_ENV]?.trim();
-  if (primary !== void 0 && primary.length > 0) return primary;
-  const alias = env[SUBAGENT_MODEL_ENV_ALIAS]?.trim();
-  return alias !== void 0 && alias.length > 0 ? alias : void 0;
+  return aliased(env, SUBAGENT_MODEL_ENV, SUBAGENT_MODEL_ENV_ALIAS, (value) => {
+    const trimmed = value?.trim();
+    return trimmed !== void 0 && trimmed.length > 0 ? trimmed : void 0;
+  });
 }
 __name(subagentModel, "subagentModel");
 function subagentModelForced(env) {
-  return isOn(env[SUBAGENT_MODEL_FORCE_ENV]) || isOn(env[SUBAGENT_MODEL_FORCE_ENV_ALIAS]);
+  return [SUBAGENT_MODEL_FORCE_ENV, SUBAGENT_MODEL_FORCE_ENV_ALIAS].some((name) => isOn(env[name]));
 }
 __name(subagentModelForced, "subagentModelForced");
 function effortLevel(value, levels) {
@@ -1860,7 +1865,7 @@ function effortLevel(value, levels) {
 }
 __name(effortLevel, "effortLevel");
 function effortLevelFromEnv(env, levels) {
-  return effortLevel(env[EFFORT_LEVEL_ENV], levels) ?? effortLevel(env[EFFORT_LEVEL_ENV_ALIAS], levels);
+  return aliased(env, EFFORT_LEVEL_ENV, EFFORT_LEVEL_ENV_ALIAS, (value) => effortLevel(value, levels));
 }
 __name(effortLevelFromEnv, "effortLevelFromEnv");
 function contextWindowOverride(env) {
@@ -1883,7 +1888,7 @@ function backgroundDisabled(env) {
     const normalized = value.trim().toLowerCase();
     return normalized.length > 0 && normalized !== "0" && normalized !== "false" && normalized !== "no";
   }, "isOnSwitch");
-  return isOnSwitch(env[BACKGROUND_DISABLE_ENV]) || isOnSwitch(env[BACKGROUND_DISABLE_ENV_ALIAS]);
+  return [BACKGROUND_DISABLE_ENV, BACKGROUND_DISABLE_ENV_ALIAS].some((name) => isOnSwitch(env[name]));
 }
 __name(backgroundDisabled, "backgroundDisabled");
 function toggle(value) {
@@ -1895,18 +1900,21 @@ function toggle(value) {
 }
 __name(toggle, "toggle");
 function forkModeFromEnv(env) {
-  return toggle(env[FORK_MODE_ENV]) ?? toggle(env[FORK_MODE_ENV_ALIAS]);
+  return aliased(env, FORK_MODE_ENV, FORK_MODE_ENV_ALIAS, toggle);
 }
 __name(forkModeFromEnv, "forkModeFromEnv");
 function agentSdk(env) {
-  return toggle(env[SDK_ENV]) === "on" || toggle(env[SDK_ENV_ALIAS]) === "on" || toggle(env[COMMANDCODE_SDK_ENV]) === "on";
+  return [SDK_ENV, SDK_ENV_ALIAS, COMMANDCODE_SDK_ENV].some((name) => toggle(env[name]) === "on");
 }
 __name(agentSdk, "agentSdk");
 function agentNameFromEnv(env) {
-  const primary = env[AGENT_ENV];
-  if (primary !== void 0 && primary.length > 0) return primary.trim();
-  const alias = env[AGENT_ENV_ALIAS];
-  return alias !== void 0 && alias.length > 0 ? alias.trim() : "";
+  const resolved = aliased(
+    env,
+    AGENT_ENV,
+    AGENT_ENV_ALIAS,
+    (value) => value !== void 0 && value.length > 0 ? value.trim() : void 0
+  );
+  return resolved ?? "";
 }
 __name(agentNameFromEnv, "agentNameFromEnv");
 function crossSessionEnabled(env) {
@@ -1918,7 +1926,7 @@ function mainPermissionModeFromEnv(env) {
 }
 __name(mainPermissionModeFromEnv, "mainPermissionModeFromEnv");
 function workerModeFromEnv(env) {
-  return env[WORKER_ENV] === "1" || env[PUB_SUB_WORKER_ENV] === "1";
+  return [WORKER_ENV, PUB_SUB_WORKER_ENV].some((name) => env[name] === "1");
 }
 __name(workerModeFromEnv, "workerModeFromEnv");
 function policyFiles(env, home) {
