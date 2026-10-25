@@ -22,90 +22,20 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 
 import mod, {createJobWorktree, finalizeWorktree} from '../better-sub-agents.ts';
-import {makeApi, makeSession, ok, toolOf} from './harness.mjs';
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function waitFor(check, label, timeout = 60_000) {
-	const deadline = Date.now() + timeout;
-	while (Date.now() < deadline) {
-		const value = check();
-		if (value) return value;
-		await sleep(100);
-	}
-	throw new Error(`timed out after ${timeout}ms waiting for ${label}`);
-}
-
-const recordOf = (dir, id) => {
-	try {
-		return JSON.parse(readFileSync(join(dir, 'jobs', `${id}.json`), 'utf8'));
-	} catch {
-		return undefined;
-	}
-};
-
-const signalsFor = (dir, id) => {
-	try {
-		return readdirSync(join(dir, 'inbox'))
-			.filter((name) => name.includes(id))
-			.map((name) => JSON.parse(readFileSync(join(dir, 'inbox', name), 'utf8')));
-	} catch {
-		return [];
-	}
-};
-
-const isTerminal = (record) =>
-	record !== undefined && ['done', 'failed', 'waiting-input', 'canceled'].includes(record.state);
-
-// Is the job's worker process still running? A live agent keeps its worker alive
-// after the record says `done`, because the session stays open for messages. A
-// resume of that job is refused while the worker holds it, so a test that wants
-// to resume waits for the process to go, not for a fixed sleep.
-const isAlive = (pid) => {
-	if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return error?.code === 'EPERM';
-	}
-};
-
-// Wait until the job's worker has exited. The record can be `done` while the
-// process is still alive, so the record is not the signal; the process is.
-async function waitForWorkerExit(dir, id, label, timeout = 60_000) {
-	const deadline = Date.now() + timeout;
-	while (Date.now() < deadline) {
-		const record = recordOf(dir, id);
-		if (record === undefined) return;
-		if (!isAlive(record.workerPid) && !isAlive(record.pid)) return;
-		await sleep(100);
-	}
-	throw new Error(`timed out after ${timeout}ms waiting for ${label} to exit`);
-}
-
-// The agent's own answer, read from the persisted transcript. The LOG holds the
-// whole conversation - the prompt, the tool calls and the answer - so a
-// transcript is what says what the agent ANSWERED rather than what it was told.
-const answerText = (dir, id) => {
-	try {
-		return readFileSync(join(dir, 'transcripts', `${id}.jsonl`), 'utf8')
-			.trim()
-			.split('\n')
-			.map((line) => {
-				try {
-					return JSON.parse(line);
-				} catch {
-					return undefined;
-				}
-			})
-			.filter((entry) => entry && entry.update && entry.update.sessionUpdate === 'agent_message_chunk')
-			.map((entry) => String((entry.update.content && entry.update.content.text) || ''))
-			.join('');
-	} catch {
-		return '';
-	}
-};
+import {
+	makeApi,
+	makeSession,
+	ok,
+	toolOf,
+	sleep,
+	waitFor,
+	recordOf,
+	signalsFor,
+	isTerminal,
+	isAlive,
+	waitForWorkerExit,
+	answerText,
+} from './helpers.mjs';
 
 try {
 	// Keep the idle live session short so a later explicit resume is exercised on a
