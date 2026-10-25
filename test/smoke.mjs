@@ -55,7 +55,7 @@ import {
 	toolNames,
 	toolOf,
 	workerSource,
-} from './harness.mjs';
+} from './helpers.mjs';
 
 // ---------------------------------------------------------------- assertions
 //
