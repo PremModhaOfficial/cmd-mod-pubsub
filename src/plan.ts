@@ -11,8 +11,21 @@
 import {join} from 'node:path';
 import {FORK_AGENT_TYPE} from './constants.ts';
 import {backgroundDisabled} from './config.ts';
+import {stringField} from './definitions.ts';
 import type {JobRecord} from './jobs.ts';
 import type {SpoolFs} from './types.ts';
+
+// Shared field-coercion helpers for the plan conversions. These are the
+// mechanical parts only: string/number coercion with the same rules the
+// conversions already applied inline.
+export function numberField(value: unknown): number | undefined {
+	const numeric = Number(value);
+	return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : undefined;
+}
+
+export function nonEmptyString(value: unknown): string | undefined {
+	return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+}
 
 export type PlanMemoryScope = 'user' | 'project' | 'local';
 
@@ -224,8 +237,8 @@ export function planFromInput(
 ): {ok: true; plan: JobPlan} | {ok: false; error: string} {
 	const label = String(input.description ?? input.label ?? '').trim();
 	if (label.length === 0) return {ok: false, error: 'description is required and must not be empty'};
-	const command = typeof input.command === 'string' && input.command.trim().length > 0 ? input.command : undefined;
-	const prompt = typeof input.prompt === 'string' && input.prompt.trim().length > 0 ? input.prompt : undefined;
+	const command = nonEmptyString(input.command);
+	const prompt = nonEmptyString(input.prompt);
 	if (command === undefined && prompt === undefined) {
 		return {ok: false, error: 'pass either prompt (a headless agent) or command (a shell command)'};
 	}
@@ -238,30 +251,20 @@ export function planFromInput(
 			error: "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it",
 		};
 	}
-	const requestedMode =
-		typeof input.permission_mode === 'string' && input.permission_mode.trim().length > 0
-			? input.permission_mode.trim()
-			: undefined;
+	const requestedMode = stringField(input.permission_mode);
 	if (requestedMode !== undefined && ctx.canonicalPermissionMode(requestedMode) === undefined) {
 		return {ok: false, error: `unknown permission_mode "${requestedMode}"`};
 	}
 	if (requestedMode !== undefined && prompt === undefined) {
 		return {ok: false, error: 'permission_mode applies to agent jobs; a shell command has no permission mode'};
 	}
-	const model = typeof input.model === 'string' && input.model.trim().length > 0 ? input.model.trim() : undefined;
-	const name = typeof input.name === 'string' && input.name.trim().length > 0 ? input.name.trim() : undefined;
-	const teamName =
-		typeof input.team_name === 'string' && input.team_name.trim().length > 0 ? input.team_name.trim() : undefined;
-	const requestedMaxTurns = Number(input.max_turns);
-	const timeoutMs = Number(input.timeout_ms);
+	const model = stringField(input.model);
+	const name = stringField(input.name);
+	const teamName = stringField(input.team_name);
 	// `subagent_type` is canonical; `agent_type` is the 1.x alias and must behave
 	// identically. Passing both with different values is ambiguous, not a merge.
-	const subagentType =
-		typeof input.subagent_type === 'string' && input.subagent_type.trim().length > 0
-			? input.subagent_type.trim()
-			: undefined;
-	const aliasType =
-		typeof input.agent_type === 'string' && input.agent_type.trim().length > 0 ? input.agent_type.trim() : undefined;
+	const subagentType = stringField(input.subagent_type);
+	const aliasType = stringField(input.agent_type);
 	if (subagentType !== undefined && aliasType !== undefined && subagentType !== aliasType) {
 		return {ok: false, error: 'pass subagent_type or its deprecated alias agent_type, not both'};
 	}
@@ -369,11 +372,7 @@ export function planFromInput(
 	// tool pool untouched, so it gets no filter and no memory additions.
 	const launchTools = prompt === undefined || forkRequested ? undefined : ctx.withMemoryTools(launch.tools, definition?.memory);
 	const maxTurns =
-		prompt === undefined || forkRequested
-			? undefined
-			: Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0
-				? Math.round(requestedMaxTurns)
-				: definition?.maxTurns;
+		prompt === undefined || forkRequested ? undefined : (numberField(input.max_turns) ?? definition?.maxTurns);
 	const runCwd = typeof input.cwd === 'string' && input.cwd.length > 0 ? input.cwd : ctx.cwd;
 	// The auto-compact window only lowers what this agent's own model gives it.
 	const compactWindow = ctx.resolveAutoCompactWindow(
@@ -423,7 +422,7 @@ export function planFromInput(
 			effort: prompt === undefined || forkRequested ? undefined : launch.effort,
 			permissionMode,
 			isolation: forkRequested ? undefined : definition?.isolation,
-			timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : undefined,
+			timeoutMs: numberField(input.timeout_ms),
 		},
 	};
 }

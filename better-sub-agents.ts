@@ -2342,11 +2342,20 @@ __name(createWorktreeLifecycle, "createWorktreeLifecycle");
 
 // src/plan.ts
 import { join as join8 } from "node:path";
+function numberField2(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : void 0;
+}
+__name(numberField2, "numberField");
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value : void 0;
+}
+__name(nonEmptyString, "nonEmptyString");
 function planFromInput(input, ctx) {
   const label = String(input.description ?? input.label ?? "").trim();
   if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
-  const command = typeof input.command === "string" && input.command.trim().length > 0 ? input.command : void 0;
-  const prompt = typeof input.prompt === "string" && input.prompt.trim().length > 0 ? input.prompt : void 0;
+  const command = nonEmptyString(input.command);
+  const prompt = nonEmptyString(input.prompt);
   if (command === void 0 && prompt === void 0) {
     return { ok: false, error: "pass either prompt (a headless agent) or command (a shell command)" };
   }
@@ -2357,20 +2366,18 @@ function planFromInput(input, ctx) {
       error: "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it"
     };
   }
-  const requestedMode = typeof input.permission_mode === "string" && input.permission_mode.trim().length > 0 ? input.permission_mode.trim() : void 0;
+  const requestedMode = stringField(input.permission_mode);
   if (requestedMode !== void 0 && ctx.canonicalPermissionMode(requestedMode) === void 0) {
     return { ok: false, error: `unknown permission_mode "${requestedMode}"` };
   }
   if (requestedMode !== void 0 && prompt === void 0) {
     return { ok: false, error: "permission_mode applies to agent jobs; a shell command has no permission mode" };
   }
-  const model = typeof input.model === "string" && input.model.trim().length > 0 ? input.model.trim() : void 0;
-  const name = typeof input.name === "string" && input.name.trim().length > 0 ? input.name.trim() : void 0;
-  const teamName = typeof input.team_name === "string" && input.team_name.trim().length > 0 ? input.team_name.trim() : void 0;
-  const requestedMaxTurns = Number(input.max_turns);
-  const timeoutMs = Number(input.timeout_ms);
-  const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim().length > 0 ? input.subagent_type.trim() : void 0;
-  const aliasType = typeof input.agent_type === "string" && input.agent_type.trim().length > 0 ? input.agent_type.trim() : void 0;
+  const model = stringField(input.model);
+  const name = stringField(input.name);
+  const teamName = stringField(input.team_name);
+  const subagentType = stringField(input.subagent_type);
+  const aliasType = stringField(input.agent_type);
   if (subagentType !== void 0 && aliasType !== void 0 && subagentType !== aliasType) {
     return { ok: false, error: "pass subagent_type or its deprecated alias agent_type, not both" };
   }
@@ -2443,7 +2450,7 @@ function planFromInput(input, ctx) {
     return { ok: false, error: "a fork needs the main session id; the session has not bound yet" };
   }
   const launchTools = prompt === void 0 || forkRequested ? void 0 : ctx.withMemoryTools(launch.tools, definition?.memory);
-  const maxTurns = prompt === void 0 || forkRequested ? void 0 : Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0 ? Math.round(requestedMaxTurns) : definition?.maxTurns;
+  const maxTurns = prompt === void 0 || forkRequested ? void 0 : numberField2(input.max_turns) ?? definition?.maxTurns;
   const runCwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : ctx.cwd;
   const compactWindow = ctx.resolveAutoCompactWindow(
     ctx.contextWindowForModel(launch.model, ctx.env),
@@ -2486,7 +2493,7 @@ function planFromInput(input, ctx) {
       effort: prompt === void 0 || forkRequested ? void 0 : launch.effort,
       permissionMode,
       isolation: forkRequested ? void 0 : definition?.isolation,
-      timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : void 0
+      timeoutMs: numberField2(input.timeout_ms)
     }
   };
 }
