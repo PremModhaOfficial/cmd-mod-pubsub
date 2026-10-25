@@ -1439,7 +1439,7 @@ process.on('uncaughtException', err => {
 });
 `;
 
-function osSpoolFs(): SpoolFs {
+export function osSpoolFs(): SpoolFs {
 	return {
 		mkdir: dir => {
 			mkdirSync(dir, {recursive: true});
@@ -1516,13 +1516,20 @@ const OS_RUNTIME: Runtime = {
 	},
 };
 
-// The test adapter is the same interface with functions swapped out.
-function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
+// The test adapter is the same interface with functions swapped out. Shared
+// mechanical part: apply the overrides on top of a base runtime, deep-merging
+// the spool filesystem so a partial `fs` override keeps the unoverridden
+// methods from the base adapter.
+function applyRuntimeOverrides(base: Runtime, overrides: RuntimeOverrides = {}): Runtime {
 	return {
-		...OS_RUNTIME,
+		...base,
 		...overrides,
-		fs: {...OS_RUNTIME.fs, ...overrides.fs},
+		fs: {...base.fs, ...overrides.fs},
 	};
+}
+
+export function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
+	return applyRuntimeOverrides(OS_RUNTIME, overrides);
 }
 
 // ---------------------------------------------------------------------------

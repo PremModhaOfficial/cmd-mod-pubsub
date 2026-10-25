@@ -4784,12 +4784,16 @@ var OS_RUNTIME = {
     };
   }, "run")
 };
-function osRuntime(overrides = {}) {
+function applyRuntimeOverrides(base, overrides = {}) {
   return {
-    ...OS_RUNTIME,
+    ...base,
     ...overrides,
-    fs: { ...OS_RUNTIME.fs, ...overrides.fs }
+    fs: { ...base.fs, ...overrides.fs }
   };
+}
+__name(applyRuntimeOverrides, "applyRuntimeOverrides");
+function osRuntime(overrides = {}) {
+  return applyRuntimeOverrides(OS_RUNTIME, overrides);
 }
 __name(osRuntime, "osRuntime");
 function hookMatches(matcher, toolName) {
@@ -6810,6 +6814,8 @@ export {
   memoryDirFor,
   mentionCandidates,
   moveTaskSelection,
+  osRuntime,
+  osSpoolFs,
   parseCacheTtl,
   parseFrontmatter,
   parseHooks,
