@@ -1087,6 +1087,16 @@ function isTerminalState(value) {
   return state !== void 0 && isTerminal(state);
 }
 __name(isTerminalState, "isTerminalState");
+function terminalState(value) {
+  const state = normalizeState(value);
+  return state !== void 0 && isTerminal(state) ? state : void 0;
+}
+__name(terminalState, "terminalState");
+function isLiveState(value) {
+  const state = normalizeState(value);
+  return state === "queued" || state === "running";
+}
+__name(isLiveState, "isLiveState");
 function canonicalState(value) {
   return normalizeState(value) ?? String(value ?? "unknown");
 }
@@ -1102,9 +1112,14 @@ __name(stateColor, "stateColor");
 var jobStates = {
   list: JOB_STATES,
   isState,
+  isSignalState,
   normalize: normalizeState,
+  canonical: canonicalState,
   canTransition,
   isTerminal,
+  isTerminalState,
+  terminalState,
+  isLive: isLiveState,
   marker: stateMarker,
   color: stateColor
 };
@@ -1339,6 +1354,19 @@ ${next2}`;
     return inboxCursor;
   }
   __name(startCursor, "startCursor");
+  function inboxPass(budgetSize, work) {
+    const seen = /* @__PURE__ */ new Set();
+    const budget = { left: budgetSize };
+    const names = inboxNames();
+    const cursor = { at: startCursor(names) };
+    const claimed = /* @__PURE__ */ new Set();
+    try {
+      return work(() => next(seen, budget, names, cursor, claimed));
+    } finally {
+      inboxCursor = cursor.at;
+    }
+  }
+  __name(inboxPass, "inboxPass");
   function next(seen, budget, names, cursor, claimedIds) {
     while (cursor.at < names.length) {
       if (budget.left <= 0) return void 0;
@@ -1446,31 +1474,27 @@ ${next2}`;
   function drain() {
     if (draining) return;
     draining = true;
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: FILES_PER_DRAIN_MAX };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
     try {
-      answerLivePermissions();
-      for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-        const claim = next(seen, budget, names, cursor, claimed);
-        if (claim === void 0) return;
-        if (!deps.hasSession()) {
-          settle(claim, "held");
-          continue;
+      inboxPass(FILES_PER_DRAIN_MAX, (nextClaim) => {
+        answerLivePermissions();
+        for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
+          const claim = nextClaim();
+          if (claim === void 0) return;
+          if (!deps.hasSession()) {
+            settle(claim, "held");
+            continue;
+          }
+          try {
+            deliver(claim.signal);
+          } catch {
+            settle(claim, "held");
+            continue;
+          }
+          markDelivered(claim.signal.id);
+          settle(claim, "accepted");
         }
-        try {
-          deliver(claim.signal);
-        } catch {
-          settle(claim, "held");
-          continue;
-        }
-        markDelivered(claim.signal.id);
-        settle(claim, "accepted");
-      }
+      });
     } finally {
-      inboxCursor = cursor.at;
       draining = false;
     }
   }
@@ -1482,36 +1506,28 @@ ${next2}`;
     }
   }, "safeDrain");
   function claimPending(limit) {
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: Math.max(limit, FILES_PER_DRAIN_MAX) };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
-    const claims = [];
-    while (claims.length < limit) {
-      const claim = next(seen, budget, names, cursor, claimed);
-      if (claim === void 0) break;
-      claims.push(claim);
-    }
-    inboxCursor = cursor.at;
-    return claims;
+    return inboxPass(Math.max(limit, FILES_PER_DRAIN_MAX), (nextClaim) => {
+      const claims = [];
+      while (claims.length < limit) {
+        const claim = nextClaim();
+        if (claim === void 0) break;
+        claims.push(claim);
+      }
+      return claims;
+    });
   }
   __name(claimPending, "claimPending");
   function countPending() {
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: FILES_PER_DRAIN_MAX };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
-    let count = 0;
-    while (count < PENDING_SCAN_MAX) {
-      const claim = next(seen, budget, names, cursor, claimed);
-      if (claim === void 0) break;
-      count += 1;
-      settle(claim, "held");
-    }
-    inboxCursor = cursor.at;
-    return count;
+    return inboxPass(FILES_PER_DRAIN_MAX, (nextClaim) => {
+      let count = 0;
+      while (count < PENDING_SCAN_MAX) {
+        const claim = nextClaim();
+        if (claim === void 0) break;
+        count += 1;
+        settle(claim, "held");
+      }
+      return count;
+    });
   }
   __name(countPending, "countPending");
   function countOrphaned() {
@@ -1798,10 +1814,6 @@ function filterTools(input = {}) {
   return { ok: true, tools: kept, removed: removed.filter((tool) => !kept.includes(tool)) };
 }
 __name(filterTools, "filterTools");
-function nonEmpty(value) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
-}
-__name(nonEmpty, "nonEmpty");
 
 // src/config.ts
 import { join as join6 } from "node:path";
@@ -1830,9 +1842,14 @@ var MAIN_PERMISSION_MODE_ENV = "BETTER_SUBAGENTS_MAIN_PERMISSION_MODE";
 var PUB_SUB_WORKER_ENV = "PUBSUB_WORKER";
 var COMMANDCODE_SDK_ENV = "COMMANDCODE_SDK";
 var MANAGED_DIR_OPTION = "managed_dir";
+function aliased(env, primary, alias, read) {
+  const primaryValue = read(env[primary]);
+  if (primaryValue !== void 0) return primaryValue;
+  return read(env[alias]);
+}
+__name(aliased, "aliased");
 function aliasValue(env, name, alias) {
-  const value = env[name];
-  return value !== void 0 ? value : env[alias];
+  return aliased(env, name, alias, (value) => value);
 }
 __name(aliasValue, "aliasValue");
 function commaList(value) {
@@ -1844,14 +1861,14 @@ function isOn(value) {
 }
 __name(isOn, "isOn");
 function subagentModel(env) {
-  const primary = env[SUBAGENT_MODEL_ENV]?.trim();
-  if (primary !== void 0 && primary.length > 0) return primary;
-  const alias = env[SUBAGENT_MODEL_ENV_ALIAS]?.trim();
-  return alias !== void 0 && alias.length > 0 ? alias : void 0;
+  return aliased(env, SUBAGENT_MODEL_ENV, SUBAGENT_MODEL_ENV_ALIAS, (value) => {
+    const trimmed = value?.trim();
+    return trimmed !== void 0 && trimmed.length > 0 ? trimmed : void 0;
+  });
 }
 __name(subagentModel, "subagentModel");
 function subagentModelForced(env) {
-  return isOn(env[SUBAGENT_MODEL_FORCE_ENV]) || isOn(env[SUBAGENT_MODEL_FORCE_ENV_ALIAS]);
+  return [SUBAGENT_MODEL_FORCE_ENV, SUBAGENT_MODEL_FORCE_ENV_ALIAS].some((name) => isOn(env[name]));
 }
 __name(subagentModelForced, "subagentModelForced");
 function effortLevel(value, levels) {
@@ -1860,7 +1877,7 @@ function effortLevel(value, levels) {
 }
 __name(effortLevel, "effortLevel");
 function effortLevelFromEnv(env, levels) {
-  return effortLevel(env[EFFORT_LEVEL_ENV], levels) ?? effortLevel(env[EFFORT_LEVEL_ENV_ALIAS], levels);
+  return aliased(env, EFFORT_LEVEL_ENV, EFFORT_LEVEL_ENV_ALIAS, (value) => effortLevel(value, levels));
 }
 __name(effortLevelFromEnv, "effortLevelFromEnv");
 function contextWindowOverride(env) {
@@ -1883,7 +1900,7 @@ function backgroundDisabled(env) {
     const normalized = value.trim().toLowerCase();
     return normalized.length > 0 && normalized !== "0" && normalized !== "false" && normalized !== "no";
   }, "isOnSwitch");
-  return isOnSwitch(env[BACKGROUND_DISABLE_ENV]) || isOnSwitch(env[BACKGROUND_DISABLE_ENV_ALIAS]);
+  return [BACKGROUND_DISABLE_ENV, BACKGROUND_DISABLE_ENV_ALIAS].some((name) => isOnSwitch(env[name]));
 }
 __name(backgroundDisabled, "backgroundDisabled");
 function toggle(value) {
@@ -1895,18 +1912,21 @@ function toggle(value) {
 }
 __name(toggle, "toggle");
 function forkModeFromEnv(env) {
-  return toggle(env[FORK_MODE_ENV]) ?? toggle(env[FORK_MODE_ENV_ALIAS]);
+  return aliased(env, FORK_MODE_ENV, FORK_MODE_ENV_ALIAS, toggle);
 }
 __name(forkModeFromEnv, "forkModeFromEnv");
 function agentSdk(env) {
-  return toggle(env[SDK_ENV]) === "on" || toggle(env[SDK_ENV_ALIAS]) === "on" || toggle(env[COMMANDCODE_SDK_ENV]) === "on";
+  return [SDK_ENV, SDK_ENV_ALIAS, COMMANDCODE_SDK_ENV].some((name) => toggle(env[name]) === "on");
 }
 __name(agentSdk, "agentSdk");
 function agentNameFromEnv(env) {
-  const primary = env[AGENT_ENV];
-  if (primary !== void 0 && primary.length > 0) return primary.trim();
-  const alias = env[AGENT_ENV_ALIAS];
-  return alias !== void 0 && alias.length > 0 ? alias.trim() : "";
+  const resolved = aliased(
+    env,
+    AGENT_ENV,
+    AGENT_ENV_ALIAS,
+    (value) => value !== void 0 && value.length > 0 ? value.trim() : void 0
+  );
+  return resolved ?? "";
 }
 __name(agentNameFromEnv, "agentNameFromEnv");
 function crossSessionEnabled(env) {
@@ -1918,7 +1938,7 @@ function mainPermissionModeFromEnv(env) {
 }
 __name(mainPermissionModeFromEnv, "mainPermissionModeFromEnv");
 function workerModeFromEnv(env) {
-  return env[WORKER_ENV] === "1" || env[PUB_SUB_WORKER_ENV] === "1";
+  return [WORKER_ENV, PUB_SUB_WORKER_ENV].some((name) => env[name] === "1");
 }
 __name(workerModeFromEnv, "workerModeFromEnv");
 function policyFiles(env, home) {
@@ -2338,11 +2358,20 @@ __name(createWorktreeLifecycle, "createWorktreeLifecycle");
 
 // src/plan.ts
 import { join as join8 } from "node:path";
+function numberField2(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.round(numeric) : void 0;
+}
+__name(numberField2, "numberField");
+function nonEmptyString(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value : void 0;
+}
+__name(nonEmptyString, "nonEmptyString");
 function planFromInput(input, ctx) {
   const label = String(input.description ?? input.label ?? "").trim();
   if (label.length === 0) return { ok: false, error: "description is required and must not be empty" };
-  const command = typeof input.command === "string" && input.command.trim().length > 0 ? input.command : void 0;
-  const prompt = typeof input.prompt === "string" && input.prompt.trim().length > 0 ? input.prompt : void 0;
+  const command = nonEmptyString(input.command);
+  const prompt = nonEmptyString(input.prompt);
   if (command === void 0 && prompt === void 0) {
     return { ok: false, error: "pass either prompt (a headless agent) or command (a shell command)" };
   }
@@ -2353,20 +2382,18 @@ function planFromInput(input, ctx) {
       error: "isolation is chosen by a definition's frontmatter (`isolation: worktree`), not per call; omit it"
     };
   }
-  const requestedMode = typeof input.permission_mode === "string" && input.permission_mode.trim().length > 0 ? input.permission_mode.trim() : void 0;
+  const requestedMode = stringField(input.permission_mode);
   if (requestedMode !== void 0 && ctx.canonicalPermissionMode(requestedMode) === void 0) {
     return { ok: false, error: `unknown permission_mode "${requestedMode}"` };
   }
   if (requestedMode !== void 0 && prompt === void 0) {
     return { ok: false, error: "permission_mode applies to agent jobs; a shell command has no permission mode" };
   }
-  const model = typeof input.model === "string" && input.model.trim().length > 0 ? input.model.trim() : void 0;
-  const name = typeof input.name === "string" && input.name.trim().length > 0 ? input.name.trim() : void 0;
-  const teamName = typeof input.team_name === "string" && input.team_name.trim().length > 0 ? input.team_name.trim() : void 0;
-  const requestedMaxTurns = Number(input.max_turns);
-  const timeoutMs = Number(input.timeout_ms);
-  const subagentType = typeof input.subagent_type === "string" && input.subagent_type.trim().length > 0 ? input.subagent_type.trim() : void 0;
-  const aliasType = typeof input.agent_type === "string" && input.agent_type.trim().length > 0 ? input.agent_type.trim() : void 0;
+  const model = stringField(input.model);
+  const name = stringField(input.name);
+  const teamName = stringField(input.team_name);
+  const subagentType = stringField(input.subagent_type);
+  const aliasType = stringField(input.agent_type);
   if (subagentType !== void 0 && aliasType !== void 0 && subagentType !== aliasType) {
     return { ok: false, error: "pass subagent_type or its deprecated alias agent_type, not both" };
   }
@@ -2439,7 +2466,7 @@ function planFromInput(input, ctx) {
     return { ok: false, error: "a fork needs the main session id; the session has not bound yet" };
   }
   const launchTools = prompt === void 0 || forkRequested ? void 0 : ctx.withMemoryTools(launch.tools, definition?.memory);
-  const maxTurns = prompt === void 0 || forkRequested ? void 0 : Number.isFinite(requestedMaxTurns) && requestedMaxTurns > 0 ? Math.round(requestedMaxTurns) : definition?.maxTurns;
+  const maxTurns = prompt === void 0 || forkRequested ? void 0 : numberField2(input.max_turns) ?? definition?.maxTurns;
   const runCwd = typeof input.cwd === "string" && input.cwd.length > 0 ? input.cwd : ctx.cwd;
   const compactWindow = ctx.resolveAutoCompactWindow(
     ctx.contextWindowForModel(launch.model, ctx.env),
@@ -2482,7 +2509,7 @@ function planFromInput(input, ctx) {
       effort: prompt === void 0 || forkRequested ? void 0 : launch.effort,
       permissionMode,
       isolation: forkRequested ? void 0 : definition?.isolation,
-      timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.round(timeoutMs) : void 0
+      timeoutMs: numberField2(input.timeout_ms)
     }
   };
 }
@@ -2997,6 +3024,16 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
 }
 __name(settleForeground, "settleForeground");
 
+// src/utils.ts
+function readLog(fs, file) {
+  try {
+    return fs.readFile(file);
+  } catch {
+    return "";
+  }
+}
+__name(readLog, "readLog");
+
 // src/tools.ts
 var okText = /* @__PURE__ */ __name((value) => ({ ok: true, content: [{ type: "text", text: value }] }), "okText");
 var badInput = /* @__PURE__ */ __name((error) => ({ ok: false, error }), "badInput");
@@ -3077,14 +3114,6 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
       })
     );
   }, "listRun");
-  function readLog(file) {
-    try {
-      return spool.readFile(file);
-    } catch {
-      return "";
-    }
-  }
-  __name(readLog, "readLog");
   function transcriptText(id, record) {
     const file = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     let raw = "";
@@ -3121,7 +3150,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const file = String(record.logPath ?? join11(logsDir, `${id}.log`));
     const transcriptPath = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
-    const logText = readLog(file);
+    const logText = readLog(spool, file);
     const log = logText.length > 0 ? logText : transcript;
     const requested = Number(input.max_chars);
     const maxChars = Math.min(
@@ -4784,12 +4813,16 @@ var OS_RUNTIME = {
     };
   }, "run")
 };
-function osRuntime(overrides = {}) {
+function applyRuntimeOverrides(base, overrides = {}) {
   return {
-    ...OS_RUNTIME,
+    ...base,
     ...overrides,
-    fs: { ...OS_RUNTIME.fs, ...overrides.fs }
+    fs: { ...base.fs, ...overrides.fs }
   };
+}
+__name(applyRuntimeOverrides, "applyRuntimeOverrides");
+function osRuntime(overrides = {}) {
+  return applyRuntimeOverrides(OS_RUNTIME, overrides);
 }
 __name(osRuntime, "osRuntime");
 function hookMatches(matcher, toolName) {
@@ -5144,12 +5177,12 @@ function resolveModel(input = {}) {
   const env = input.env ?? {};
   const envModel = subagentModel(env);
   const forced = subagentModelForced(env);
-  const main = nonEmpty(input.main);
+  const main = stringField(input.main);
   if (forced && envModel !== void 0) return { model: envModel, source: "forced" };
-  const requested = nonEmpty(input.requested);
+  const requested = stringField(input.requested);
   if (requested === "inherit") return { model: main, source: "inherit" };
   if (requested !== void 0) return { model: requested, source: "parameter" };
-  const definition = nonEmpty(input.definition);
+  const definition = stringField(input.definition);
   if (definition === "inherit") return { model: main, source: "inherit" };
   if (definition !== void 0) return { model: definition, source: "definition" };
   if (envModel !== void 0) return { model: envModel, source: "environment" };
@@ -5226,10 +5259,6 @@ function mcpServerConfigs(fs, dirs) {
   return configs;
 }
 __name(mcpServerConfigs, "mcpServerConfigs");
-function mcpServerNames(fs, dirs) {
-  return Object.keys(mcpServerConfigs(fs, dirs));
-}
-__name(mcpServerNames, "mcpServerNames");
 function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
@@ -5991,8 +6020,8 @@ function index_default(cmd, overrides = {}) {
     if (workerMode) return;
     const owner = currentOwner();
     for (const job of jobCache) {
-      const state = normalizeState(job.state);
-      if (state === void 0 || !isTerminal(state) || job.subagentStopHook === true) continue;
+      const state = terminalState(job.state);
+      if (state === void 0 || job.subagentStopHook === true) continue;
       if (typeof job.owner === "string" && job.owner.length > 0 && job.owner !== owner) continue;
       runHookRules(runtime.run, projectHookRules("SubagentStop"), {
         event: "SubagentStop",
@@ -6256,14 +6285,6 @@ function index_default(cmd, overrides = {}) {
       }
     }, "render")
   });
-  function readLog(file) {
-    try {
-      return spool.readFile(file);
-    } catch {
-      return "";
-    }
-  }
-  __name(readLog, "readLog");
   const planCtx = {
     fs: spool,
     env: runtime.env,
@@ -6331,7 +6352,7 @@ function index_default(cmd, overrides = {}) {
     refreshJobs,
     finalizeJobWorktree,
     foregroundOutcome,
-    readLog,
+    readLog: /* @__PURE__ */ __name((file) => readLog(spool, file), "readLog"),
     rosterFor,
     runProjectHooks: /* @__PURE__ */ __name((event, cwd, agent, input) => runHookRules(runtime.run, projectHookRules(event), { event, cwd, agent, input }), "runProjectHooks"),
     appendJobEntry: /* @__PURE__ */ __name((entry) => {
@@ -6806,10 +6827,11 @@ export {
   listAgentsVisible,
   mainCheckoutRoots,
   mcpServerConfigs,
-  mcpServerNames,
   memoryDirFor,
   mentionCandidates,
   moveTaskSelection,
+  osRuntime,
+  osSpoolFs,
   parseCacheTtl,
   parseFrontmatter,
   parseHooks,

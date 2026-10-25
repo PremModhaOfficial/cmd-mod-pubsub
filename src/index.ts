@@ -112,7 +112,7 @@ import {
 	stringMapField,
 } from './definitions.ts';
 import type {AgentDefinition, AgentHookRule, AgentMcpServer, AgentMemoryScope, AgentScope} from './definitions.ts';
-import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker} from './state.ts';
+import {canTransition, canonicalState, isTerminal, isTerminalState, normalizeState, stateColor, stateMarker, terminalState} from './state.ts';
 import {resolveAppendSystemPrompt, resolveAutoCompactWindow} from './append.ts';
 import {createJobStore} from './jobs.ts';
 import type {JobRecord} from './jobs.ts';
@@ -120,7 +120,7 @@ import {createLedger} from './ledger.ts';
 import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Ownership} from './signals.ts';
-import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
+import {EFFORT_LEVELS, filterTools, withheldBy, workerToolAllowed} from './tool-filter.ts';
 import {
 	agentNameFromEnv,
 	agentSdk,
@@ -146,6 +146,7 @@ import {gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
 import {createWorktreeLifecycle, sweepExpiredEntries} from './worktree-lifecycle.ts';
 import {recordFromPlan, sessionNameOf} from './plan.ts';
 import {createTools} from './tools.ts';
+import {readLog} from './utils.ts';
 import type {PlanContext} from './plan.ts';
 import {answerPendingPermission as answerPermission, failJob, fire} from './spawn.ts';
 import type {ForegroundResult, PermissionContext, SpawnContext, WorkerSpec} from './spawn.ts';
@@ -1439,7 +1440,7 @@ process.on('uncaughtException', err => {
 });
 `;
 
-function osSpoolFs(): SpoolFs {
+export function osSpoolFs(): SpoolFs {
 	return {
 		mkdir: dir => {
 			mkdirSync(dir, {recursive: true});
@@ -1516,13 +1517,20 @@ const OS_RUNTIME: Runtime = {
 	},
 };
 
-// The test adapter is the same interface with functions swapped out.
-function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
+// The test adapter is the same interface with functions swapped out. Shared
+// mechanical part: apply the overrides on top of a base runtime, deep-merging
+// the spool filesystem so a partial `fs` override keeps the unoverridden
+// methods from the base adapter.
+function applyRuntimeOverrides(base: Runtime, overrides: RuntimeOverrides = {}): Runtime {
 	return {
-		...OS_RUNTIME,
+		...base,
 		...overrides,
-		fs: {...OS_RUNTIME.fs, ...overrides.fs},
+		fs: {...base.fs, ...overrides.fs},
 	};
+}
+
+export function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
+	return applyRuntimeOverrides(OS_RUNTIME, overrides);
 }
 
 // ---------------------------------------------------------------------------
@@ -2070,14 +2078,14 @@ export function resolveModel(input: ModelResolutionInput = {}): ModelResolution 
 	const env = input.env ?? {};
 	const envModel = subagentModel(env);
 	const forced = subagentModelForced(env);
-	const main = nonEmpty(input.main);
+	const main = stringField(input.main);
 	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
 
-	const requested = nonEmpty(input.requested);
+	const requested = stringField(input.requested);
 	if (requested === 'inherit') return {model: main, source: 'inherit'};
 	if (requested !== undefined) return {model: requested, source: 'parameter'};
 
-	const definition = nonEmpty(input.definition);
+	const definition = stringField(input.definition);
 	if (definition === 'inherit') return {model: main, source: 'inherit'};
 	if (definition !== undefined) return {model: definition, source: 'definition'};
 
@@ -2216,10 +2224,6 @@ export function mcpServerConfigs(
 		}
 	}
 	return configs;
-}
-
-export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
-	return Object.keys(mcpServerConfigs(fs, dirs));
 }
 
 export interface McpTrustRoots {
@@ -3344,8 +3348,8 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		if (workerMode) return;
 		const owner = currentOwner();
 		for (const job of jobCache) {
-			const state = normalizeState(job.state);
-			if (state === undefined || !isTerminal(state) || job.subagentStopHook === true) continue;
+			const state = terminalState(job.state);
+			if (state === undefined || job.subagentStopHook === true) continue;
 			if (typeof job.owner === 'string' && job.owner.length > 0 && job.owner !== owner) continue;
 			runHookRules(runtime.run, projectHookRules('SubagentStop'), {
 				event: 'SubagentStop',
@@ -3650,16 +3654,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// The tool surface lives in src/tools.ts. The entry builds the context the
 	// module needs and owns the two contexts the plan and the spawn read.
 
-	// One log file, read through the spool. The spawn reads it to settle a
-	// foreground run; the tool surface reads it to show the output.
-	function readLog(file: string): string {
-		try {
-			return spool.readFile(file);
-		} catch {
-			return '';
-		}
-	}
-
 	// The plan and the spawn read this session's state through these contexts, so
 	// neither module closes over the composition root.
 	const planCtx: PlanContext = {
@@ -3734,7 +3728,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		refreshJobs,
 		finalizeJobWorktree,
 		foregroundOutcome,
-		readLog,
+		readLog: file => readLog(spool, file),
 		rosterFor,
 		runProjectHooks: (event, cwd, agent, input) =>
 			runHookRules(runtime.run, projectHookRules(event), {event, cwd, agent, input}),

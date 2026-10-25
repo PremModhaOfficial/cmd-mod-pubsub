@@ -189,6 +189,26 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 		return inboxCursor;
 	}
 
+	// One implementation of the inbox scan: read the directory once, start the
+	// cursor, bound the work by `budgetSize` files, and commit the cursor when
+	// the pass is done (or throws). Every inbox operation goes through here so
+	// scan/claim/put-back/cursor handling cannot drift apart.
+	function inboxPass<T>(
+		budgetSize: number,
+		work: (nextClaim: () => Claim | undefined) => T,
+	): T {
+		const seen = new Set<string>();
+		const budget = {left: budgetSize};
+		const names = inboxNames();
+		const cursor = {at: startCursor(names)};
+		const claimed = new Set<string>();
+		try {
+			return work(() => next(seen, budget, names, cursor, claimed));
+		} finally {
+			inboxCursor = cursor.at;
+		}
+	}
+
 	// Claim the next signal this session may deliver. Everything else - torn, already
 	// delivered, untagged, foreign, or not classifiable yet - is settled right here,
 	// so the caller only ever sees its own work. `seen` bounds one pass.
@@ -367,38 +387,29 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	function drain(): void {
 		if (draining) return;
 		draining = true;
-		const seen = new Set<string>();
-		// One budget and one directory read for the whole pass: the files this
-		// pass may look at, and the inbox as it is now.
-		const budget = {left: FILES_PER_DRAIN_MAX};
-		const names = inboxNames();
-		const cursor = {at: startCursor(names)};
-		const claimed = new Set<string>();
 		try {
-			answerLivePermissions();
-			for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-				const claim = next(seen, budget, names, cursor, claimed);
-				if (claim === undefined) return;
-				// No bound session is a state, not an exception: sending here would
-				// degrade to a silent queue push in a headless run. Hold it instead.
-				if (!deps.hasSession()) {
-					settle(claim, 'held');
-					continue;
+			inboxPass(FILES_PER_DRAIN_MAX, nextClaim => {
+				answerLivePermissions();
+				for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
+					const claim = nextClaim();
+					if (claim === undefined) return;
+					// No bound session is a state, not an exception: sending here would
+					// degrade to a silent queue push in a headless run. Hold it instead.
+					if (!deps.hasSession()) {
+						settle(claim, 'held');
+						continue;
+					}
+					try {
+						deliver(claim.signal);
+					} catch {
+						settle(claim, 'held');
+						continue;
+					}
+					markDelivered(claim.signal.id);
+					settle(claim, 'accepted');
 				}
-				try {
-					deliver(claim.signal);
-				} catch {
-					settle(claim, 'held');
-					continue;
-				}
-				markDelivered(claim.signal.id);
-				settle(claim, 'accepted');
-			}
+			});
 		} finally {
-			// The next pass carries on from the first file this pass did NOT
-			// look at, so a long backlog is worked through and no file is
-			// stepped over.
-			inboxCursor = cursor.at;
 			draining = false;
 		}
 	}
@@ -416,45 +427,37 @@ export function createDelivery(deps: DeliveryDeps): Delivery {
 	// reach the model (onStop continues the run with them as the reason). An unsettled
 	// claim stays in claimed/ and is swept later.
 	function claimPending(limit: number): Claim[] {
-		const seen = new Set<string>();
 		// The budget is the larger of the two bounds: a pass may look at more
 		// files than it claims, because a foreign file is looked at and put back
 		// without being claimed.
-		const budget = {left: Math.max(limit, FILES_PER_DRAIN_MAX)};
-		const names = inboxNames();
-		const cursor = {at: startCursor(names)};
-		const claimed = new Set<string>();
-		const claims: Claim[] = [];
-		while (claims.length < limit) {
-			const claim = next(seen, budget, names, cursor, claimed);
-			if (claim === undefined) break;
-			claims.push(claim);
-		}
-		inboxCursor = cursor.at;
-		return claims;
+		return inboxPass(Math.max(limit, FILES_PER_DRAIN_MAX), nextClaim => {
+			const claims: Claim[] = [];
+			while (claims.length < limit) {
+				const claim = nextClaim();
+				if (claim === undefined) break;
+				claims.push(claim);
+			}
+			return claims;
+		});
 	}
 
 	// How many signals are waiting for this session. It claims through the same
 	// next()/settle() pair the drain uses, so the count cannot drift from delivery.
 	function countPending(): number {
-		const seen = new Set<string>();
 		// The count is a number for the status line, not a promise to look at the
 		// whole inbox. It runs on every status refresh, so it gets the same
 		// per-pass bound the drain does: a foreign backlog must not make the
 		// status line cost more than the drain does.
-		const budget = {left: FILES_PER_DRAIN_MAX};
-		const names = inboxNames();
-		const cursor = {at: startCursor(names)};
-		const claimed = new Set<string>();
-		let count = 0;
-		while (count < PENDING_SCAN_MAX) {
-			const claim = next(seen, budget, names, cursor, claimed);
-			if (claim === undefined) break;
-			count += 1;
-			settle(claim, 'held');
-		}
-		inboxCursor = cursor.at;
-		return count;
+		return inboxPass(FILES_PER_DRAIN_MAX, nextClaim => {
+			let count = 0;
+			while (count < PENDING_SCAN_MAX) {
+				const claim = nextClaim();
+				if (claim === undefined) break;
+				count += 1;
+				settle(claim, 'held');
+			}
+			return count;
+		});
 	}
 
 	function countOrphaned(): number {

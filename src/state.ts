@@ -87,6 +87,19 @@ export function isTerminalState(value: unknown): boolean {
 	return state !== undefined && isTerminal(state);
 }
 
+// The terminal state a value resolves to, or undefined when it is not terminal.
+// Shared mechanical core for the "is it finished, and which state" checks.
+export function terminalState(value: unknown): JobState | undefined {
+	const state = normalizeState(value);
+	return state !== undefined && isTerminal(state) ? state : undefined;
+}
+
+// Whether a value resolves to a live (queued or running) state.
+export function isLiveState(value: unknown): boolean {
+	const state = normalizeState(value);
+	return state === 'queued' || state === 'running';
+}
+
 // Display: a legacy alias shows as its state, an unknown value shows as itself so
 // it cannot hide.
 export function canonicalState(value: unknown): string {
@@ -106,9 +119,14 @@ export function stateColor(state: unknown): string {
 export const jobStates = {
 	list: JOB_STATES,
 	isState,
+	isSignalState,
 	normalize: normalizeState,
+	canonical: canonicalState,
 	canTransition,
 	isTerminal,
+	isTerminalState,
+	terminalState,
+	isLive: isLiveState,
 	marker: stateMarker,
 	color: stateColor,
 };
