@@ -5226,10 +5226,6 @@ function mcpServerConfigs(fs, dirs) {
   return configs;
 }
 __name(mcpServerConfigs, "mcpServerConfigs");
-function mcpServerNames(fs, dirs) {
-  return Object.keys(mcpServerConfigs(fs, dirs));
-}
-__name(mcpServerNames, "mcpServerNames");
 function agentFolderTrusted(definition, roots) {
   if (definition.scope === "plugin") return false;
   const path = definition.sourcePath;
@@ -6806,7 +6802,6 @@ export {
   listAgentsVisible,
   mainCheckoutRoots,
   mcpServerConfigs,
-  mcpServerNames,
   memoryDirFor,
   mentionCandidates,
   moveTaskSelection,

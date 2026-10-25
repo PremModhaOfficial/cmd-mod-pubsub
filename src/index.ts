@@ -2218,10 +2218,6 @@ export function mcpServerConfigs(
 	return configs;
 }
 
-export function mcpServerNames(fs: Pick<SpoolFs, 'readFile'>, dirs: string[]): string[] {
-	return Object.keys(mcpServerConfigs(fs, dirs));
-}
-
 export interface McpTrustRoots {
 	readonly cwd: string;
 	readonly home: string;

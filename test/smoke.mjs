@@ -2740,7 +2740,7 @@ process.stdin.on('data', (data) => {
 
 	// 47. tool access filters and model/effort resolution --------------------
 	const access = await import('../better-sub-agents.ts');
-	for (const name of ['filterTools', 'resolveModel', 'resolveEffort', 'resolveLaunch', 'mcpServerNames']) {
+	for (const name of ['filterTools', 'resolveModel', 'resolveEffort', 'resolveLaunch', 'mcpServerConfigs']) {
 		assert.equal(typeof access[name], 'function', `${name} is exported for a focused check`);
 	}
 
@@ -2962,7 +2962,7 @@ process.stdin.on('data', (data) => {
 	const deep = await spawnAccess({description: 'deep', prompt: 'x', subagent_type: 'deep'});
 	assert.deepEqual(deep.spec.tools, ['mcp__deepwiki__*'], 'an MCP wildcard resolves against configured servers');
 	assert.deepEqual(
-		access.mcpServerNames(realFs, [accessHome]),
+		Object.keys(access.mcpServerConfigs(realFs, [accessHome])),
 		['deepwiki'],
 		'an MCP server disabled in the config contributes no tools',
 	);
