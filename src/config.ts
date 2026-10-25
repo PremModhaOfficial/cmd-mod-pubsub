@@ -95,11 +95,25 @@ const MANAGED_DIR_OPTION = 'managed_dir';
 // The shared rules
 // ---------------------------------------------------------------------------
 
+// The shared mechanical core for a setting with a mod name and a documented
+// alias: read the mod name first, and let the alias answer only when the mod
+// name's reader yields nothing. `read` is the setting's own parser, so a blank
+// or invalid mod value can decline to answer and fall through to the alias.
+function aliased<T>(
+	env: Env,
+	primary: string,
+	alias: string,
+	read: (value: string | undefined) => T | undefined,
+): T | undefined {
+	const primaryValue = read(env[primary]);
+	if (primaryValue !== undefined) return primaryValue;
+	return read(env[alias]);
+}
+
 // The value of `name`, or of its alias when the mod's name is unset. A name
 // that is set to the empty string is set: the alias does not answer for it.
 function aliasValue(env: Env, name: string, alias: string): string | undefined {
-	const value = env[name];
-	return value !== undefined ? value : env[alias];
+	return aliased(env, name, alias, value => value);
 }
 
 // A comma-separated list; blank entries are dropped.
@@ -124,10 +138,10 @@ function isOn(value: string | undefined): boolean {
  * text wins; a blank setting is no setting, so the alias answers instead.
  */
 export function subagentModel(env: Env): string | undefined {
-	const primary = env[SUBAGENT_MODEL_ENV]?.trim();
-	if (primary !== undefined && primary.length > 0) return primary;
-	const alias = env[SUBAGENT_MODEL_ENV_ALIAS]?.trim();
-	return alias !== undefined && alias.length > 0 ? alias : undefined;
+	return aliased(env, SUBAGENT_MODEL_ENV, SUBAGENT_MODEL_ENV_ALIAS, value => {
+		const trimmed = value?.trim();
+		return trimmed !== undefined && trimmed.length > 0 ? trimmed : undefined;
+	});
 }
 
 /**
@@ -135,7 +149,7 @@ export function subagentModel(env: Env): string | undefined {
  * Either name says yes here: a force on the alias is still a force.
  */
 export function subagentModelForced(env: Env): boolean {
-	return isOn(env[SUBAGENT_MODEL_FORCE_ENV]) || isOn(env[SUBAGENT_MODEL_FORCE_ENV_ALIAS]);
+	return [SUBAGENT_MODEL_FORCE_ENV, SUBAGENT_MODEL_FORCE_ENV_ALIAS].some(name => isOn(env[name]));
 }
 
 /** A normalized effort level, or undefined when the value names no level. */
@@ -150,7 +164,7 @@ export function effortLevel(value: unknown, levels: readonly string[]): string |
  * the alias is tried.
  */
 export function effortLevelFromEnv(env: Env, levels: readonly string[]): string | undefined {
-	return effortLevel(env[EFFORT_LEVEL_ENV], levels) ?? effortLevel(env[EFFORT_LEVEL_ENV_ALIAS], levels);
+	return aliased(env, EFFORT_LEVEL_ENV, EFFORT_LEVEL_ENV_ALIAS, value => effortLevel(value, levels));
 }
 
 /** The context window the environment asks for, if it asks for one at all. */
@@ -180,7 +194,7 @@ export function backgroundDisabled(env: Env): boolean {
 		const normalized = value.trim().toLowerCase();
 		return normalized.length > 0 && normalized !== '0' && normalized !== 'false' && normalized !== 'no';
 	};
-	return isOnSwitch(env[BACKGROUND_DISABLE_ENV]) || isOnSwitch(env[BACKGROUND_DISABLE_ENV_ALIAS]);
+	return [BACKGROUND_DISABLE_ENV, BACKGROUND_DISABLE_ENV_ALIAS].some(name => isOnSwitch(env[name]));
 }
 
 /**
@@ -197,16 +211,12 @@ export function toggle(value: unknown): 'on' | 'off' | undefined {
 
 /** The fork mode the environment asks for, if it asks for one at all. */
 export function forkModeFromEnv(env: Env): 'on' | 'off' | undefined {
-	return toggle(env[FORK_MODE_ENV]) ?? toggle(env[FORK_MODE_ENV_ALIAS]);
+	return aliased(env, FORK_MODE_ENV, FORK_MODE_ENV_ALIAS, toggle);
 }
 
 /** Whether the Agent SDK is driving this session. */
 export function agentSdk(env: Env): boolean {
-	return (
-		toggle(env[SDK_ENV]) === 'on' ||
-		toggle(env[SDK_ENV_ALIAS]) === 'on' ||
-		toggle(env[COMMANDCODE_SDK_ENV]) === 'on'
-	);
+	return [SDK_ENV, SDK_ENV_ALIAS, COMMANDCODE_SDK_ENV].some(name => toggle(env[name]) === 'on');
 }
 
 /**
@@ -214,10 +224,10 @@ export function agentSdk(env: Env): boolean {
  * when it is set to anything at all - even whitespace, which names no agent.
  */
 export function agentNameFromEnv(env: Env): string {
-	const primary = env[AGENT_ENV];
-	if (primary !== undefined && primary.length > 0) return primary.trim();
-	const alias = env[AGENT_ENV_ALIAS];
-	return alias !== undefined && alias.length > 0 ? alias.trim() : '';
+	const resolved = aliased(env, AGENT_ENV, AGENT_ENV_ALIAS, value =>
+		value !== undefined && value.length > 0 ? value.trim() : undefined,
+	);
+	return resolved ?? '';
 }
 
 /** Whether the session may message another session's agent. */
@@ -232,7 +242,7 @@ export function mainPermissionModeFromEnv(env: Env): string | undefined {
 
 /** Whether this process is a worker rather than a session. */
 export function workerModeFromEnv(env: Env): boolean {
-	return env[WORKER_ENV] === '1' || env[PUB_SUB_WORKER_ENV] === '1';
+	return [WORKER_ENV, PUB_SUB_WORKER_ENV].some(name => env[name] === '1');
 }
 
 /** Where the managed and the user policy files live. */
