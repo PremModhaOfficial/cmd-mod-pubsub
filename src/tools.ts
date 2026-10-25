@@ -26,6 +26,7 @@ import type {ForegroundResult, SpawnContext, WorkerSpec} from './spawn.ts';
 import {canonicalState, isTerminal, isTerminalState, normalizeState, stateMarker} from './state.ts';
 import type {Ledger} from './ledger.ts';
 import type {Runtime, Signal, SpoolFs} from './types.ts';
+import {readLog} from './utils.ts';
 
 export type ToolResult = {ok: boolean; error?: string; content?: {type: string; text: string}[]};
 
@@ -181,14 +182,6 @@ export function createTools(ctx: ToolsContext): Tools {
 				);
 			};
 
-			function readLog(file: string): string {
-				try {
-					return spool.readFile(file);
-				} catch {
-					return '';
-				}
-			}
-
 			// The persisted conversation, rendered from the worker's JSONL stream. A
 			// malformed line is skipped; it never hides the rest of the transcript.
 			function transcriptText(id: string, record: JobRecord): string {
@@ -233,7 +226,7 @@ export function createTools(ctx: ToolsContext): Tools {
 				const file = String(record.logPath ?? join(logsDir, `${id}.log`));
 				const transcriptPath = String(record.transcriptPath ?? join(transcriptsDir, `${id}.jsonl`));
 				const transcript = record.kind === 'agent' || record.kind === 'fork' ? transcriptText(id, record) : '';
-				const logText = readLog(file);
+				const logText = readLog(spool, file);
 				const log = logText.length > 0 ? logText : transcript;
 				const requested = Number(input.max_chars);
 				// The request is a bound, so it is honored as given. It used to have a

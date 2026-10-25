@@ -146,6 +146,7 @@ import {gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
 import {createWorktreeLifecycle, sweepExpiredEntries} from './worktree-lifecycle.ts';
 import {recordFromPlan, sessionNameOf} from './plan.ts';
 import {createTools} from './tools.ts';
+import {readLog} from './utils.ts';
 import type {PlanContext} from './plan.ts';
 import {answerPendingPermission as answerPermission, failJob, fire} from './spawn.ts';
 import type {ForegroundResult, PermissionContext, SpawnContext, WorkerSpec} from './spawn.ts';
@@ -3650,16 +3651,6 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	// The tool surface lives in src/tools.ts. The entry builds the context the
 	// module needs and owns the two contexts the plan and the spawn read.
 
-	// One log file, read through the spool. The spawn reads it to settle a
-	// foreground run; the tool surface reads it to show the output.
-	function readLog(file: string): string {
-		try {
-			return spool.readFile(file);
-		} catch {
-			return '';
-		}
-	}
-
 	// The plan and the spawn read this session's state through these contexts, so
 	// neither module closes over the composition root.
 	const planCtx: PlanContext = {
@@ -3734,7 +3725,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 		refreshJobs,
 		finalizeJobWorktree,
 		foregroundOutcome,
-		readLog,
+		readLog: file => readLog(spool, file),
 		rosterFor,
 		runProjectHooks: (event, cwd, agent, input) =>
 			runHookRules(runtime.run, projectHookRules(event), {event, cwd, agent, input}),

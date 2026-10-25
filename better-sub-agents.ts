@@ -2997,6 +2997,16 @@ worktree kept at ${decision.path}${decision.error === void 0 ? "" : ` (${decisio
 }
 __name(settleForeground, "settleForeground");
 
+// src/utils.ts
+function readLog(fs, file) {
+  try {
+    return fs.readFile(file);
+  } catch {
+    return "";
+  }
+}
+__name(readLog, "readLog");
+
 // src/tools.ts
 var okText = /* @__PURE__ */ __name((value) => ({ ok: true, content: [{ type: "text", text: value }] }), "okText");
 var badInput = /* @__PURE__ */ __name((error) => ({ ok: false, error }), "badInput");
@@ -3077,14 +3087,6 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
       })
     );
   }, "listRun");
-  function readLog(file) {
-    try {
-      return spool.readFile(file);
-    } catch {
-      return "";
-    }
-  }
-  __name(readLog, "readLog");
   function transcriptText(id, record) {
     const file = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     let raw = "";
@@ -3121,7 +3123,7 @@ The result arrives here as a signal when it exits - do not wait for it. subagent
     const file = String(record.logPath ?? join11(logsDir, `${id}.log`));
     const transcriptPath = String(record.transcriptPath ?? join11(transcriptsDir, `${id}.jsonl`));
     const transcript = record.kind === "agent" || record.kind === "fork" ? transcriptText(id, record) : "";
-    const logText = readLog(file);
+    const logText = readLog(spool, file);
     const log = logText.length > 0 ? logText : transcript;
     const requested = Number(input.max_chars);
     const maxChars = Math.min(
@@ -6256,14 +6258,6 @@ function index_default(cmd, overrides = {}) {
       }
     }, "render")
   });
-  function readLog(file) {
-    try {
-      return spool.readFile(file);
-    } catch {
-      return "";
-    }
-  }
-  __name(readLog, "readLog");
   const planCtx = {
     fs: spool,
     env: runtime.env,
@@ -6331,7 +6325,7 @@ function index_default(cmd, overrides = {}) {
     refreshJobs,
     finalizeJobWorktree,
     foregroundOutcome,
-    readLog,
+    readLog: /* @__PURE__ */ __name((file) => readLog(spool, file), "readLog"),
     rosterFor,
     runProjectHooks: /* @__PURE__ */ __name((event, cwd, agent, input) => runHookRules(runtime.run, projectHookRules(event), { event, cwd, agent, input }), "runProjectHooks"),
     appendJobEntry: /* @__PURE__ */ __name((entry) => {
