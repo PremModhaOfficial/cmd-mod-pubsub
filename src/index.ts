@@ -120,7 +120,7 @@ import {createLedger} from './ledger.ts';
 import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Ownership} from './signals.ts';
-import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
+import {EFFORT_LEVELS, filterTools, withheldBy, workerToolAllowed} from './tool-filter.ts';
 import {
 	agentNameFromEnv,
 	agentSdk,
@@ -2070,14 +2070,14 @@ export function resolveModel(input: ModelResolutionInput = {}): ModelResolution 
 	const env = input.env ?? {};
 	const envModel = subagentModel(env);
 	const forced = subagentModelForced(env);
-	const main = nonEmpty(input.main);
+	const main = stringField(input.main);
 	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
 
-	const requested = nonEmpty(input.requested);
+	const requested = stringField(input.requested);
 	if (requested === 'inherit') return {model: main, source: 'inherit'};
 	if (requested !== undefined) return {model: requested, source: 'parameter'};
 
-	const definition = nonEmpty(input.definition);
+	const definition = stringField(input.definition);
 	if (definition === 'inherit') return {model: main, source: 'inherit'};
 	if (definition !== undefined) return {model: definition, source: 'definition'};
 

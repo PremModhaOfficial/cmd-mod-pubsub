@@ -1798,10 +1798,6 @@ function filterTools(input = {}) {
   return { ok: true, tools: kept, removed: removed.filter((tool) => !kept.includes(tool)) };
 }
 __name(filterTools, "filterTools");
-function nonEmpty(value) {
-  return typeof value === "string" && value.trim().length > 0 ? value.trim() : void 0;
-}
-__name(nonEmpty, "nonEmpty");
 
 // src/config.ts
 import { join as join6 } from "node:path";
@@ -5144,12 +5140,12 @@ function resolveModel(input = {}) {
   const env = input.env ?? {};
   const envModel = subagentModel(env);
   const forced = subagentModelForced(env);
-  const main = nonEmpty(input.main);
+  const main = stringField(input.main);
   if (forced && envModel !== void 0) return { model: envModel, source: "forced" };
-  const requested = nonEmpty(input.requested);
+  const requested = stringField(input.requested);
   if (requested === "inherit") return { model: main, source: "inherit" };
   if (requested !== void 0) return { model: requested, source: "parameter" };
-  const definition = nonEmpty(input.definition);
+  const definition = stringField(input.definition);
   if (definition === "inherit") return { model: main, source: "inherit" };
   if (definition !== void 0) return { model: definition, source: "definition" };
   if (envModel !== void 0) return { model: envModel, source: "environment" };

@@ -259,7 +259,3 @@ export function filterTools(input: ToolFilterInput = {}): ToolFilterResult {
 	}
 	return {ok: true, tools: kept, removed: removed.filter(tool => !kept.includes(tool))};
 }
-
-export function nonEmpty(value: unknown): string | undefined {
-	return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
-}
