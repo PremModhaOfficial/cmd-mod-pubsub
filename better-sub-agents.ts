@@ -1339,6 +1339,19 @@ ${next2}`;
     return inboxCursor;
   }
   __name(startCursor, "startCursor");
+  function inboxPass(budgetSize, work) {
+    const seen = /* @__PURE__ */ new Set();
+    const budget = { left: budgetSize };
+    const names = inboxNames();
+    const cursor = { at: startCursor(names) };
+    const claimed = /* @__PURE__ */ new Set();
+    try {
+      return work(() => next(seen, budget, names, cursor, claimed));
+    } finally {
+      inboxCursor = cursor.at;
+    }
+  }
+  __name(inboxPass, "inboxPass");
   function next(seen, budget, names, cursor, claimedIds) {
     while (cursor.at < names.length) {
       if (budget.left <= 0) return void 0;
@@ -1446,31 +1459,27 @@ ${next2}`;
   function drain() {
     if (draining) return;
     draining = true;
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: FILES_PER_DRAIN_MAX };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
     try {
-      answerLivePermissions();
-      for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
-        const claim = next(seen, budget, names, cursor, claimed);
-        if (claim === void 0) return;
-        if (!deps.hasSession()) {
-          settle(claim, "held");
-          continue;
+      inboxPass(FILES_PER_DRAIN_MAX, (nextClaim) => {
+        answerLivePermissions();
+        for (let handled = 0; handled < FILES_PER_DRAIN_MAX; handled += 1) {
+          const claim = nextClaim();
+          if (claim === void 0) return;
+          if (!deps.hasSession()) {
+            settle(claim, "held");
+            continue;
+          }
+          try {
+            deliver(claim.signal);
+          } catch {
+            settle(claim, "held");
+            continue;
+          }
+          markDelivered(claim.signal.id);
+          settle(claim, "accepted");
         }
-        try {
-          deliver(claim.signal);
-        } catch {
-          settle(claim, "held");
-          continue;
-        }
-        markDelivered(claim.signal.id);
-        settle(claim, "accepted");
-      }
+      });
     } finally {
-      inboxCursor = cursor.at;
       draining = false;
     }
   }
@@ -1482,36 +1491,28 @@ ${next2}`;
     }
   }, "safeDrain");
   function claimPending(limit) {
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: Math.max(limit, FILES_PER_DRAIN_MAX) };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
-    const claims = [];
-    while (claims.length < limit) {
-      const claim = next(seen, budget, names, cursor, claimed);
-      if (claim === void 0) break;
-      claims.push(claim);
-    }
-    inboxCursor = cursor.at;
-    return claims;
+    return inboxPass(Math.max(limit, FILES_PER_DRAIN_MAX), (nextClaim) => {
+      const claims = [];
+      while (claims.length < limit) {
+        const claim = nextClaim();
+        if (claim === void 0) break;
+        claims.push(claim);
+      }
+      return claims;
+    });
   }
   __name(claimPending, "claimPending");
   function countPending() {
-    const seen = /* @__PURE__ */ new Set();
-    const budget = { left: FILES_PER_DRAIN_MAX };
-    const names = inboxNames();
-    const cursor = { at: startCursor(names) };
-    const claimed = /* @__PURE__ */ new Set();
-    let count = 0;
-    while (count < PENDING_SCAN_MAX) {
-      const claim = next(seen, budget, names, cursor, claimed);
-      if (claim === void 0) break;
-      count += 1;
-      settle(claim, "held");
-    }
-    inboxCursor = cursor.at;
-    return count;
+    return inboxPass(FILES_PER_DRAIN_MAX, (nextClaim) => {
+      let count = 0;
+      while (count < PENDING_SCAN_MAX) {
+        const claim = nextClaim();
+        if (claim === void 0) break;
+        count += 1;
+        settle(claim, "held");
+      }
+      return count;
+    });
   }
   __name(countPending, "countPending");
   function countOrphaned() {
