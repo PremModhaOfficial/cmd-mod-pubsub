@@ -2,19 +2,7 @@ var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // src/index.ts
-import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import {
-  appendFileSync,
-  mkdirSync,
-  readdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  statSync,
-  writeFileSync
-} from "node:fs";
-import { homedir as homedir2 } from "node:os";
 import { dirname as dirname5, isAbsolute as isAbsolute4, join as join14, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
@@ -3670,6 +3658,170 @@ function resolveTeamPolicy(input) {
 }
 __name(resolveTeamPolicy, "resolveTeamPolicy");
 
+// src/runtime.ts
+import { spawn, spawnSync } from "node:child_process";
+import {
+  appendFileSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync
+} from "node:fs";
+import { homedir as homedir2 } from "node:os";
+function osSpoolFs() {
+  return {
+    mkdir: /* @__PURE__ */ __name((dir) => {
+      mkdirSync(dir, { recursive: true });
+    }, "mkdir"),
+    readdir: /* @__PURE__ */ __name((dir) => readdirSync(dir), "readdir"),
+    readFile: /* @__PURE__ */ __name((file) => readFileSync(file, "utf8"), "readFile"),
+    writeFile: /* @__PURE__ */ __name((file, data) => writeFileSync(file, data), "writeFile"),
+    appendFile: /* @__PURE__ */ __name((file, data) => appendFileSync(file, data), "appendFile"),
+    rename: /* @__PURE__ */ __name((from, to) => renameSync(from, to), "rename"),
+    remove: /* @__PURE__ */ __name((file) => {
+      rmSync(file, { force: true, recursive: true });
+    }, "remove"),
+    stat: /* @__PURE__ */ __name((file) => {
+      const stats = statSync(file);
+      return { size: stats.size, mtimeMs: stats.mtimeMs };
+    }, "stat"),
+    exists: /* @__PURE__ */ __name((file) => {
+      try {
+        return statSync(file).isDirectory();
+      } catch {
+        return false;
+      }
+    }, "exists")
+  };
+}
+__name(osSpoolFs, "osSpoolFs");
+var OS_RUNTIME = {
+  now: /* @__PURE__ */ __name(() => Date.now(), "now"),
+  spawn: /* @__PURE__ */ __name((command, args, options) => spawn(command, args, options), "spawn"),
+  kill: /* @__PURE__ */ __name((pid, signal) => {
+    process.kill(pid, signal);
+  }, "kill"),
+  alive: /* @__PURE__ */ __name((pid) => {
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return error.code === "EPERM";
+    }
+  }, "alive"),
+  // The only wait in the mod, used by subagent_output's opt-in blocking read.
+  sleep: /* @__PURE__ */ __name((ms) => new Promise((resolve3) => setTimeout(resolve3, ms)), "sleep"),
+  // The fallback for a host without `cmd.clock.after`, and the seam the tests drive.
+  later: /* @__PURE__ */ __name((ms, fn) => {
+    const timer = setTimeout(fn, ms);
+    if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
+  }, "later"),
+  pid: process.pid,
+  execPath: process.execPath,
+  env: process.env,
+  cwd: process.cwd(),
+  home: homedir2(),
+  interactive: process.stdin.isTTY === true,
+  fs: osSpoolFs(),
+  // One bounded command. Everything it returns is plain data, so a failed git (not a
+  // repository, no ref) is a value, never a throw here.
+  run: /* @__PURE__ */ __name((command, args, options) => {
+    const result = spawnSync(command, args, {
+      cwd: options.cwd,
+      encoding: "utf8",
+      timeout: options.timeoutMs ?? 2e3,
+      maxBuffer: 64 * 1024,
+      ...options.env !== void 0 ? { env: { ...process.env, ...options.env } } : {}
+    });
+    return {
+      ok: result.status === 0,
+      code: typeof result.status === "number" ? result.status : 1,
+      stdout: String(result.stdout ?? ""),
+      stderr: String(result.stderr ?? result.error?.message ?? "")
+    };
+  }, "run")
+};
+function osRuntime(overrides = {}) {
+  return {
+    ...OS_RUNTIME,
+    ...overrides,
+    fs: { ...OS_RUNTIME.fs, ...overrides.fs }
+  };
+}
+__name(osRuntime, "osRuntime");
+
+// src/hooks.ts
+function hookMatches(matcher, toolName) {
+  const pattern = (matcher ?? "").trim();
+  if (pattern.length === 0 || pattern === "*") return true;
+  if (pattern.length > 2 && pattern.startsWith("/") && pattern.endsWith("/")) {
+    try {
+      return new RegExp(pattern.slice(1, -1), "i").test(toolName);
+    } catch {
+      return false;
+    }
+  }
+  const glob = /* @__PURE__ */ __name((value) => {
+    const escaped = value.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*");
+    return new RegExp(`^${escaped}$`, "i").test(toolName);
+  }, "glob");
+  return pattern.split("|").some((part) => glob(part.trim()));
+}
+__name(hookMatches, "hookMatches");
+var HOOK_TIMEOUT_MS = 1e4;
+function runHookRules(run, rules, detail) {
+  const outcome = { ran: 0 };
+  if (run === void 0 || rules === void 0 || rules.length === 0) return outcome;
+  const contexts = [];
+  for (const rule of rules) {
+    if ((detail.event === "PreToolUse" || detail.event === "PostToolUse") && !hookMatches(rule.matcher, detail.toolName ?? "")) {
+      continue;
+    }
+    const env = {
+      BETTER_SUBAGENTS_HOOK_EVENT: detail.event,
+      BETTER_SUBAGENTS_HOOK_AGENT: detail.agent ?? "",
+      BETTER_SUBAGENTS_HOOK_TOOL_NAME: detail.toolName ?? "",
+      BETTER_SUBAGENTS_HOOK_TOOL_INPUT: JSON.stringify(detail.input ?? {}),
+      BETTER_SUBAGENTS_HOOK_RESULT: JSON.stringify(detail.result ?? null),
+      BETTER_SUBAGENTS_HOOK_CWD: detail.cwd
+    };
+    let result;
+    try {
+      result = run("/bin/sh", ["-c", rule.command], {
+        cwd: detail.cwd,
+        timeoutMs: rule.timeoutMs ?? HOOK_TIMEOUT_MS,
+        env
+      });
+    } catch {
+      continue;
+    }
+    outcome.ran += 1;
+    const code = typeof result.code === "number" ? result.code : result.ok ? 0 : 1;
+    if (code !== 2) continue;
+    const message = (result.stderr || result.stdout || "").trim();
+    if (detail.event === "PreToolUse") {
+      outcome.block = message.length > 0 ? message : "Blocked by a PreToolUse hook.";
+      return outcome;
+    }
+    if (detail.event === "PostToolUse") {
+      if (message.length > 0) contexts.push(message);
+      continue;
+    }
+    if (detail.event === "SubagentStop") {
+      outcome.continue = true;
+      outcome.reason = message.length > 0 ? message : "SubagentStop hook requested another turn.";
+      return outcome;
+    }
+  }
+  if (contexts.length > 0) outcome.additionalContext = contexts.join("\n\n");
+  return outcome;
+}
+__name(runHookRules, "runHookRules");
+
 // src/mcp.ts
 import { isAbsolute as isAbsolute2, join as join12 } from "node:path";
 function mcpServerConfigs(fs, dirs) {
@@ -5258,154 +5410,6 @@ process.on('uncaughtException', err => {
   process.exit(0);
 });
 `;
-function osSpoolFs() {
-  return {
-    mkdir: /* @__PURE__ */ __name((dir) => {
-      mkdirSync(dir, { recursive: true });
-    }, "mkdir"),
-    readdir: /* @__PURE__ */ __name((dir) => readdirSync(dir), "readdir"),
-    readFile: /* @__PURE__ */ __name((file) => readFileSync(file, "utf8"), "readFile"),
-    writeFile: /* @__PURE__ */ __name((file, data) => writeFileSync(file, data), "writeFile"),
-    appendFile: /* @__PURE__ */ __name((file, data) => appendFileSync(file, data), "appendFile"),
-    rename: /* @__PURE__ */ __name((from, to) => renameSync(from, to), "rename"),
-    remove: /* @__PURE__ */ __name((file) => {
-      rmSync(file, { force: true, recursive: true });
-    }, "remove"),
-    stat: /* @__PURE__ */ __name((file) => {
-      const stats = statSync(file);
-      return { size: stats.size, mtimeMs: stats.mtimeMs };
-    }, "stat"),
-    exists: /* @__PURE__ */ __name((file) => {
-      try {
-        return statSync(file).isDirectory();
-      } catch {
-        return false;
-      }
-    }, "exists")
-  };
-}
-__name(osSpoolFs, "osSpoolFs");
-var OS_RUNTIME = {
-  now: /* @__PURE__ */ __name(() => Date.now(), "now"),
-  spawn: /* @__PURE__ */ __name((command, args, options) => spawn(command, args, options), "spawn"),
-  kill: /* @__PURE__ */ __name((pid, signal) => {
-    process.kill(pid, signal);
-  }, "kill"),
-  alive: /* @__PURE__ */ __name((pid) => {
-    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (error) {
-      return error.code === "EPERM";
-    }
-  }, "alive"),
-  // The only wait in the mod, used by subagent_output's opt-in blocking read.
-  sleep: /* @__PURE__ */ __name((ms) => new Promise((resolve3) => setTimeout(resolve3, ms)), "sleep"),
-  // The fallback for a host without `cmd.clock.after`, and the seam the tests drive.
-  later: /* @__PURE__ */ __name((ms, fn) => {
-    const timer = setTimeout(fn, ms);
-    if (typeof timer === "object" && timer !== null && "unref" in timer && typeof timer.unref === "function") timer.unref();
-  }, "later"),
-  pid: process.pid,
-  execPath: process.execPath,
-  env: process.env,
-  cwd: process.cwd(),
-  home: homedir2(),
-  interactive: process.stdin.isTTY === true,
-  fs: osSpoolFs(),
-  // One bounded command. Everything it returns is plain data, so a failed git (not a
-  // repository, no ref) is a value, never a throw here.
-  run: /* @__PURE__ */ __name((command, args, options) => {
-    const result = spawnSync(command, args, {
-      cwd: options.cwd,
-      encoding: "utf8",
-      timeout: options.timeoutMs ?? 2e3,
-      maxBuffer: 64 * 1024,
-      ...options.env !== void 0 ? { env: { ...process.env, ...options.env } } : {}
-    });
-    return {
-      ok: result.status === 0,
-      code: typeof result.status === "number" ? result.status : 1,
-      stdout: String(result.stdout ?? ""),
-      stderr: String(result.stderr ?? result.error?.message ?? "")
-    };
-  }, "run")
-};
-function osRuntime(overrides = {}) {
-  return {
-    ...OS_RUNTIME,
-    ...overrides,
-    fs: { ...OS_RUNTIME.fs, ...overrides.fs }
-  };
-}
-__name(osRuntime, "osRuntime");
-function hookMatches(matcher, toolName) {
-  const pattern = (matcher ?? "").trim();
-  if (pattern.length === 0 || pattern === "*") return true;
-  if (pattern.length > 2 && pattern.startsWith("/") && pattern.endsWith("/")) {
-    try {
-      return new RegExp(pattern.slice(1, -1), "i").test(toolName);
-    } catch {
-      return false;
-    }
-  }
-  const glob = /* @__PURE__ */ __name((value) => {
-    const escaped = value.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*");
-    return new RegExp(`^${escaped}$`, "i").test(toolName);
-  }, "glob");
-  return pattern.split("|").some((part) => glob(part.trim()));
-}
-__name(hookMatches, "hookMatches");
-var HOOK_TIMEOUT_MS = 1e4;
-function runHookRules(run, rules, detail) {
-  const outcome = { ran: 0 };
-  if (run === void 0 || rules === void 0 || rules.length === 0) return outcome;
-  const contexts = [];
-  for (const rule of rules) {
-    if ((detail.event === "PreToolUse" || detail.event === "PostToolUse") && !hookMatches(rule.matcher, detail.toolName ?? "")) {
-      continue;
-    }
-    const env = {
-      BETTER_SUBAGENTS_HOOK_EVENT: detail.event,
-      BETTER_SUBAGENTS_HOOK_AGENT: detail.agent ?? "",
-      BETTER_SUBAGENTS_HOOK_TOOL_NAME: detail.toolName ?? "",
-      BETTER_SUBAGENTS_HOOK_TOOL_INPUT: JSON.stringify(detail.input ?? {}),
-      BETTER_SUBAGENTS_HOOK_RESULT: JSON.stringify(detail.result ?? null),
-      BETTER_SUBAGENTS_HOOK_CWD: detail.cwd
-    };
-    let result;
-    try {
-      result = run("/bin/sh", ["-c", rule.command], {
-        cwd: detail.cwd,
-        timeoutMs: rule.timeoutMs ?? HOOK_TIMEOUT_MS,
-        env
-      });
-    } catch {
-      continue;
-    }
-    outcome.ran += 1;
-    const code = typeof result.code === "number" ? result.code : result.ok ? 0 : 1;
-    if (code !== 2) continue;
-    const message = (result.stderr || result.stdout || "").trim();
-    if (detail.event === "PreToolUse") {
-      outcome.block = message.length > 0 ? message : "Blocked by a PreToolUse hook.";
-      return outcome;
-    }
-    if (detail.event === "PostToolUse") {
-      if (message.length > 0) contexts.push(message);
-      continue;
-    }
-    if (detail.event === "SubagentStop") {
-      outcome.continue = true;
-      outcome.reason = message.length > 0 ? message : "SubagentStop hook requested another turn.";
-      return outcome;
-    }
-  }
-  if (contexts.length > 0) outcome.additionalContext = contexts.join("\n\n");
-  return outcome;
-}
-__name(runHookRules, "runHookRules");
 function buildRoster(entries, selfName) {
   const named = /* @__PURE__ */ new Map();
   for (const entry of entries) {
