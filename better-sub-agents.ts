@@ -3582,6 +3582,94 @@ function tasksHintVisible(jobs, now) {
 }
 __name(tasksHintVisible, "tasksHintVisible");
 
+// src/policy.ts
+var PERMISSION_MODE_LIST = [
+  "default",
+  "acceptEdits",
+  "auto",
+  "dontAsk",
+  "bypassPermissions",
+  "plan"
+];
+var PERMISSION_MODE_TABLE = {
+  default: { acp: "default", cli: "standard" },
+  acceptEdits: { acp: "auto-accept", cli: "accept-edits", inherits: true },
+  auto: { inherits: true },
+  dontAsk: { acp: "dont-ask", autoDeny: true },
+  bypassPermissions: { acp: "bypass", cli: "yolo", inherits: true, bypass: true },
+  plan: { acp: "plan", cli: "plan", readOnly: true }
+};
+var PERMISSION_MODE_ALIASES = {
+  manual: "default",
+  standard: "default",
+  "accept-edits": "acceptEdits",
+  "auto-accept": "acceptEdits",
+  "dont-ask": "dontAsk",
+  yolo: "bypassPermissions",
+  bypass: "bypassPermissions"
+};
+function canonicalPermissionMode(value) {
+  if (typeof value !== "string" || value.length === 0) return void 0;
+  const alias = PERMISSION_MODE_ALIASES[value];
+  if (alias !== void 0) return alias;
+  return Object.prototype.hasOwnProperty.call(PERMISSION_MODE_TABLE, value) ? value : void 0;
+}
+__name(canonicalPermissionMode, "canonicalPermissionMode");
+function resolvePermissionMode(definitionMode, mainMode) {
+  const main = canonicalPermissionMode(mainMode) ?? "default";
+  const definition = canonicalPermissionMode(definitionMode) ?? "default";
+  if (PERMISSION_MODE_TABLE[main].inherits === true) return { ok: true, mode: main };
+  if (PERMISSION_MODE_TABLE[definition].bypass === true) {
+    return {
+      ok: false,
+      error: 'permissionMode "bypassPermissions" requires the main session to be in bypassPermissions'
+    };
+  }
+  return { ok: true, mode: definition };
+}
+__name(resolvePermissionMode, "resolvePermissionMode");
+var permissionModes = {
+  list: PERMISSION_MODE_LIST,
+  table: PERMISSION_MODE_TABLE,
+  canonical: canonicalPermissionMode,
+  resolve: resolvePermissionMode
+};
+function resolveExecutionPolicy(input) {
+  if (backgroundDisabled(input.env)) return "foreground";
+  if (input.definitionBackground === true) return "background";
+  if (input.requested === false) return "foreground";
+  return "background";
+}
+__name(resolveExecutionPolicy, "resolveExecutionPolicy");
+function resolveForkMode(input = {}) {
+  const flag = toggle(input.flag);
+  if (flag !== void 0) return flag;
+  const env = input.env ?? {};
+  const fromEnv = forkModeFromEnv(env);
+  if (fromEnv !== void 0) return fromEnv;
+  const inSdk = input.sdk === true || agentSdk(env);
+  if (inSdk) return "off";
+  return input.interactive === true ? "on" : "off";
+}
+__name(resolveForkMode, "resolveForkMode");
+function resolveTeamPolicy(input) {
+  if (input.teammate !== true) return { ok: true, background: false };
+  if (input.definitionBackground === true) {
+    return {
+      ok: false,
+      error: `a teammate cannot run in the background: its definition sets background: true; remove that field to join a team`
+    };
+  }
+  if (input.requested === true && input.forkMode === "off") {
+    return {
+      ok: false,
+      error: "a teammate cannot run in the background: remove run_in_background: true (teammates run in the foreground)"
+    };
+  }
+  return { ok: true, background: false };
+}
+__name(resolveTeamPolicy, "resolveTeamPolicy");
+
 // src/output.ts
 function scanOutput(text) {
   const marker = "[harness: subagent output matched instruction-shaped pattern(s): ";
@@ -5396,92 +5484,6 @@ function resolveAgentMcpServers(input = {}) {
   return { servers, dropped };
 }
 __name(resolveAgentMcpServers, "resolveAgentMcpServers");
-var PERMISSION_MODE_LIST = [
-  "default",
-  "acceptEdits",
-  "auto",
-  "dontAsk",
-  "bypassPermissions",
-  "plan"
-];
-var PERMISSION_MODE_TABLE = {
-  default: { acp: "default", cli: "standard" },
-  acceptEdits: { acp: "auto-accept", cli: "accept-edits", inherits: true },
-  auto: { inherits: true },
-  dontAsk: { acp: "dont-ask", autoDeny: true },
-  bypassPermissions: { acp: "bypass", cli: "yolo", inherits: true, bypass: true },
-  plan: { acp: "plan", cli: "plan", readOnly: true }
-};
-var PERMISSION_MODE_ALIASES = {
-  manual: "default",
-  standard: "default",
-  "accept-edits": "acceptEdits",
-  "auto-accept": "acceptEdits",
-  "dont-ask": "dontAsk",
-  yolo: "bypassPermissions",
-  bypass: "bypassPermissions"
-};
-function canonicalPermissionMode(value) {
-  if (typeof value !== "string" || value.length === 0) return void 0;
-  const alias = PERMISSION_MODE_ALIASES[value];
-  if (alias !== void 0) return alias;
-  return Object.prototype.hasOwnProperty.call(PERMISSION_MODE_TABLE, value) ? value : void 0;
-}
-__name(canonicalPermissionMode, "canonicalPermissionMode");
-function resolvePermissionMode(definitionMode, mainMode) {
-  const main = canonicalPermissionMode(mainMode) ?? "default";
-  const definition = canonicalPermissionMode(definitionMode) ?? "default";
-  if (PERMISSION_MODE_TABLE[main].inherits === true) return { ok: true, mode: main };
-  if (PERMISSION_MODE_TABLE[definition].bypass === true) {
-    return {
-      ok: false,
-      error: 'permissionMode "bypassPermissions" requires the main session to be in bypassPermissions'
-    };
-  }
-  return { ok: true, mode: definition };
-}
-__name(resolvePermissionMode, "resolvePermissionMode");
-var permissionModes = {
-  list: PERMISSION_MODE_LIST,
-  table: PERMISSION_MODE_TABLE,
-  canonical: canonicalPermissionMode,
-  resolve: resolvePermissionMode
-};
-function resolveExecutionPolicy(input) {
-  if (backgroundDisabled(input.env)) return "foreground";
-  if (input.definitionBackground === true) return "background";
-  if (input.requested === false) return "foreground";
-  return "background";
-}
-__name(resolveExecutionPolicy, "resolveExecutionPolicy");
-function resolveForkMode(input = {}) {
-  const flag = toggle(input.flag);
-  if (flag !== void 0) return flag;
-  const env = input.env ?? {};
-  const fromEnv = forkModeFromEnv(env);
-  if (fromEnv !== void 0) return fromEnv;
-  const inSdk = input.sdk === true || agentSdk(env);
-  if (inSdk) return "off";
-  return input.interactive === true ? "on" : "off";
-}
-__name(resolveForkMode, "resolveForkMode");
-function resolveTeamPolicy(input) {
-  if (input.teammate !== true) return { ok: true, background: false };
-  if (input.definitionBackground === true) {
-    return {
-      ok: false,
-      error: `a teammate cannot run in the background: its definition sets background: true; remove that field to join a team`
-    };
-  }
-  if (input.requested === true && input.forkMode === "off") {
-    return {
-      ok: false,
-      error: "a teammate cannot run in the background: remove run_in_background: true (teammates run in the foreground)"
-    };
-  }
-  return { ok: true, background: false };
-}
-__name(resolveTeamPolicy, "resolveTeamPolicy");
 function index_default(cmd, overrides = {}) {
   const runtime = osRuntime(overrides);
   const spool = runtime.fs;
