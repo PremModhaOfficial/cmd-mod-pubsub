@@ -615,7 +615,6 @@ export function recordFromPlan(
 		sessionId: ctx.sessionId(),
 		updatedAt: startedAt,
 		...(intent.depth !== undefined ? {depth: intent.depth} : {}),
-		...(intent.parentJobId !== undefined ? {parentJobId: intent.parentJobId} : {}),
 		...(isAgent
 			? {
 					// The durable resume handle. A one-shot agent has none, so nothing can

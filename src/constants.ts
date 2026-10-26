@@ -33,10 +33,6 @@ export const WAIT_MAX_MS = 60 * 1000;
 export const WAIT_POLL_MS = 200;
 export const OUTPUT_MAX_CHARS_DEFAULT = 4000;
 export const OUTPUT_MAX_CHARS_CAP = 100 * 1000;
-// Live messaging. A running agent polls its control/send.jsonl; an agent with no
-// message waits this long for a turn before it exits and a send resumes it.
-export const LIVE_POLL_MS = 100;
-export const LIVE_IDLE_MS_DEFAULT = 30 * 1000;
 // The adapter's own cadence, set on every spec: how often it polls the control
 // channel, and how long a foreground permission prompt waits for an answer.
 export const CONTROL_POLL_MS = 100;
@@ -76,7 +72,6 @@ export const AGENT_NAME_MAX = 256;
 export const AGENT_SCAN_MAX = 1000;
 export const AGENT_SCAN_DEPTH_MAX = 8;
 export const AGENT_LOG_FILE = 'agents.log';
-export const WORKER_PROMPT_ENV = 'BETTER_SUBAGENTS_AGENT_PROMPT';
 // The host reserves these names for its own agents. We never register *our*
 // built-ins under them; `general` resolves to our `general-purpose` instead.
 export const HOST_RESERVED_AGENT_NAMES: Record<string, true> = {
