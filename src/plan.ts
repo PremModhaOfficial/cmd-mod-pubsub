@@ -12,7 +12,7 @@ import {join} from 'node:path';
 import {FORK_AGENT_TYPE} from './constants.ts';
 import {backgroundDisabled} from './config.ts';
 import type {JobRecord} from './jobs.ts';
-import type {SpoolFs} from './types.ts';
+import type {LaunchCacheTtl, LaunchMcpServer, SpoolFs} from './types.ts';
 
 export type PlanMemoryScope = 'user' | 'project' | 'local';
 
@@ -28,14 +28,14 @@ export interface PlanAgent {
 	readonly tools?: string[];
 	readonly disallowedTools?: string[];
 	readonly permissionMode?: string;
-	readonly mcpServers?: NonNullable<JobRecord['mcpServers']>;
+	readonly mcpServers?: LaunchMcpServer[];
 	readonly model?: string;
 	readonly effort?: string;
 	readonly maxTurns?: number;
 	readonly memory?: PlanMemoryScope;
 	readonly isolation?: string;
 	readonly color?: string;
-	readonly cacheTtl?: JobRecord['cacheTtl'];
+	readonly cacheTtl?: LaunchCacheTtl;
 	readonly hooks?: PlanHooks;
 	readonly autoCompactWindow?: number;
 }
@@ -101,7 +101,7 @@ export type PlanLaunch =
 	| {ok: false; error: string};
 
 export interface PlanMcpInput {
-	defined: NonNullable<JobRecord['mcpServers']>;
+	defined: LaunchMcpServer[];
 	configured: Record<string, unknown>;
 	definition?: PlanAgent;
 	env: Record<string, string | undefined>;
@@ -109,7 +109,7 @@ export interface PlanMcpInput {
 }
 
 export interface PlanMcpResolution {
-	servers: NonNullable<JobRecord['mcpServers']>;
+	servers: LaunchMcpServer[];
 }
 
 export interface PlanTrustRoots {
@@ -193,10 +193,10 @@ export interface JobPlan {
 	readonly tools?: string[];
 	readonly disallowedTools?: string[];
 	/** The MCP servers scoped to this agent. */
-	readonly mcpServers?: NonNullable<JobRecord['mcpServers']>;
+	readonly mcpServers?: LaunchMcpServer[];
 	/** The resolved auto-compact window; only ever lowers the inherited one. */
 	readonly autoCompactWindow?: number;
-	readonly cacheTtl?: JobRecord['cacheTtl'];
+	readonly cacheTtl?: LaunchCacheTtl;
 	readonly color?: string;
 	readonly permissionMode?: string;
 	readonly isolation?: string;
@@ -214,6 +214,26 @@ export interface JobPlan {
 	/** keep the ACP session open for live messages after the first turn */
 	readonly live?: boolean;
 }
+
+// The launch fields that never reach the durable record: the rendered prompts and
+// startup bundle, the hook rules, the session a follow-up resumes, the one-shot
+// marker (already carried by the absent agentId), and the parent's job id (no
+// record reader takes it, so it stays out of the file). Every other launch field
+// is persisted, so a new field is either recorded or named here.
+export const TRANSIENT_PLAN_FIELDS = [
+	'appendSystemPrompt',
+	'hooks',
+	'oneShot',
+	'parentJobId',
+	'resumeSession',
+	'startup',
+	'systemPrompt',
+] as const satisfies readonly (keyof JobPlan)[];
+
+export type TransientPlanField = (typeof TRANSIENT_PLAN_FIELDS)[number];
+
+/** The launch fields a record carries, plus the record-only bookkeeping fields. */
+type RecordedPlan = {-readonly [K in Exclude<keyof JobPlan, TransientPlanField>]: JobPlan[K] | undefined};
 
 // One resolution for a new job: every field the record, the worker spec, and the
 // transport need is decided here, once. `fire` adds identity (id, paths, owner,
@@ -588,7 +608,10 @@ export function sessionNameOf(id: string): string {
 	return `subagent-${id}`;
 }
 
-// What the job is: one record, before anything is spawned.
+// What the job is: one record, before anything is spawned. The launch fields go
+// through a required mapping: RecordedPlan names every JobPlan field that is not
+// declared transient, so a new launch field is a type error until it is either
+// recorded here or declared transient above.
 export function recordFromPlan(
 	intent: JobPlan,
 	id: string,
@@ -598,57 +621,59 @@ export function recordFromPlan(
 	ctx: Pick<PlanContext, 'sessionId' | 'transcriptsDir'>,
 ): JobRecord {
 	const isAgent = intent.prompt !== undefined;
-	return {
-		id,
-		owner,
+	const launch: RecordedPlan = {
 		description: intent.description,
 		kind: intent.kind,
-		...(intent.name !== undefined ? {name: intent.name} : {}),
-		state: 'queued',
+		command: intent.prompt !== undefined ? undefined : intent.command,
+		prompt: intent.prompt,
+		cwd: intent.cwd,
+		agentType: isAgent ? (intent.agentType ?? 'general-purpose') : undefined,
+		fork: intent.fork === true ? true : undefined,
+		mainSessionId: intent.fork === true ? intent.mainSessionId : undefined,
+		teamName: intent.teamName,
+		// Whether a restriction was applied. A plain agent has a resolved tool list
+		// too, so the list alone cannot say "restricted" on a follow-up.
+		restrictedTools: intent.restrictedTools === true ? true : undefined,
+		depth: intent.depth,
+		model: intent.model,
+		maxTurns: intent.maxTurns,
+		effort: intent.effort,
+		tools: intent.tools,
+		// The deny list the run resolved, so a resume restores the same one. The
+		// definition's list is not the same thing: a spawn may override it.
+		disallowedTools: intent.disallowedTools,
+		mcpServers: intent.mcpServers,
+		autoCompactWindow: intent.autoCompactWindow,
+		cacheTtl: intent.cacheTtl,
+		color: intent.color,
+		permissionMode: intent.permissionMode,
+		isolation: intent.isolation,
 		// The resolved policy, not the raw `run_in_background`: env and definition
 		// overrides are already applied by the caller.
 		background: intent.background !== false,
-		...(isAgent && intent.live !== false && intent.oneShot !== true ? {live: true} : {}),
-		cwd: intent.cwd,
+		timeoutMs: intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? intent.timeoutMs : undefined,
+		resumedFrom: intent.resumeSession !== undefined ? intent.resumedFrom : undefined,
+		name: intent.name,
+		owner,
+		live: isAgent && intent.live !== false && intent.oneShot !== true ? true : undefined,
+	};
+	return {
+		...launch,
+		id,
 		logPath,
 		startedAt,
 		sessionId: ctx.sessionId(),
+		state: 'queued',
 		updatedAt: startedAt,
-		...(intent.depth !== undefined ? {depth: intent.depth} : {}),
 		...(isAgent
 			? {
 					// The durable resume handle. A one-shot agent has none, so nothing can
 					// invite a resume that the lifecycle forbids.
 					...(intent.oneShot === true ? {} : {agentId: id}),
-					agentType: intent.agentType ?? 'general-purpose',
 					sessionName: sessionNameOf(id),
 					transcriptPath: join(ctx.transcriptsDir, `${id}.jsonl`),
-					...(intent.resumeSession !== undefined ? {resumedFrom: intent.resumedFrom} : {}),
 				}
 			: {}),
-		...(intent.fork === true
-			? {fork: true, promptCache: 'shared', ...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {})}
-			: isAgent
-				? {promptCache: 'own'}
-				: {}),
-		...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
-		...(intent.model !== undefined ? {model: intent.model} : {}),
-		...(intent.tools !== undefined ? {tools: intent.tools} : {}),
-		// The deny list the run resolved, so a resume restores the same one. The
-		// definition's list is not the same thing: a spawn may override it.
-		...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
-		// Whether a restriction was applied. A plain agent has a resolved tool list
-		// too, so the list alone cannot say "restricted" on a follow-up.
-		...(intent.restrictedTools === true ? {restrictedTools: true} : {}),
-		...(intent.mcpServers !== undefined ? {mcpServers: intent.mcpServers} : {}),
-		...(intent.autoCompactWindow !== undefined ? {autoCompactWindow: intent.autoCompactWindow} : {}),
-		...(intent.cacheTtl !== undefined ? {cacheTtl: intent.cacheTtl} : {}),
-		...(intent.color !== undefined ? {color: intent.color} : {}),
-		...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
-		...(intent.effort !== undefined ? {effort: intent.effort} : {}),
-		...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
-		...(intent.isolation !== undefined ? {isolation: intent.isolation} : {}),
-		...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
-		...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
+		...(intent.fork === true ? {promptCache: 'shared'} : isAgent ? {promptCache: 'own'} : {}),
 	};
 }

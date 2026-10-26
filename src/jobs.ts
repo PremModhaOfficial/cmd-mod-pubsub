@@ -9,64 +9,36 @@
 // ---------------------------------------------------------------------------
 
 import type {CompactBoundary, JobIdentity, PermissionRequest, SpoolFs} from './types.ts';
+import type {JobPlan, TransientPlanField} from './plan.ts';
 import {join} from 'node:path';
 
-// The durable record behind a job: the shared identity plus its bookkeeping.
-export interface JobRecord extends JobIdentity {
-	command?: string;
-	prompt?: string;
-	cwd?: string;
+/**
+ * The launch fields a record carries: the one launch shape minus the fields that
+ * exist only for the running worker. Derived, so a launch field cannot be
+ * re-stated here and drift from the plan that produces it.
+ */
+export type JobRecordLaunch = {-readonly [K in Exclude<keyof JobPlan, TransientPlanField>]?: JobPlan[K]};
+
+// The durable record behind a job: the shared identity, the launch it came from,
+// and its bookkeeping.
+export interface JobRecord extends Omit<JobIdentity, 'description' | 'kind'>, JobRecordLaunch {
 	/** The persisted conversation for this agent; retention sweeps it with the record. */
 	transcriptPath?: string;
 	/** The maxTurns or max_tokens stop that produced a partial result. */
 	partial?: boolean;
 	/** The last compaction observed for this agent's own context window. */
 	compactBoundary?: CompactBoundary;
-	/** This job's nesting level. */
-	depth?: number;
-	agentType?: string;
-	/** The addressable name from the spawn; absent for an anonymous agent. */
-	name?: string;
-	/** A fork: the main conversation's history, prompt, tools, model, cache. */
-	fork?: boolean;
-	/** The main conversation a fork copied. */
-	mainSessionId?: string;
+	/** The host's name for this agent's session; a resume targets acpSessionId. */
+	sessionName?: string;
 	/** The host's id for the fork session; follow-ups resume it. */
 	forkSessionId?: string;
+	/** The ACP session the worker created; a resume targets this id. */
+	acpSessionId?: string;
 	/** `shared` for a fork, `own` for every other agent. */
 	promptCache?: string;
-	/** The team this teammate belongs to. */
-	teamName?: string;
 	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
 	 *  own end-of-turn signal is suppressed. */
 	handbackAt?: number;
-	/** The resolved execution policy: false is a foreground run. */
-	background?: boolean;
-	model?: string;
-	tools?: string[];
-	/** The deny list this run resolved, not the definition's. A spawn may override
-	 *  the definition's `disallowedTools`, and a resume must restore what the run
-	 *  actually had, or the follow-up loses a tool the first run was allowed. */
-	disallowedTools?: string[];
-	/** A tool restriction was applied to this run, so the worker hook must enforce
-	 *  it. A plain agent has a resolved tool list too, so the list alone does not
-	 *  say "restricted"; a follow-up needs this flag to know. */
-	restrictedTools?: boolean;
-	/** The MCP servers scoped to this agent; a resume keeps the same scope. The shape
-	 *  is the one the definition layer parses, restated so the record names no registry. */
-	mcpServers?: {name: string; command?: string; args?: string[]; env?: Record<string, string>; url?: string}[];
-	autoCompactWindow?: number;
-	cacheTtl?: '5m' | '1h';
-	color?: string;
-	maxTurns?: number;
-	timeoutMs?: number;
-	sessionName?: string;
-	resumedFrom?: string;
-	/** The ACP session the worker created; a resume targets this id. */
-	acpSessionId?: string;
-	effort?: string;
-	permissionMode?: string;
-	isolation?: string;
 	/** The worktree this job ran in, when isolation created one. */
 	worktree?: string;
 	/** The repository root, used to remove the worktree. */
@@ -80,8 +52,6 @@ export interface JobRecord extends JobIdentity {
 	worktreeKept?: boolean;
 	/** The worktree's starting commit; a new HEAD means committed work. */
 	worktreeHead?: string;
-	/** A live agent may still accept a follow-up; its checkout must survive. */
-	live?: boolean;
 	exitCode?: number;
 	pid?: number;
 	workerPid?: number;

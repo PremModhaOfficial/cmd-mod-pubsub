@@ -2587,52 +2587,58 @@ function sessionNameOf(id) {
 __name(sessionNameOf, "sessionNameOf");
 function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
   const isAgent = intent.prompt !== void 0;
-  return {
-    id,
-    owner,
+  const launch = {
     description: intent.description,
     kind: intent.kind,
-    ...intent.name !== void 0 ? { name: intent.name } : {},
-    state: "queued",
+    command: intent.prompt !== void 0 ? void 0 : intent.command,
+    prompt: intent.prompt,
+    cwd: intent.cwd,
+    agentType: isAgent ? intent.agentType ?? "general-purpose" : void 0,
+    fork: intent.fork === true ? true : void 0,
+    mainSessionId: intent.fork === true ? intent.mainSessionId : void 0,
+    teamName: intent.teamName,
+    // Whether a restriction was applied. A plain agent has a resolved tool list
+    // too, so the list alone cannot say "restricted" on a follow-up.
+    restrictedTools: intent.restrictedTools === true ? true : void 0,
+    depth: intent.depth,
+    model: intent.model,
+    maxTurns: intent.maxTurns,
+    effort: intent.effort,
+    tools: intent.tools,
+    // The deny list the run resolved, so a resume restores the same one. The
+    // definition's list is not the same thing: a spawn may override it.
+    disallowedTools: intent.disallowedTools,
+    mcpServers: intent.mcpServers,
+    autoCompactWindow: intent.autoCompactWindow,
+    cacheTtl: intent.cacheTtl,
+    color: intent.color,
+    permissionMode: intent.permissionMode,
+    isolation: intent.isolation,
     // The resolved policy, not the raw `run_in_background`: env and definition
     // overrides are already applied by the caller.
     background: intent.background !== false,
-    ...isAgent && intent.live !== false && intent.oneShot !== true ? { live: true } : {},
-    cwd: intent.cwd,
+    timeoutMs: intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? intent.timeoutMs : void 0,
+    resumedFrom: intent.resumeSession !== void 0 ? intent.resumedFrom : void 0,
+    name: intent.name,
+    owner,
+    live: isAgent && intent.live !== false && intent.oneShot !== true ? true : void 0
+  };
+  return {
+    ...launch,
+    id,
     logPath,
     startedAt,
     sessionId: ctx.sessionId(),
+    state: "queued",
     updatedAt: startedAt,
-    ...intent.depth !== void 0 ? { depth: intent.depth } : {},
     ...isAgent ? {
       // The durable resume handle. A one-shot agent has none, so nothing can
       // invite a resume that the lifecycle forbids.
       ...intent.oneShot === true ? {} : { agentId: id },
-      agentType: intent.agentType ?? "general-purpose",
       sessionName: sessionNameOf(id),
-      transcriptPath: join8(ctx.transcriptsDir, `${id}.jsonl`),
-      ...intent.resumeSession !== void 0 ? { resumedFrom: intent.resumedFrom } : {}
+      transcriptPath: join8(ctx.transcriptsDir, `${id}.jsonl`)
     } : {},
-    ...intent.fork === true ? { fork: true, promptCache: "shared", ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {} } : isAgent ? { promptCache: "own" } : {},
-    ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
-    ...intent.model !== void 0 ? { model: intent.model } : {},
-    ...intent.tools !== void 0 ? { tools: intent.tools } : {},
-    // The deny list the run resolved, so a resume restores the same one. The
-    // definition's list is not the same thing: a spawn may override it.
-    ...intent.disallowedTools !== void 0 ? { disallowedTools: intent.disallowedTools } : {},
-    // Whether a restriction was applied. A plain agent has a resolved tool list
-    // too, so the list alone cannot say "restricted" on a follow-up.
-    ...intent.restrictedTools === true ? { restrictedTools: true } : {},
-    ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
-    ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
-    ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
-    ...intent.color !== void 0 ? { color: intent.color } : {},
-    ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
-    ...intent.effort !== void 0 ? { effort: intent.effort } : {},
-    ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
-    ...intent.isolation !== void 0 ? { isolation: intent.isolation } : {},
-    ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
-    ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command }
+    ...intent.fork === true ? { promptCache: "shared" } : isAgent ? { promptCache: "own" } : {}
   };
 }
 __name(recordFromPlan, "recordFromPlan");
@@ -2878,11 +2884,19 @@ async function fire(intent, ctx) {
     } catch {
     }
   }
+  const {
+    isolation: _isolation,
+    oneShot: _oneShot,
+    parentJobId: _parentJobId,
+    color: _color,
+    resumedFrom: _resumedFrom,
+    live: _live,
+    ...launch
+  } = intent;
   const spec = buildSpec(
     {
+      ...launch,
       id,
-      description: intent.description,
-      kind: intent.kind,
       owner,
       cwd: isolation?.ok === true ? isolation.path : intent.cwd,
       logPath,
@@ -2894,42 +2908,18 @@ async function fire(intent, ctx) {
       permissionTimeoutMs: intent.background === false ? FOREGROUND_PERMISSION_TIMEOUT_MS : PERMISSION_TIMEOUT_MS,
       bin: isAgent ? ctx.env.COMMANDCODE_BIN ?? "cmd" : "/bin/sh",
       sessionId: ctx.sessionId(),
-      ...intent.name !== void 0 ? { name: intent.name } : {},
+      depth,
       background: intent.background !== false,
+      restrictedTools: intent.restrictedTools === true ? true : void 0,
+      timeoutMs: intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? intent.timeoutMs : void 0,
       // A foreground caller answers permission prompts inline; a background run
       // settles with the request instead of holding a worker that nobody watches.
       ...intent.background === false ? { interactive: true, controlDir: join10(ctx.jobsDir, "..", "control", id) } : {},
-      depth,
-      ...intent.agentType !== void 0 ? { agentType: intent.agentType } : {},
       ...record.agentId !== void 0 ? { agentId: record.agentId } : {},
       ...record.transcriptPath !== void 0 ? { transcriptPath: record.transcriptPath } : {},
-      ...intent.fork === true ? {
-        fork: true,
-        promptCache: "shared",
-        sessionName: ctx.sessionNameOf(id),
-        ...intent.mainSessionId !== void 0 ? { mainSessionId: intent.mainSessionId } : {}
-      } : isAgent ? { promptCache: "own" } : {},
-      ...intent.teamName !== void 0 ? { teamName: intent.teamName } : {},
-      ...intent.systemPrompt !== void 0 ? { systemPrompt: intent.systemPrompt } : {},
-      ...intent.appendSystemPrompt !== void 0 ? { appendSystemPrompt: intent.appendSystemPrompt } : {},
-      ...intent.restrictedTools === true ? { restrictedTools: true } : {},
-      ...intent.hooks !== void 0 ? { hooks: intent.hooks } : {},
-      ...intent.startup !== void 0 ? { startup: intent.startup } : {},
-      ...intent.model !== void 0 ? { model: intent.model } : {},
-      ...intent.tools !== void 0 ? { tools: intent.tools } : {},
-      ...intent.disallowedTools !== void 0 ? { disallowedTools: intent.disallowedTools } : {},
-      ...intent.mcpServers !== void 0 ? { mcpServers: intent.mcpServers } : {},
-      ...intent.autoCompactWindow !== void 0 ? { autoCompactWindow: intent.autoCompactWindow } : {},
-      ...intent.cacheTtl !== void 0 ? { cacheTtl: intent.cacheTtl } : {},
-      ...intent.maxTurns !== void 0 ? { maxTurns: intent.maxTurns } : {},
-      ...intent.effort !== void 0 ? { effort: intent.effort } : {},
-      ...intent.permissionMode !== void 0 ? { permissionMode: intent.permissionMode } : {},
-      ...intent.timeoutMs !== void 0 && intent.timeoutMs > 0 ? { timeoutMs: intent.timeoutMs } : {},
-      ...intent.resumeSession !== void 0 ? { resumeSession: intent.resumeSession } : {},
-      ...intent.prompt !== void 0 ? { prompt: intent.prompt } : { command: intent.command },
+      ...intent.fork === true ? { promptCache: "shared", sessionName: ctx.sessionNameOf(id) } : isAgent ? { promptCache: "own" } : {},
       ...roster.roster !== void 0 ? { roster: roster.roster } : {},
       ...roster.rosterNames.length > 0 ? { rosterNames: roster.rosterNames } : {},
-      ...intent.background !== void 0 ? { background: intent.background } : {},
       ...live ? { live: true, controlDir: join10(ctx.controlRoot, id), ...Number.isFinite(idleMs) && idleMs > 0 ? { idleMs } : {} } : {},
       ...isAgent ? { promptMarkerPath: join10(ctx.logsDir, `${id}.mod`) } : {},
       ...isolation?.ok === true ? { worktree: isolation.path, mainCheckouts: isolation.mainCheckouts } : {}

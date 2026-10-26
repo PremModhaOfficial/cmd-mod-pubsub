@@ -45,12 +45,13 @@ export type {PermissionContext} from './permission.ts';
 
 export type LimitEnv = Record<string, string | undefined>;
 
-export interface WorkerSpecInput {
+/**
+ * The worker's spec: the one launch shape plus the transport envelope. The launch
+ * fields are inherited from JobPlan, never re-stated, so plan and spec cannot
+ * drift; only the envelope the child needs to start is declared here.
+ */
+export interface WorkerSpecInput extends JobPlan {
 	id: string;
-	description: string;
-	kind: 'command' | 'agent' | 'fork';
-	owner?: string;
-	cwd: string;
 	logPath: string;
 	inboxDir: string;
 	jobsDir: string;
@@ -58,52 +59,17 @@ export interface WorkerSpecInput {
 	tailMax: number;
 	bin: string;
 	sessionId?: string;
-	/** This job's nesting level: the caller's depth plus one. */
-	depth?: number;
-	agentType?: string;
 	/** The durable resume handle; absent for a one-shot agent. */
 	agentId?: string;
 	/** Where the worker appends the persisted conversation. */
 	transcriptPath?: string;
-	/** A fork: inherit the main conversation's prompt, tools, model, and cache. */
-	fork?: boolean;
-	/** The main conversation the fork copies; absent for a non-fork. */
-	mainSessionId?: string;
 	/** The session name the host assigns to the new fork. */
 	sessionName?: string;
 	/** `shared` for a fork, `own` for a non-fork. */
 	promptCache?: 'shared' | 'own';
-	/** The team a teammate belongs to. */
-	teamName?: string;
-	systemPrompt?: string;
-	/** The resolved append text, carried so a nested worker keeps it. */
-	appendSystemPrompt?: string;
-	/** This agent's tools are restricted; the worker hook must enforce them. */
-	restrictedTools?: boolean;
-	/** PreToolUse/PostToolUse/Stop rules, active only while this agent runs. */
-	hooks?: JobPlan['hooks'];
-	model?: string;
-	effort?: string;
-	/** The resolved tool capabilities; the worker logs them and never widens them. */
-	tools?: string[];
-	disallowedTools?: string[];
 	/** The parent's control-poll and permission-wait cadence. */
 	controlPollMs?: number;
 	permissionTimeoutMs?: number;
-	/** The MCP servers scoped to this agent; `session/new` receives exactly these. */
-	mcpServers?: JobPlan['mcpServers'];
-	/** The resolved auto-compact window, never larger than inherited. */
-	autoCompactWindow?: number;
-	/** `experimental.cacheTtl`: `5m` or `1h`. ACP has no option; the adapter logs it. */
-	cacheTtl?: JobPlan['cacheTtl'];
-	permissionMode?: string;
-	maxTurns?: number;
-	timeoutMs?: number;
-	resumeSession?: string;
-	prompt?: string;
-	command?: string;
-	/** The resolved execution policy; the worker and ListAgents gating read it. */
-	background?: boolean;
 	/** Foreground runs answer permission prompts inline; background runs settle. */
 	interactive?: boolean;
 	controlDir?: string;
@@ -113,18 +79,12 @@ export interface WorkerSpecInput {
 	worktree?: string;
 	/** Checkout roots this job must never enter. */
 	mainCheckouts?: string[];
-	/** Addressable name (`subagent_spawn.name`); absent for an anonymous agent. */
-	name?: string;
 	/** Rendered sibling snapshot (main + other named agents), taken at spawn. */
 	roster?: string;
 	/** Roster names, for ListAgents and for validating a worker's `to`. */
 	rosterNames?: string[];
-	/** Accept live messages after the first turn instead of exiting. */
-	live?: boolean;
 	/** How long an idle live agent waits for a message before it exits. */
 	idleMs?: number;
-	/** The rendered startup bundle: CLAUDE.md, git status, skills, memory, roster. */
-	startup?: string;
 }
 
 export interface WorkerSpec extends WorkerSpecInput {
@@ -434,11 +394,25 @@ export async function fire(intent: JobPlan, ctx: SpawnContext): Promise<Launch> 
 			/* the first send retries the mkdir */
 		}
 	}
+	// The spec is the launch plus the transport envelope. Every launch field is
+	// carried by the spread, so a new one cannot be dropped on the way to the
+	// child. The six below are parent-only: the worktree is already created, the
+	// id and depth are already settled, and the remaining three never cross the
+	// process boundary. `live` and `restrictedTools` are re-derived below, so the
+	// raw plan values must not leak through.
+	const {
+		isolation: _isolation,
+		oneShot: _oneShot,
+		parentJobId: _parentJobId,
+		color: _color,
+		resumedFrom: _resumedFrom,
+		live: _live,
+		...launch
+	} = intent;
 	const spec = buildSpec(
 		{
+			...launch,
 			id,
-			description: intent.description,
-			kind: intent.kind,
 			owner,
 			cwd: isolation?.ok === true ? isolation.path : intent.cwd,
 			logPath,
@@ -450,48 +424,24 @@ export async function fire(intent: JobPlan, ctx: SpawnContext): Promise<Launch> 
 			permissionTimeoutMs: intent.background === false ? FOREGROUND_PERMISSION_TIMEOUT_MS : PERMISSION_TIMEOUT_MS,
 			bin: isAgent ? (ctx.env.COMMANDCODE_BIN ?? 'cmd') : '/bin/sh',
 			sessionId: ctx.sessionId(),
-			...(intent.name !== undefined ? {name: intent.name} : {}),
+			depth,
 			background: intent.background !== false,
+			restrictedTools: intent.restrictedTools === true ? true : undefined,
+			timeoutMs: intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? intent.timeoutMs : undefined,
 			// A foreground caller answers permission prompts inline; a background run
 			// settles with the request instead of holding a worker that nobody watches.
 			...(intent.background === false
 				? {interactive: true, controlDir: join(ctx.jobsDir, '..', 'control', id)}
 				: {}),
-			depth,
-			...(intent.agentType !== undefined ? {agentType: intent.agentType} : {}),
 			...(record.agentId !== undefined ? {agentId: record.agentId} : {}),
 			...(record.transcriptPath !== undefined ? {transcriptPath: record.transcriptPath} : {}),
 			...(intent.fork === true
-				? {
-						fork: true,
-						promptCache: 'shared',
-						sessionName: ctx.sessionNameOf(id),
-						...(intent.mainSessionId !== undefined ? {mainSessionId: intent.mainSessionId} : {}),
-					}
+				? {promptCache: 'shared', sessionName: ctx.sessionNameOf(id)}
 				: isAgent
 					? {promptCache: 'own'}
 					: {}),
-			...(intent.teamName !== undefined ? {teamName: intent.teamName} : {}),
-			...(intent.systemPrompt !== undefined ? {systemPrompt: intent.systemPrompt} : {}),
-			...(intent.appendSystemPrompt !== undefined ? {appendSystemPrompt: intent.appendSystemPrompt} : {}),
-			...(intent.restrictedTools === true ? {restrictedTools: true} : {}),
-			...(intent.hooks !== undefined ? {hooks: intent.hooks} : {}),
-			...(intent.startup !== undefined ? {startup: intent.startup} : {}),
-			...(intent.model !== undefined ? {model: intent.model} : {}),
-			...(intent.tools !== undefined ? {tools: intent.tools} : {}),
-			...(intent.disallowedTools !== undefined ? {disallowedTools: intent.disallowedTools} : {}),
-			...(intent.mcpServers !== undefined ? {mcpServers: intent.mcpServers} : {}),
-			...(intent.autoCompactWindow !== undefined ? {autoCompactWindow: intent.autoCompactWindow} : {}),
-			...(intent.cacheTtl !== undefined ? {cacheTtl: intent.cacheTtl} : {}),
-			...(intent.maxTurns !== undefined ? {maxTurns: intent.maxTurns} : {}),
-			...(intent.effort !== undefined ? {effort: intent.effort} : {}),
-			...(intent.permissionMode !== undefined ? {permissionMode: intent.permissionMode} : {}),
-			...(intent.timeoutMs !== undefined && intent.timeoutMs > 0 ? {timeoutMs: intent.timeoutMs} : {}),
-			...(intent.resumeSession !== undefined ? {resumeSession: intent.resumeSession} : {}),
-			...(intent.prompt !== undefined ? {prompt: intent.prompt} : {command: intent.command}),
 			...(roster.roster !== undefined ? {roster: roster.roster} : {}),
 			...(roster.rosterNames.length > 0 ? {rosterNames: roster.rosterNames} : {}),
-			...(intent.background !== undefined ? {background: intent.background} : {}),
 			...(live ? {live: true, controlDir: join(ctx.controlRoot, id), ...(Number.isFinite(idleMs) && idleMs > 0 ? {idleMs} : {})} : {}),
 			...(isAgent ? {promptMarkerPath: join(ctx.logsDir, `${id}.mod`)} : {}),
 			...(isolation?.ok === true ? {worktree: isolation.path, mainCheckouts: isolation.mainCheckouts} : {}),
