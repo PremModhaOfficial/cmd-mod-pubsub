@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute3, join as join13, resolve as resolve2 } from "node:path";
+import { dirname as dirname5, isAbsolute as isAbsolute4, join as join14, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -3853,6 +3853,267 @@ function foregroundOutcome(job, log) {
 }
 __name(foregroundOutcome, "foregroundOutcome");
 
+// src/startup.ts
+import { dirname as dirname4, isAbsolute as isAbsolute3, join as join13 } from "node:path";
+var MEMORY_INDEX_FILE = "MEMORY.md";
+var MEMORY_INDEX_LINES_MAX = 200;
+var MEMORY_INDEX_BYTES_MAX = 25 * 1024;
+var GIT_STATUS_MAX_CHARS = 2e3;
+var STARTUP_WALK_DEPTH_MAX = 8;
+var CONTEXT_WINDOW_DEFAULT = 2e5;
+var CONTEXT_WINDOW_MAX = 10 * 1e3 * 1e3;
+var CONTEXT_WINDOW_FAMILIES = [
+  [/\[1m\]|-1m\b/i, 1e6],
+  [/opus|sonnet|haiku|fable/i, 2e5]
+];
+var EXPLORE_PLAN_NAMES = { explore: true, plan: true };
+function readStartupFile(fs, path) {
+  try {
+    return fs.readFile(path);
+  } catch {
+    return void 0;
+  }
+}
+__name(readStartupFile, "readStartupFile");
+function startupFile(fs, path) {
+  const content = readStartupFile(fs, path);
+  return content === void 0 ? void 0 : { path, content };
+}
+__name(startupFile, "startupFile");
+function projectDirsUpward(cwd, fs) {
+  const dirs = [];
+  let current = cwd;
+  for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+    dirs.push(current);
+    if (fs !== void 0 && hasGitMarker(fs, current)) break;
+    const parent = dirname4(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return dirs.reverse();
+}
+__name(projectDirsUpward, "projectDirsUpward");
+function subdirectoryClaudeMd(fs, cwd, paths) {
+  const seen = /* @__PURE__ */ new Set();
+  const files = [];
+  for (const path of paths) {
+    const absolute = isAbsolute3(path) ? path : join13(cwd, path);
+    let dir = dirname4(absolute);
+    for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
+      if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
+      const filePath = join13(dir, "CLAUDE.md");
+      if (seen.has(filePath)) break;
+      seen.add(filePath);
+      const file = startupFile(fs, filePath);
+      if (file !== void 0) files.push(file);
+      dir = dirname4(dir);
+    }
+  }
+  return files;
+}
+__name(subdirectoryClaudeMd, "subdirectoryClaudeMd");
+function claudeMdHierarchy(options) {
+  const env = options.env ?? {};
+  const fs = options.fs;
+  const definition = options.definition;
+  const agentType = (options.agentType ?? definition?.name ?? "").toLowerCase();
+  const claudeMd = [];
+  const agentsMd = [];
+  const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
+  const policy = policyFiles(env, options.home);
+  if (!skipHierarchy && definition?.scope !== "managed") {
+    const managed = startupFile(fs, policy.managed);
+    if (managed !== void 0) claudeMd.push(managed);
+  }
+  if (!skipHierarchy && definition?.omitClaudeMd !== true) {
+    const user = startupFile(fs, policy.user);
+    if (user !== void 0) claudeMd.push(user);
+    for (const dir of projectDirsUpward(options.cwd, options.fs)) {
+      const project = startupFile(fs, join13(dir, "CLAUDE.md"));
+      if (project !== void 0) claudeMd.push(project);
+      const local = startupFile(fs, join13(dir, "CLAUDE.local.md"));
+      if (local !== void 0) claudeMd.push(local);
+    }
+    for (const dir of projectDirsUpward(options.cwd, options.fs)) {
+      const agents = startupFile(fs, join13(dir, "AGENTS.md"));
+      if (agents !== void 0) agentsMd.push(agents);
+    }
+  }
+  claudeMd.push(...subdirectoryClaudeMd(fs, options.cwd, options.paths ?? []));
+  return { claudeMd, agentsMd };
+}
+__name(claudeMdHierarchy, "claudeMdHierarchy");
+function skillFileFor(name, options) {
+  if (name.length === 0) return void 0;
+  const candidates = [];
+  for (const dir of projectDirsUpward(options.cwd, options.fs)) {
+    candidates.push(join13(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join13(dir, ".claude", "skills", name, "SKILL.md"));
+  }
+  candidates.push(join13(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join13(options.home, ".claude", "skills", name, "SKILL.md"));
+  for (const candidate of candidates) {
+    if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
+  }
+  return void 0;
+}
+__name(skillFileFor, "skillFileFor");
+function memoryDirFor(scope, name, options) {
+  const root = scope === "user" ? join13(options.home, ".commandcode", "agent-memory") : scope === "project" ? join13(options.cwd, ".commandcode", "agent-memory") : join13(options.cwd, ".commandcode", "agent-memory-local");
+  return join13(root, name);
+}
+__name(memoryDirFor, "memoryDirFor");
+function readMemoryIndex(path, fs) {
+  let source;
+  try {
+    source = fs.readFile(path);
+  } catch {
+    return { content: "", lines: 0, truncated: false };
+  }
+  const allLines = source.split("\n");
+  if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
+  const lineBound = allLines.slice(0, MEMORY_INDEX_LINES_MAX).join("\n");
+  let content = lineBound;
+  let truncatedByBytes = false;
+  if (Buffer.byteLength(lineBound, "utf8") > MEMORY_INDEX_BYTES_MAX) {
+    const buffer = Buffer.from(lineBound, "utf8").subarray(0, MEMORY_INDEX_BYTES_MAX);
+    content = buffer.toString("utf8").replace(/\uFFFD$/, "");
+    truncatedByBytes = true;
+  }
+  const truncatedByLines = allLines.length > MEMORY_INDEX_LINES_MAX;
+  return {
+    content,
+    lines: content.length === 0 ? 0 : content.split("\n").length,
+    truncated: truncatedByLines || truncatedByBytes
+  };
+}
+__name(readMemoryIndex, "readMemoryIndex");
+function startupMemory(options) {
+  const scope = options.definition?.memory;
+  const name = options.definition?.name;
+  if (scope === void 0 || name === void 0 || name.length === 0) return void 0;
+  const dir = memoryDirFor(scope, name, { cwd: options.cwd, home: options.home });
+  try {
+    options.fs.mkdir(dir);
+  } catch {
+  }
+  const path = join13(dir, MEMORY_INDEX_FILE);
+  const index = readMemoryIndex(path, options.fs);
+  return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
+}
+__name(startupMemory, "startupMemory");
+function contextWindowForModel(model, env = {}) {
+  const override = contextWindowOverride(env);
+  if (override !== void 0 && override >= 1e3) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
+  const value = (model ?? "").toLowerCase();
+  for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
+    if (pattern.test(value)) return window;
+  }
+  return CONTEXT_WINDOW_DEFAULT;
+}
+__name(contextWindowForModel, "contextWindowForModel");
+function withMemoryTools(tools, memory) {
+  if (memory === void 0) return tools === void 0 ? void 0 : [...tools];
+  const result = tools === void 0 ? [] : [...tools];
+  for (const tool of ["Read", "Write", "Edit"]) if (!result.includes(tool)) result.push(tool);
+  return result;
+}
+__name(withMemoryTools, "withMemoryTools");
+function gitStatusSnapshot(runtime, cwd) {
+  const run = runtime.run;
+  if (typeof run !== "function") return void 0;
+  try {
+    const result = run("git", ["status", "--short", "--branch"], { cwd });
+    return result.ok ? result.stdout : void 0;
+  } catch {
+    return void 0;
+  }
+}
+__name(gitStatusSnapshot, "gitStatusSnapshot");
+function trimGitStatus(status) {
+  if (status === void 0) return void 0;
+  const text = status.replace(/\s+$/, "");
+  if (text.length === 0) return void 0;
+  return text.length > GIT_STATUS_MAX_CHARS ? `${text.slice(0, GIT_STATUS_MAX_CHARS)}
+(truncated)` : text;
+}
+__name(trimGitStatus, "trimGitStatus");
+function renderStartup(bundle) {
+  const sections = [bundle.environmentText];
+  if (bundle.claudeMd.length > 0) {
+    const files = bundle.claudeMd.map((file) => `## ${file.path}
+${file.content}`);
+    sections.push(["# Project instructions (CLAUDE.md)", ...files].join("\n\n"));
+  }
+  if (bundle.agentsMd.length > 0) {
+    const files = bundle.agentsMd.map((file) => `## ${file.path}
+${file.content}`);
+    sections.push(["# AGENTS.md", ...files].join("\n\n"));
+  }
+  if (bundle.gitStatus !== void 0) sections.push(`# Git status
+${bundle.gitStatus}`);
+  if (bundle.skills.length > 0) {
+    const skills = bundle.skills.map((skill) => `## ${skill.name} (${skill.path})
+${skill.content}`);
+    sections.push(["# Skills (full content)", ...skills].join("\n\n"));
+  }
+  if (bundle.roster !== void 0 && bundle.roster.length > 0) {
+    sections.push(`# Sibling agents
+${bundle.roster.map((name) => `- ${name}`).join("\n")}`);
+  }
+  if (bundle.outputStyle !== void 0) sections.push(`# Output style
+${bundle.outputStyle}`);
+  if (bundle.memory !== void 0) {
+    const bound = bundle.memory.truncated ? " (truncated to the first 200 lines or 25KB)" : "";
+    sections.push(`# Agent memory
+${bundle.memory.path}${bound}
+${bundle.memory.content}`);
+  }
+  return sections.join("\n\n");
+}
+__name(renderStartup, "renderStartup");
+function buildStartupBundle(options) {
+  const env = options.env ?? {};
+  const definition = options.definition;
+  const agentType = (options.agentType ?? definition?.name ?? "").toLowerCase();
+  const contextWindow = contextWindowForModel(options.model, env);
+  const { claudeMd, agentsMd } = claudeMdHierarchy(options);
+  const gitStatus = EXPLORE_PLAN_NAMES[agentType] === true ? void 0 : trimGitStatus(options.gitStatus);
+  const skills = [];
+  for (const name of definition?.skills ?? []) {
+    const path = skillFileFor(name, options);
+    const content = path === void 0 ? void 0 : readStartupFile(options.fs, path);
+    if (path !== void 0 && content !== void 0) skills.push({ name, path, content });
+  }
+  const roster = options.roster === void 0 ? void 0 : [...options.roster];
+  const outputStyle = options.outputStyle ?? definition?.outputStyle;
+  const memory = startupMemory(options);
+  const environment = [
+    "# Environment",
+    `working directory: ${options.cwd}`,
+    `platform: ${options.platform ?? "unknown"}`
+  ];
+  if (options.now !== void 0) environment.push(`date: ${new Date(options.now).toISOString().slice(0, 10)}`);
+  if (options.model !== void 0) environment.push(`model: ${options.model}`);
+  environment.push(`context window: ${contextWindow} tokens`);
+  const base = {
+    systemPrompt: definition?.prompt ?? "",
+    environmentText: environment.join("\n"),
+    task: options.prompt ?? "",
+    claudeMd,
+    agentsMd,
+    ...gitStatus !== void 0 ? { gitStatus } : {},
+    skills,
+    ...roster !== void 0 ? { roster } : {},
+    ...outputStyle !== void 0 ? { outputStyle } : {},
+    ...memory !== void 0 ? { memory } : {},
+    contextWindow,
+    parentMemory: false
+  };
+  return { ...base, text: renderStartup(base) };
+}
+__name(buildStartupBundle, "buildStartupBundle");
+
 // src/index.ts
 var WORKER_SOURCE = `
 const {spawn} = require('node:child_process');
@@ -5145,264 +5406,6 @@ function runHookRules(run, rules, detail) {
   return outcome;
 }
 __name(runHookRules, "runHookRules");
-var MEMORY_INDEX_FILE = "MEMORY.md";
-var MEMORY_INDEX_LINES_MAX = 200;
-var MEMORY_INDEX_BYTES_MAX = 25 * 1024;
-var GIT_STATUS_MAX_CHARS = 2e3;
-var STARTUP_WALK_DEPTH_MAX = 8;
-var CONTEXT_WINDOW_DEFAULT = 2e5;
-var CONTEXT_WINDOW_MAX = 10 * 1e3 * 1e3;
-var CONTEXT_WINDOW_FAMILIES = [
-  [/\[1m\]|-1m\b/i, 1e6],
-  [/opus|sonnet|haiku|fable/i, 2e5]
-];
-var EXPLORE_PLAN_NAMES = { explore: true, plan: true };
-function readStartupFile(fs, path) {
-  try {
-    return fs.readFile(path);
-  } catch {
-    return void 0;
-  }
-}
-__name(readStartupFile, "readStartupFile");
-function startupFile(fs, path) {
-  const content = readStartupFile(fs, path);
-  return content === void 0 ? void 0 : { path, content };
-}
-__name(startupFile, "startupFile");
-function projectDirsUpward(cwd, fs) {
-  const dirs = [];
-  let current = cwd;
-  for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
-    dirs.push(current);
-    if (fs !== void 0 && hasGitMarker(fs, current)) break;
-    const parent = dirname4(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  return dirs.reverse();
-}
-__name(projectDirsUpward, "projectDirsUpward");
-function subdirectoryClaudeMd(fs, cwd, paths) {
-  const seen = /* @__PURE__ */ new Set();
-  const files = [];
-  for (const path of paths) {
-    const absolute = isAbsolute3(path) ? path : join13(cwd, path);
-    let dir = dirname4(absolute);
-    for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
-      if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join13(dir, "CLAUDE.md");
-      if (seen.has(filePath)) break;
-      seen.add(filePath);
-      const file = startupFile(fs, filePath);
-      if (file !== void 0) files.push(file);
-      dir = dirname4(dir);
-    }
-  }
-  return files;
-}
-__name(subdirectoryClaudeMd, "subdirectoryClaudeMd");
-function claudeMdHierarchy(options) {
-  const env = options.env ?? {};
-  const fs = options.fs;
-  const definition = options.definition;
-  const agentType = (options.agentType ?? definition?.name ?? "").toLowerCase();
-  const claudeMd = [];
-  const agentsMd = [];
-  const skipHierarchy = EXPLORE_PLAN_NAMES[agentType] === true;
-  const policy = policyFiles(env, options.home);
-  if (!skipHierarchy && definition?.scope !== "managed") {
-    const managed = startupFile(fs, policy.managed);
-    if (managed !== void 0) claudeMd.push(managed);
-  }
-  if (!skipHierarchy && definition?.omitClaudeMd !== true) {
-    const user = startupFile(fs, policy.user);
-    if (user !== void 0) claudeMd.push(user);
-    for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join13(dir, "CLAUDE.md"));
-      if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join13(dir, "CLAUDE.local.md"));
-      if (local !== void 0) claudeMd.push(local);
-    }
-    for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join13(dir, "AGENTS.md"));
-      if (agents !== void 0) agentsMd.push(agents);
-    }
-  }
-  claudeMd.push(...subdirectoryClaudeMd(fs, options.cwd, options.paths ?? []));
-  return { claudeMd, agentsMd };
-}
-__name(claudeMdHierarchy, "claudeMdHierarchy");
-function skillFileFor(name, options) {
-  if (name.length === 0) return void 0;
-  const candidates = [];
-  for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join13(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join13(dir, ".claude", "skills", name, "SKILL.md"));
-  }
-  candidates.push(join13(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join13(options.home, ".claude", "skills", name, "SKILL.md"));
-  for (const candidate of candidates) {
-    if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
-  }
-  return void 0;
-}
-__name(skillFileFor, "skillFileFor");
-function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join13(options.home, ".commandcode", "agent-memory") : scope === "project" ? join13(options.cwd, ".commandcode", "agent-memory") : join13(options.cwd, ".commandcode", "agent-memory-local");
-  return join13(root, name);
-}
-__name(memoryDirFor, "memoryDirFor");
-function readMemoryIndex(path, fs) {
-  let source;
-  try {
-    source = fs.readFile(path);
-  } catch {
-    return { content: "", lines: 0, truncated: false };
-  }
-  const allLines = source.split("\n");
-  if (allLines.length > 0 && allLines[allLines.length - 1] === "") allLines.pop();
-  const lineBound = allLines.slice(0, MEMORY_INDEX_LINES_MAX).join("\n");
-  let content = lineBound;
-  let truncatedByBytes = false;
-  if (Buffer.byteLength(lineBound, "utf8") > MEMORY_INDEX_BYTES_MAX) {
-    const buffer = Buffer.from(lineBound, "utf8").subarray(0, MEMORY_INDEX_BYTES_MAX);
-    content = buffer.toString("utf8").replace(/\uFFFD$/, "");
-    truncatedByBytes = true;
-  }
-  const truncatedByLines = allLines.length > MEMORY_INDEX_LINES_MAX;
-  return {
-    content,
-    lines: content.length === 0 ? 0 : content.split("\n").length,
-    truncated: truncatedByLines || truncatedByBytes
-  };
-}
-__name(readMemoryIndex, "readMemoryIndex");
-function startupMemory(options) {
-  const scope = options.definition?.memory;
-  const name = options.definition?.name;
-  if (scope === void 0 || name === void 0 || name.length === 0) return void 0;
-  const dir = memoryDirFor(scope, name, { cwd: options.cwd, home: options.home });
-  try {
-    options.fs.mkdir(dir);
-  } catch {
-  }
-  const path = join13(dir, MEMORY_INDEX_FILE);
-  const index = readMemoryIndex(path, options.fs);
-  return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
-}
-__name(startupMemory, "startupMemory");
-function contextWindowForModel(model, env = {}) {
-  const override = contextWindowOverride(env);
-  if (override !== void 0 && override >= 1e3) return Math.min(CONTEXT_WINDOW_MAX, Math.round(override));
-  const value = (model ?? "").toLowerCase();
-  for (const [pattern, window] of CONTEXT_WINDOW_FAMILIES) {
-    if (pattern.test(value)) return window;
-  }
-  return CONTEXT_WINDOW_DEFAULT;
-}
-__name(contextWindowForModel, "contextWindowForModel");
-function withMemoryTools(tools, memory) {
-  if (memory === void 0) return tools === void 0 ? void 0 : [...tools];
-  const result = tools === void 0 ? [] : [...tools];
-  for (const tool of ["Read", "Write", "Edit"]) if (!result.includes(tool)) result.push(tool);
-  return result;
-}
-__name(withMemoryTools, "withMemoryTools");
-function gitStatusSnapshot(runtime, cwd) {
-  const run = runtime.run;
-  if (typeof run !== "function") return void 0;
-  try {
-    const result = run("git", ["status", "--short", "--branch"], { cwd });
-    return result.ok ? result.stdout : void 0;
-  } catch {
-    return void 0;
-  }
-}
-__name(gitStatusSnapshot, "gitStatusSnapshot");
-function trimGitStatus(status) {
-  if (status === void 0) return void 0;
-  const text = status.replace(/\s+$/, "");
-  if (text.length === 0) return void 0;
-  return text.length > GIT_STATUS_MAX_CHARS ? `${text.slice(0, GIT_STATUS_MAX_CHARS)}
-(truncated)` : text;
-}
-__name(trimGitStatus, "trimGitStatus");
-function renderStartup(bundle) {
-  const sections = [bundle.environmentText];
-  if (bundle.claudeMd.length > 0) {
-    const files = bundle.claudeMd.map((file) => `## ${file.path}
-${file.content}`);
-    sections.push(["# Project instructions (CLAUDE.md)", ...files].join("\n\n"));
-  }
-  if (bundle.agentsMd.length > 0) {
-    const files = bundle.agentsMd.map((file) => `## ${file.path}
-${file.content}`);
-    sections.push(["# AGENTS.md", ...files].join("\n\n"));
-  }
-  if (bundle.gitStatus !== void 0) sections.push(`# Git status
-${bundle.gitStatus}`);
-  if (bundle.skills.length > 0) {
-    const skills = bundle.skills.map((skill) => `## ${skill.name} (${skill.path})
-${skill.content}`);
-    sections.push(["# Skills (full content)", ...skills].join("\n\n"));
-  }
-  if (bundle.roster !== void 0 && bundle.roster.length > 0) {
-    sections.push(`# Sibling agents
-${bundle.roster.map((name) => `- ${name}`).join("\n")}`);
-  }
-  if (bundle.outputStyle !== void 0) sections.push(`# Output style
-${bundle.outputStyle}`);
-  if (bundle.memory !== void 0) {
-    const bound = bundle.memory.truncated ? " (truncated to the first 200 lines or 25KB)" : "";
-    sections.push(`# Agent memory
-${bundle.memory.path}${bound}
-${bundle.memory.content}`);
-  }
-  return sections.join("\n\n");
-}
-__name(renderStartup, "renderStartup");
-function buildStartupBundle(options) {
-  const env = options.env ?? {};
-  const definition = options.definition;
-  const agentType = (options.agentType ?? definition?.name ?? "").toLowerCase();
-  const contextWindow = contextWindowForModel(options.model, env);
-  const { claudeMd, agentsMd } = claudeMdHierarchy(options);
-  const gitStatus = EXPLORE_PLAN_NAMES[agentType] === true ? void 0 : trimGitStatus(options.gitStatus);
-  const skills = [];
-  for (const name of definition?.skills ?? []) {
-    const path = skillFileFor(name, options);
-    const content = path === void 0 ? void 0 : readStartupFile(options.fs, path);
-    if (path !== void 0 && content !== void 0) skills.push({ name, path, content });
-  }
-  const roster = options.roster === void 0 ? void 0 : [...options.roster];
-  const outputStyle = options.outputStyle ?? definition?.outputStyle;
-  const memory = startupMemory(options);
-  const environment = [
-    "# Environment",
-    `working directory: ${options.cwd}`,
-    `platform: ${options.platform ?? "unknown"}`
-  ];
-  if (options.now !== void 0) environment.push(`date: ${new Date(options.now).toISOString().slice(0, 10)}`);
-  if (options.model !== void 0) environment.push(`model: ${options.model}`);
-  environment.push(`context window: ${contextWindow} tokens`);
-  const base = {
-    systemPrompt: definition?.prompt ?? "",
-    environmentText: environment.join("\n"),
-    task: options.prompt ?? "",
-    claudeMd,
-    agentsMd,
-    ...gitStatus !== void 0 ? { gitStatus } : {},
-    skills,
-    ...roster !== void 0 ? { roster } : {},
-    ...outputStyle !== void 0 ? { outputStyle } : {},
-    ...memory !== void 0 ? { memory } : {},
-    contextWindow,
-    parentMemory: false
-  };
-  return { ...base, text: renderStartup(base) };
-}
-__name(buildStartupBundle, "buildStartupBundle");
 function buildRoster(entries, selfName) {
   const named = /* @__PURE__ */ new Map();
   for (const entry of entries) {
@@ -5557,7 +5560,7 @@ function index_default(cmd, overrides = {}) {
     if (!workerMode) return void 0;
     try {
       const spec = JSON.parse(String(runtime.env[WORKER_SPEC_ENV] ?? ""));
-      return typeof spec.inboxDir === "string" ? dirname4(spec.inboxDir) : void 0;
+      return typeof spec.inboxDir === "string" ? dirname5(spec.inboxDir) : void 0;
     } catch {
       return void 0;
     }
@@ -5569,15 +5572,15 @@ function index_default(cmd, overrides = {}) {
     flag: optionValue(cmd, FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join13(root, "inbox");
-  const claimedDir = join13(root, "claimed");
-  const orphanedDir = join13(root, "orphaned");
-  const logsDir = join13(root, "logs");
-  const jobsDir = join13(root, "jobs");
-  const transcriptsDir = join13(root, "transcripts");
-  const worktreesDir = join13(root, "worktrees");
-  const controlRoot = join13(root, "control");
-  const ledgerPath = join13(root, "delivered.jsonl");
+  const inboxDir = join14(root, "inbox");
+  const claimedDir = join14(root, "claimed");
+  const orphanedDir = join14(root, "orphaned");
+  const logsDir = join14(root, "logs");
+  const jobsDir = join14(root, "jobs");
+  const transcriptsDir = join14(root, "transcripts");
+  const worktreesDir = join14(root, "worktrees");
+  const controlRoot = join14(root, "control");
+  const ledgerPath = join14(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -5600,7 +5603,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: optionValue(cmd, CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join13(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join14(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -5704,17 +5707,17 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join13(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join14(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join13(current, ".git"));
+        spool.stat(join14(current, ".git"));
         break;
       } catch {
       }
-      const parent = dirname4(current);
+      const parent = dirname5(current);
       if (parent === current) break;
       current = parent;
     }
@@ -5902,10 +5905,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(namedJob, "namedJob");
   function appendLive(id, from, message) {
-    const dir = join13(controlRoot, id);
+    const dir = join14(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join13(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join14(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -5937,9 +5940,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join13(inboxDir, `.tmp-${stamp}`);
+      const tmp = join14(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join13(inboxDir, stamp));
+      spool.rename(tmp, join14(inboxDir, stamp));
     } catch {
     }
   }
@@ -6064,8 +6067,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join13(controlRoot, id));
-        spool.writeFile(join13(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join14(controlRoot, id));
+        spool.writeFile(join14(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -6601,7 +6604,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute3(wanted) ? wanted : join13(cmd.cwd, wanted);
+      const dir = isAbsolute4(wanted) ? wanted : join14(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
