@@ -22,9 +22,8 @@ export interface JobRecord extends JobIdentity {
 	partial?: boolean;
 	/** The last compaction observed for this agent's own context window. */
 	compactBoundary?: CompactBoundary;
-	/** This job's nesting level, and the job that spawned it. */
+	/** This job's nesting level. */
 	depth?: number;
-	parentJobId?: string;
 	agentType?: string;
 	/** The addressable name from the spawn; absent for an anonymous agent. */
 	name?: string;
@@ -38,8 +37,6 @@ export interface JobRecord extends JobIdentity {
 	promptCache?: string;
 	/** The team this teammate belongs to. */
 	teamName?: string;
-	/** Ctrl+B moved a foreground run to the background. */
-	backgroundedAt?: number;
 	/** Set by SubagentHandback: the report was already emitted, so the wrapper's
 	 *  own end-of-turn signal is suppressed. */
 	handbackAt?: number;

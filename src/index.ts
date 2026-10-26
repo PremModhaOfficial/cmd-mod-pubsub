@@ -2301,7 +2301,7 @@ export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 			return candidate.background === false && (state === 'queued' || state === 'running');
 		});
 		if (job === undefined) return undefined;
-		writeJob({...job, background: true, backgroundedAt: runtime.now(), updatedAt: runtime.now()});
+		writeJob({...job, background: true, updatedAt: runtime.now()});
 		backgroundedForegrounds.add(job.id);
 		refreshJobs();
 		return job;

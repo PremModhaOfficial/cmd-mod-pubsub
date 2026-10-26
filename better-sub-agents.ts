@@ -30,7 +30,6 @@ var WAIT_MAX_MS = 60 * 1e3;
 var WAIT_POLL_MS = 200;
 var OUTPUT_MAX_CHARS_DEFAULT = 4e3;
 var OUTPUT_MAX_CHARS_CAP = 100 * 1e3;
-var LIVE_IDLE_MS_DEFAULT = 30 * 1e3;
 var CONTROL_POLL_MS = 100;
 var PERMISSION_TIMEOUT_MS = 30 * 1e3;
 var FOREGROUND_PERMISSION_TIMEOUT_MS = 10 * 60 * 1e3;
@@ -2605,7 +2604,6 @@ function recordFromPlan(intent, id, logPath, startedAt, owner, ctx) {
     sessionId: ctx.sessionId(),
     updatedAt: startedAt,
     ...intent.depth !== void 0 ? { depth: intent.depth } : {},
-    ...intent.parentJobId !== void 0 ? { parentJobId: intent.parentJobId } : {},
     ...isAgent ? {
       // The durable resume handle. A one-shot agent has none, so nothing can
       // invite a resume that the lifecycle forbids.
@@ -6152,7 +6150,7 @@ function index_default(cmd, overrides = {}) {
       return candidate.background === false && (state === "queued" || state === "running");
     });
     if (job === void 0) return void 0;
-    writeJob({ ...job, background: true, backgroundedAt: runtime.now(), updatedAt: runtime.now() });
+    writeJob({ ...job, background: true, updatedAt: runtime.now() });
     backgroundedForegrounds.add(job.id);
     refreshJobs();
     return job;
