@@ -29,8 +29,9 @@
 		"build": "node scripts/build.mjs",
 		"check": "npm run build && node scripts/check-stale.mjs",
 		"check:imports": "node scripts/check-imports.mjs",
-		"gate": "npm run check && npm run typecheck && npm run check:imports && node test/bundle.mjs && npm test",
+		"gate": "npm run check && npm run typecheck && npm run check:imports && node test/bundle.mjs && npm run test:scripts && npm test",
 		"test": "node test/smoke.mjs",
+		"test:scripts": "node test/extract-region.mjs",
 		"test:e2e": "node test/e2e.mjs",
 		"typecheck": "tsc --noEmit"
 	},
