@@ -99,18 +99,14 @@ import {createLedger} from './ledger.ts';
 import {createDelivery} from './delivery.ts';
 import {patchOf, signalEnvelope, signalOf} from './signals.ts';
 import type {Ownership} from './signals.ts';
-import {EFFORT_LEVELS, filterTools, nonEmpty, withheldBy, workerToolAllowed} from './tool-filter.ts';
+import {withheldBy, workerToolAllowed} from './tool-filter.ts';
 import {
 	agentNameFromEnv,
-	effortLevel,
-	effortLevelFromEnv,
 	managedSettingsDir,
 	mainPermissionModeFromEnv,
 	optionList,
 	optionValue,
 	pickOption,
-	subagentModel,
-	subagentModelForced,
 	workerModeFromEnv,
 } from './config.ts';
 import {gitSeam, guardToolCall, isInside, isolationRoots} from './worktree.ts';
@@ -136,6 +132,10 @@ import {
 	gitStatusSnapshot,
 	withMemoryTools,
 } from './startup.ts';
+import {buildRoster, listAgentsVisible} from './roster.ts';
+import type {RosterEntry} from './roster.ts';
+import {resolveLaunch} from './resolve.ts';
+import type {LaunchResolutionInput} from './resolve.ts';
 
 export {buildArgs, buildSpec, resolveMaxConcurrent, resolveMaxDepth, workerEnv} from './spawn.ts';
 export type {ForegroundResult, LimitEnv, WorkerSpec, WorkerSpecInput} from './spawn.ts';
@@ -188,6 +188,19 @@ export type {
 } from './startup.ts';
 export {hookMatches, runHookRules} from './hooks.ts';
 export type {HookDetail, HookOutcome} from './hooks.ts';
+export {buildRoster, listAgentsVisible} from './roster.ts';
+export type {RosterEntry} from './roster.ts';
+export {resolveEffort, resolveLaunch, resolveModel} from './resolve.ts';
+export type {
+	EffortResolution,
+	EffortResolutionInput,
+	EffortSource,
+	LaunchResolution,
+	LaunchResolutionInput,
+	ModelResolution,
+	ModelResolutionInput,
+	ModelSource,
+} from './resolve.ts';
 
 export type {
 	ChildHandle,
@@ -1422,184 +1435,6 @@ process.on('uncaughtException', err => {
   process.exit(0);
 });
 `;
-
-
-
-// ---------------------------------------------------------------------------
-// Live messaging: the roster
-//
-// A named spawn is addressable. Every agent that has the send tool starts with a
-// snapshot of its siblings, so it can message them without a discovery call. The
-// snapshot lists main and the OTHER named agents only: an unnamed job has no
-// address, and an agent is never its own peer. The newest record for a name wins,
-// so a resumed agent replaces the job it continued.
-// ---------------------------------------------------------------------------
-
-export interface RosterEntry {
-	name?: string;
-	state?: string;
-	jobId?: string;
-}
-
-export function buildRoster(entries: readonly RosterEntry[], selfName?: string): string {
-	const named = new Map<string, RosterEntry>();
-	for (const entry of entries) {
-		const name = typeof entry.name === 'string' ? entry.name.trim() : '';
-		if (name.length === 0 || name === selfName) continue;
-		if (!named.has(name)) named.set(name, entry);
-	}
-	// `main` is always addressable, so the roster is never empty: a lone named
-	// agent still learns how to reach the conversation that started it.
-	const lines = [
-		'SIBLING ROSTER (snapshot taken at start; address a peer with subagent_send({to, message}))',
-		`${ROSTER_MAIN} — the conversation that started you`,
-	];
-	for (const [name, entry] of named) {
-		const state = typeof entry.state === 'string' && entry.state.length > 0 ? ` (${entry.state})` : '';
-		const job = typeof entry.jobId === 'string' && entry.jobId.length > 0 ? ` job ${entry.jobId}` : '';
-		lines.push(`${name}${state}${job}`);
-	}
-	return lines.join('\n');
-}
-
-// ListAgents is a foreground tool: a foreground agent inherits it when cross-session
-// messaging is on; a background agent does not keep it. One pure predicate, so the
-// tool registration and the tests cannot disagree about visibility.
-export function listAgentsVisible(options: {background?: boolean; crossSessionMessaging?: boolean}): boolean {
-	if (options.crossSessionMessaging === false) return false;
-	return options.background !== true;
-}
-
-export type ModelSource = 'parameter' | 'definition' | 'environment' | 'main' | 'inherit' | 'forced';
-
-export interface ModelResolutionInput {
-	/** The per-invocation `model` parameter. */
-	requested?: string;
-	/** The definition's `model` frontmatter. */
-	definition?: string;
-	env?: Record<string, string | undefined>;
-	/** The main conversation's model; absent means the child inherits its default. */
-	main?: string;
-}
-
-export interface ModelResolution {
-	model: string | undefined;
-	source: ModelSource;
-}
-
-// Parameter, frontmatter, environment, main. `inherit` (either place) selects the
-// main model outright, so it outranks the environment default. FORCE makes the
-// environment value win over the parameter and the frontmatter.
-export function resolveModel(input: ModelResolutionInput = {}): ModelResolution {
-	const env = input.env ?? {};
-	const envModel = subagentModel(env);
-	const forced = subagentModelForced(env);
-	const main = nonEmpty(input.main);
-	if (forced && envModel !== undefined) return {model: envModel, source: 'forced'};
-
-	const requested = nonEmpty(input.requested);
-	if (requested === 'inherit') return {model: main, source: 'inherit'};
-	if (requested !== undefined) return {model: requested, source: 'parameter'};
-
-	const definition = nonEmpty(input.definition);
-	if (definition === 'inherit') return {model: main, source: 'inherit'};
-	if (definition !== undefined) return {model: definition, source: 'definition'};
-
-	if (envModel !== undefined) return {model: envModel, source: 'environment'};
-	return {model: main, source: 'main'};
-}
-
-export type EffortSource = 'parameter' | 'definition' | 'environment' | 'none';
-
-export interface EffortResolutionInput {
-	/** The per-invocation `effort` parameter. */
-	requested?: string;
-	/** The definition's `effort` frontmatter. */
-	definition?: string;
-	env?: Record<string, string | undefined>;
-}
-
-export interface EffortResolution {
-	effort: string | undefined;
-	source: EffortSource;
-}
-
-// Per-invocation, frontmatter, environment. There is no effort inheritance from the
-// main conversation: the runtime default applies when nothing is set.
-export function resolveEffort(input: EffortResolutionInput = {}): EffortResolution {
-	const env = input.env ?? {};
-	const requested = effortLevel(input.requested, EFFORT_LEVELS);
-	if (requested !== undefined) return {effort: requested, source: 'parameter'};
-	const definition = effortLevel(input.definition, EFFORT_LEVELS);
-	if (definition !== undefined) return {effort: definition, source: 'definition'};
-	const fromEnv = effortLevelFromEnv(env, EFFORT_LEVELS);
-	if (fromEnv !== undefined) return {effort: fromEnv, source: 'environment'};
-	return {effort: undefined, source: 'none'};
-}
-
-export interface LaunchResolutionInput {
-	requestedModel?: string;
-	definitionModel?: string;
-	requestedEffort?: string;
-	definitionEffort?: string;
-	env?: Record<string, string | undefined>;
-	mainModel?: string;
-	tools?: string[];
-	disallowedTools?: string[];
-	permissionMode?: string;
-	background?: boolean;
-	availableTools?: string[];
-	mcpServers?: string[];
-	team?: boolean;
-}
-
-export type LaunchResolution =
-	| {
-			ok: true;
-			model: string | undefined;
-			modelSource: ModelSource;
-			effort: string | undefined;
-			effortSource: EffortSource;
-			tools: string[];
-			removed: string[];
-	  }
-	| {ok: false; error: string};
-
-// The one spawn-time resolution: tools, model, and effort from the same inputs, so
-// the spec and the record cannot disagree about what was resolved.
-export function resolveLaunch(input: LaunchResolutionInput = {}): LaunchResolution {
-	const tools = filterTools({
-		...(input.availableTools !== undefined ? {available: input.availableTools} : {}),
-		...(input.mcpServers !== undefined ? {mcpServers: input.mcpServers} : {}),
-		...(input.tools !== undefined ? {tools: input.tools} : {}),
-		...(input.disallowedTools !== undefined ? {disallowedTools: input.disallowedTools} : {}),
-		...(input.permissionMode !== undefined ? {permissionMode: input.permissionMode} : {}),
-		...(input.background !== undefined ? {background: input.background} : {}),
-		...(input.team !== undefined ? {team: input.team} : {}),
-	});
-	if (tools.ok === false) return tools;
-	const model = resolveModel({
-		...(input.requestedModel !== undefined ? {requested: input.requestedModel} : {}),
-		...(input.definitionModel !== undefined ? {definition: input.definitionModel} : {}),
-		...(input.env !== undefined ? {env: input.env} : {}),
-		...(input.mainModel !== undefined ? {main: input.mainModel} : {}),
-	});
-	const effort = resolveEffort({
-		...(input.requestedEffort !== undefined ? {requested: input.requestedEffort} : {}),
-		...(input.definitionEffort !== undefined ? {definition: input.definitionEffort} : {}),
-		...(input.env !== undefined ? {env: input.env} : {}),
-	});
-	return {
-		ok: true,
-		model: model.model,
-		modelSource: model.source,
-		effort: effort.effort,
-		effortSource: effort.source,
-		tools: tools.tools,
-		removed: tools.removed,
-	};
-}
-
 
 
 

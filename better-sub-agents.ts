@@ -4266,6 +4266,94 @@ function buildStartupBundle(options) {
 }
 __name(buildStartupBundle, "buildStartupBundle");
 
+// src/roster.ts
+function buildRoster(entries, selfName) {
+  const named = /* @__PURE__ */ new Map();
+  for (const entry of entries) {
+    const name = typeof entry.name === "string" ? entry.name.trim() : "";
+    if (name.length === 0 || name === selfName) continue;
+    if (!named.has(name)) named.set(name, entry);
+  }
+  const lines = [
+    "SIBLING ROSTER (snapshot taken at start; address a peer with subagent_send({to, message}))",
+    `${ROSTER_MAIN} \u2014 the conversation that started you`
+  ];
+  for (const [name, entry] of named) {
+    const state = typeof entry.state === "string" && entry.state.length > 0 ? ` (${entry.state})` : "";
+    const job = typeof entry.jobId === "string" && entry.jobId.length > 0 ? ` job ${entry.jobId}` : "";
+    lines.push(`${name}${state}${job}`);
+  }
+  return lines.join("\n");
+}
+__name(buildRoster, "buildRoster");
+function listAgentsVisible(options) {
+  if (options.crossSessionMessaging === false) return false;
+  return options.background !== true;
+}
+__name(listAgentsVisible, "listAgentsVisible");
+
+// src/resolve.ts
+function resolveModel(input = {}) {
+  const env = input.env ?? {};
+  const envModel = subagentModel(env);
+  const forced = subagentModelForced(env);
+  const main = nonEmpty(input.main);
+  if (forced && envModel !== void 0) return { model: envModel, source: "forced" };
+  const requested = nonEmpty(input.requested);
+  if (requested === "inherit") return { model: main, source: "inherit" };
+  if (requested !== void 0) return { model: requested, source: "parameter" };
+  const definition = nonEmpty(input.definition);
+  if (definition === "inherit") return { model: main, source: "inherit" };
+  if (definition !== void 0) return { model: definition, source: "definition" };
+  if (envModel !== void 0) return { model: envModel, source: "environment" };
+  return { model: main, source: "main" };
+}
+__name(resolveModel, "resolveModel");
+function resolveEffort(input = {}) {
+  const env = input.env ?? {};
+  const requested = effortLevel(input.requested, EFFORT_LEVELS);
+  if (requested !== void 0) return { effort: requested, source: "parameter" };
+  const definition = effortLevel(input.definition, EFFORT_LEVELS);
+  if (definition !== void 0) return { effort: definition, source: "definition" };
+  const fromEnv = effortLevelFromEnv(env, EFFORT_LEVELS);
+  if (fromEnv !== void 0) return { effort: fromEnv, source: "environment" };
+  return { effort: void 0, source: "none" };
+}
+__name(resolveEffort, "resolveEffort");
+function resolveLaunch(input = {}) {
+  const tools = filterTools({
+    ...input.availableTools !== void 0 ? { available: input.availableTools } : {},
+    ...input.mcpServers !== void 0 ? { mcpServers: input.mcpServers } : {},
+    ...input.tools !== void 0 ? { tools: input.tools } : {},
+    ...input.disallowedTools !== void 0 ? { disallowedTools: input.disallowedTools } : {},
+    ...input.permissionMode !== void 0 ? { permissionMode: input.permissionMode } : {},
+    ...input.background !== void 0 ? { background: input.background } : {},
+    ...input.team !== void 0 ? { team: input.team } : {}
+  });
+  if (tools.ok === false) return tools;
+  const model = resolveModel({
+    ...input.requestedModel !== void 0 ? { requested: input.requestedModel } : {},
+    ...input.definitionModel !== void 0 ? { definition: input.definitionModel } : {},
+    ...input.env !== void 0 ? { env: input.env } : {},
+    ...input.mainModel !== void 0 ? { main: input.mainModel } : {}
+  });
+  const effort = resolveEffort({
+    ...input.requestedEffort !== void 0 ? { requested: input.requestedEffort } : {},
+    ...input.definitionEffort !== void 0 ? { definition: input.definitionEffort } : {},
+    ...input.env !== void 0 ? { env: input.env } : {}
+  });
+  return {
+    ok: true,
+    model: model.model,
+    modelSource: model.source,
+    effort: effort.effort,
+    effortSource: effort.source,
+    tools: tools.tools,
+    removed: tools.removed
+  };
+}
+__name(resolveLaunch, "resolveLaunch");
+
 // src/index.ts
 var WORKER_SOURCE = `
 const {spawn} = require('node:child_process');
@@ -5410,90 +5498,6 @@ process.on('uncaughtException', err => {
   process.exit(0);
 });
 `;
-function buildRoster(entries, selfName) {
-  const named = /* @__PURE__ */ new Map();
-  for (const entry of entries) {
-    const name = typeof entry.name === "string" ? entry.name.trim() : "";
-    if (name.length === 0 || name === selfName) continue;
-    if (!named.has(name)) named.set(name, entry);
-  }
-  const lines = [
-    "SIBLING ROSTER (snapshot taken at start; address a peer with subagent_send({to, message}))",
-    `${ROSTER_MAIN} \u2014 the conversation that started you`
-  ];
-  for (const [name, entry] of named) {
-    const state = typeof entry.state === "string" && entry.state.length > 0 ? ` (${entry.state})` : "";
-    const job = typeof entry.jobId === "string" && entry.jobId.length > 0 ? ` job ${entry.jobId}` : "";
-    lines.push(`${name}${state}${job}`);
-  }
-  return lines.join("\n");
-}
-__name(buildRoster, "buildRoster");
-function listAgentsVisible(options) {
-  if (options.crossSessionMessaging === false) return false;
-  return options.background !== true;
-}
-__name(listAgentsVisible, "listAgentsVisible");
-function resolveModel(input = {}) {
-  const env = input.env ?? {};
-  const envModel = subagentModel(env);
-  const forced = subagentModelForced(env);
-  const main = nonEmpty(input.main);
-  if (forced && envModel !== void 0) return { model: envModel, source: "forced" };
-  const requested = nonEmpty(input.requested);
-  if (requested === "inherit") return { model: main, source: "inherit" };
-  if (requested !== void 0) return { model: requested, source: "parameter" };
-  const definition = nonEmpty(input.definition);
-  if (definition === "inherit") return { model: main, source: "inherit" };
-  if (definition !== void 0) return { model: definition, source: "definition" };
-  if (envModel !== void 0) return { model: envModel, source: "environment" };
-  return { model: main, source: "main" };
-}
-__name(resolveModel, "resolveModel");
-function resolveEffort(input = {}) {
-  const env = input.env ?? {};
-  const requested = effortLevel(input.requested, EFFORT_LEVELS);
-  if (requested !== void 0) return { effort: requested, source: "parameter" };
-  const definition = effortLevel(input.definition, EFFORT_LEVELS);
-  if (definition !== void 0) return { effort: definition, source: "definition" };
-  const fromEnv = effortLevelFromEnv(env, EFFORT_LEVELS);
-  if (fromEnv !== void 0) return { effort: fromEnv, source: "environment" };
-  return { effort: void 0, source: "none" };
-}
-__name(resolveEffort, "resolveEffort");
-function resolveLaunch(input = {}) {
-  const tools = filterTools({
-    ...input.availableTools !== void 0 ? { available: input.availableTools } : {},
-    ...input.mcpServers !== void 0 ? { mcpServers: input.mcpServers } : {},
-    ...input.tools !== void 0 ? { tools: input.tools } : {},
-    ...input.disallowedTools !== void 0 ? { disallowedTools: input.disallowedTools } : {},
-    ...input.permissionMode !== void 0 ? { permissionMode: input.permissionMode } : {},
-    ...input.background !== void 0 ? { background: input.background } : {},
-    ...input.team !== void 0 ? { team: input.team } : {}
-  });
-  if (tools.ok === false) return tools;
-  const model = resolveModel({
-    ...input.requestedModel !== void 0 ? { requested: input.requestedModel } : {},
-    ...input.definitionModel !== void 0 ? { definition: input.definitionModel } : {},
-    ...input.env !== void 0 ? { env: input.env } : {},
-    ...input.mainModel !== void 0 ? { main: input.mainModel } : {}
-  });
-  const effort = resolveEffort({
-    ...input.requestedEffort !== void 0 ? { requested: input.requestedEffort } : {},
-    ...input.definitionEffort !== void 0 ? { definition: input.definitionEffort } : {},
-    ...input.env !== void 0 ? { env: input.env } : {}
-  });
-  return {
-    ok: true,
-    model: model.model,
-    modelSource: model.source,
-    effort: effort.effort,
-    effortSource: effort.source,
-    tools: tools.tools,
-    removed: tools.removed
-  };
-}
-__name(resolveLaunch, "resolveLaunch");
 function index_default(cmd, overrides = {}) {
   const runtime = osRuntime(overrides);
   const spool = runtime.fs;
