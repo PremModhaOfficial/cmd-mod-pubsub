@@ -1,0 +1,735 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Architecture review — cmd-mod-pubsub — 2026-10-26</title>
+<style>
+  :root{
+    --paper:#f6f4ef; --card:#fffdf9; --ink:#1c2430; --muted:#68707d;
+    --line:#d9d4c8; --line2:#c4bdae;
+    --deep:#182231; --deep2:#26364a;
+    --accent:#0f766e; --accent-soft:#e2f1ee;
+    --red:#b3261e; --red-soft:#fbe9e7;
+    --amber:#9a5b06; --amber-soft:#fbf1dc;
+    --grey:#6b7280; --grey-soft:#eef0f2;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    --serif:ui-serif,Georgia,"Times New Roman",serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--sans);line-height:1.5}
+  main{max-width:1120px;margin:0 auto;padding:56px 28px 96px}
+  a{color:var(--accent)}
+  header.report{border-bottom:1px solid var(--line2);padding-bottom:26px;margin-bottom:28px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  h1{font-family:var(--serif);font-weight:500;font-size:40px;line-height:1.1;margin:10px 0 12px}
+  .sub{color:var(--muted);max-width:780px;font-size:15px}
+  .legend{display:flex;flex-wrap:wrap;gap:18px;margin-top:20px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .swatch{width:22px;height:13px;border:1px solid var(--line2);display:inline-block;border-radius:2px;background:var(--card)}
+  .swatch.deep{background:var(--deep);border-color:var(--deep)}
+  .swatch.seam{background:transparent;border:1px dashed var(--grey)}
+  .swatch.leak{background:transparent;border:0;border-top:2px solid var(--red);height:2px;width:26px}
+  h2{font-family:var(--serif);font-weight:500;font-size:26px;margin:46px 0 6px}
+  .section-note{color:var(--muted);font-size:13px;margin-bottom:18px}
+  table.summary{width:100%;border-collapse:collapse;font-size:13px;background:var(--card);border:1px solid var(--line)}
+  table.summary th{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);text-align:left;padding:10px 12px;border-bottom:1px solid var(--line)}
+  table.summary td{padding:11px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  table.summary tr:last-child td{border-bottom:0}
+  table.summary td.num{font-family:var(--mono);white-space:nowrap;color:var(--muted)}
+  .cand{cursor:default}
+  .badge{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;padding:3px 8px;border-radius:999px;border:1px solid}
+  .b-strong{color:var(--accent);border-color:#9dccc5;background:var(--accent-soft)}
+  .b-worth{color:var(--amber);border-color:#e4c790;background:var(--amber-soft)}
+  .b-spec{color:var(--grey);border-color:#cfd4da;background:var(--grey-soft)}
+  .b-reject{color:var(--red);border-color:#e5b7b2;background:var(--red-soft)}
+  article.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:26px 26px 22px;margin:26px 0 34px;scroll-margin-top:20px}
+  article.card>h3{font-family:var(--serif);font-weight:500;font-size:23px;margin:0 0 4px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+  .files{font-family:var(--mono);font-size:11.5px;color:var(--muted);margin:0 0 18px;word-break:break-word}
+  .files b{color:var(--ink);font-weight:600}
+  .diagram{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:8px 0 20px}
+  .panel{border:1px solid var(--line);border-radius:7px;background:#fbfaf6;padding:10px 10px 6px;min-width:0}
+  .panel .cap{font-family:var(--mono);font-size:10px;letter-spacing:.11em;text-transform:uppercase;color:var(--muted);margin:0 0 4px}
+  .panel .note{font-size:11px;color:var(--muted);margin:4px 2px 6px;min-height:30px}
+  svg{display:block;width:100%;height:auto}
+  .mod{fill:#fffdf9;stroke:#b9b2a3;stroke-width:1.2}
+  .deep{fill:var(--deep);stroke:var(--deep)}
+  .seam{fill:none;stroke:#8b93a0;stroke-width:1.2;stroke-dasharray:4 4}
+  .leak{fill:none;stroke:var(--red);stroke-width:1.8}
+  .flow{fill:none;stroke:#6b7280;stroke-width:1.2}
+  .t{font-family:var(--mono);font-size:10.5px;fill:#26303c}
+  .t.small{font-size:9.5px;fill:#68707d}
+  .t.inv{fill:#f4f7fa}
+  .t.red{fill:var(--red)}
+  .t.amber{fill:var(--amber)}
+  .t.grey{fill:#8a919c}
+  .boxhead{font-family:var(--mono);font-size:9px;letter-spacing:.1em;text-transform:uppercase;fill:#68707d}
+  table.facts{width:100%;border-collapse:collapse;font-size:13px;margin:2px 0 14px}
+  table.facts th{width:132px;text-align:left;vertical-align:top;font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);padding:6px 12px 6px 0;border-top:1px solid var(--line)}
+  table.facts td{padding:6px 0;border-top:1px solid var(--line);vertical-align:top}
+  table.facts code,p code,td code{font-family:var(--mono);font-size:12px;background:#f0ede5;padding:1px 4px;border-radius:3px}
+  .problem{margin:0 0 4px;font-size:14px}
+  .problem b{font-family:var(--mono);font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:500;margin-right:8px}
+  .wins{list-style:none;padding:0;margin:10px 0 0;display:flex;flex-wrap:wrap;gap:6px}
+  .wins li{font-size:12px;border:1px solid var(--line);border-radius:999px;padding:4px 10px;background:#faf8f2}
+  .callout{border-left:3px solid var(--amber);background:var(--amber-soft);padding:10px 12px;border-radius:0 5px 5px 0;font-size:12.5px;color:#5f3c07;margin:12px 0 0}
+  .callout.red{border-color:var(--red);background:var(--red-soft);color:#6b1712}
+  .topcard{background:var(--deep);color:#eef2f6;border-radius:12px;padding:34px 34px 30px;margin-top:18px}
+  .topcard h2{color:#fff;margin:0 0 10px}
+  .topcard p{color:#cfd8e2;max-width:760px;margin:0 0 12px}
+  .topcard .why{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin:18px 0 0}
+  .topcard .why div{border-top:1px solid #3b4b60;padding-top:10px}
+  .topcard .why b{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#8fa3ba;margin-bottom:4px;font-weight:500}
+  .topcard a{color:#7dd3c8}
+  .smalltable{font-size:12.5px}
+  .smalltable td:first-child{font-family:var(--mono);white-space:nowrap}
+  footer{margin-top:48px;border-top:1px solid var(--line);padding-top:16px;color:var(--muted);font-size:11.5px;font-family:var(--mono)}
+  @media (max-width:760px){
+    .diagram{grid-template-columns:1fr}
+    h1{font-size:31px}
+    .topcard .why{grid-template-columns:1fr}
+    main{padding:34px 16px 64px}
+  }
+</style>
+</head>
+<body>
+<main>
+
+<header class="report">
+  <div class="eyebrow">Architecture scan · read-only · revision 4</div>
+  <h1>cmd-mod-pubsub</h1>
+  <div class="sub">Deepening opportunities in a 10,220-line, 29-file mod. This scan looks at structure, not size: which interfaces force callers to know too much, which implementation details leak across a seam, and where one shape is declared three times.</div>
+  <div class="legend">
+    <span><i class="swatch"></i>module</span>
+    <span><i class="swatch deep"></i>deep module</span>
+    <span><i class="swatch seam"></i>seam</span>
+    <span><i class="swatch leak"></i>leakage</span>
+    <span>branch <b>refactor/module-split</b></span>
+    <span>gate <b>npm run gate</b> · 137 smoke checks</span>
+  </div>
+</header>
+
+<h2 id="candidates">Candidates</h2>
+<p class="section-note">Ranked by capability preserved ÷ risk of change. Widths are counted declarations, not lines.</p>
+
+<table class="summary">
+  <thead>
+    <tr><th>#</th><th>Candidate</th><th>Where</th><th>What is wide today</th><th>Strength</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="num">1</td><td><a href="#c1">One launch shape</a></td><td class="num">plan.ts:161, 221, 588 · spawn.ts:48, 437 · jobs.ts:15</td><td class="num">JobPlan 35 → WorkerSpecInput 52 → JobRecord 65; 2 mapping functions</td><td><span class="badge b-strong">Strong</span></td></tr>
+    <tr><td class="num">2</td><td><a href="#c2">Give the tool surface a session</a></td><td class="num">tools.ts:37–76, 85–706</td><td class="num">30-field context · 3 methods · 13 tools + 5 aliases</td><td><span class="badge b-strong">Strong</span></td></tr>
+    <tr><td class="num">3</td><td><a href="#c3">One record lifecycle, embedded</a></td><td class="num">index.ts:295–1437 vs state.ts, jobs.ts</td><td class="num">2 implementations of settle/record IO</td><td><span class="badge b-worth">Worth exploring</span></td></tr>
+    <tr><td class="num">4</td><td><a href="#c4">Owner identity behind a module</a></td><td class="num">index.ts:1757–1853</td><td class="num">3 entry-local functions + hidden ordering rule</td><td><span class="badge b-worth">Worth exploring</span></td></tr>
+    <tr><td class="num">5</td><td><a href="#c5">One roster module</a></td><td class="num">index.ts:1964–2062</td><td class="num">5 closures over the same job scan</td><td><span class="badge b-worth">Worth exploring</span></td></tr>
+    <tr><td class="num">6</td><td><a href="#c6">Split claim from delivery</a></td><td class="num">delivery.ts:25–70, 86–504</td><td class="num">25-field deps · 11-method interface</td><td><span class="badge b-worth">Worth exploring</span></td></tr>
+    <tr><td class="num">7</td><td><a href="#c7">Extract the task pane</a></td><td class="num">index.ts:2263–2431</td><td class="num">5 closures + 4 selection variables in the entry</td><td><span class="badge b-spec">Speculative</span></td></tr>
+    <tr><td class="num">8</td><td><a href="#c8">Trim the re-export surface</a></td><td class="num">index.ts:140–276</td><td class="num">153 names · 76 values · 24 values with no reader</td><td><span class="badge b-spec">Speculative</span></td></tr>
+  </tbody>
+</table>
+
+<!-- 1 -->
+<article class="card" id="c1">
+  <h3>1 · One launch shape</h3>
+  <div class="meta"><span class="badge b-strong">Strong</span><span class="badge b-spec">in-process</span></div>
+  <p class="files"><b>plan.ts</b> 161–216, 221–429, 435–583, 588–655 · <b>spawn.ts</b> 48–140, 437–500 · <b>jobs.ts</b> 15–100 · <b>index.ts</b> 114, 2450–2532</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — one launch, three declarations</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Three stacked declarations: JobPlan 35 fields, WorkerSpecInput 52 fields, JobRecord 65 fields, joined by two mapping functions">
+        <rect class="mod" x="30" y="14" width="300" height="52" rx="6"/>
+        <text class="boxhead" x="42" y="32">DECISION</text>
+        <text class="t" x="42" y="50">JobPlan · 35 fields</text>
+        <text class="t small" x="42" y="62">planFromInput / planFromRecord</text>
+        <text class="t small" x="342" y="46">plan.ts:161</text>
+
+        <rect class="mod" x="30" y="96" width="300" height="52" rx="6"/>
+        <text class="boxhead" x="42" y="114">TRANSPORT</text>
+        <text class="t" x="42" y="132">WorkerSpecInput · 52 fields</text>
+        <text class="t small" x="42" y="144">buildSpec · 35 conditional spreads</text>
+        <text class="t small" x="342" y="128">spawn.ts:48</text>
+
+        <rect class="mod" x="30" y="178" width="300" height="52" rx="6"/>
+        <text class="boxhead" x="42" y="196">DURABLE</text>
+        <text class="t" x="42" y="214">JobRecord · 65 fields incl. identity</text>
+        <text class="t small" x="42" y="226">recordFromPlan · 28 field copies</text>
+        <text class="t small" x="342" y="210">jobs.ts:15</text>
+
+        <path class="leak" d="M180 66 L180 94"/>
+        <path class="leak" d="M180 148 L180 176"/>
+        <text class="t red" x="190" y="85">fire() copies every field</text>
+        <text class="t red" x="190" y="167">recordFromPlan() copies it again</text>
+        <text class="t red" x="30" y="252">one new option = 3 declarations + 2 mappings + 1 worker read</text>
+      </svg>
+      <p class="note">Every launch field is declared three times and copied twice. The copies are not decisions.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — one declaration, two edges</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="One deep launch module with identity and transport added at its edges">
+        <rect class="deep" x="26" y="26" width="286" height="150" rx="8"/>
+        <text class="boxhead" x="42" y="48" style="fill:#8fa3ba">ONE DECLARATION</text>
+        <text class="t inv" x="42" y="72">launch intent</text>
+        <text class="t inv small" x="42" y="90">the record's own field names</text>
+        <text class="t inv small" x="42" y="108">precedence decided once, in plan</text>
+        <text class="t inv small" x="42" y="126">no mirror type, no field list</text>
+        <text class="t inv small" x="42" y="150">+ identity at the edge</text>
+        <text class="t inv small" x="42" y="164">+ transport at the edge</text>
+
+        <rect class="mod" x="330" y="40" width="112" height="44" rx="6"/>
+        <text class="t" x="342" y="58">identity</text>
+        <text class="t small" x="342" y="72">id · owner · paths</text>
+        <rect class="mod" x="330" y="108" width="112" height="44" rx="6"/>
+        <text class="t" x="342" y="126">transport</text>
+        <text class="t small" x="342" y="140">argv · env spec</text>
+        <path class="flow" d="M312 74 L328 62"/>
+        <path class="flow" d="M312 132 L328 130"/>
+        <text class="t" x="26" y="210">deletes</text>
+        <text class="t small" x="74" y="210">WorkerSpecInput · recordFromPlan · 35 spreads</text>
+        <text class="t small" x="74" y="226">15 Plan* type exports with no reader</text>
+        <text class="t small" x="74" y="242">PlanContext: 28 fields → ~6 capabilities</text>
+      </svg>
+      <p class="note">Identity and transport become edges on one shape; the field list lives in one place.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>The launch data is restated in three declarations, and two functions exist only to copy field names between them.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td><code>planFromInput(input, PlanContext)</code> with a 28-field context, returning a 35-field <code>JobPlan</code>; <code>fire(intent, SpawnContext)</code> with a 34-field context, building a 52-field <code>WorkerSpecInput</code>; <code>recordFromPlan()</code> copying 28 fields into a 65-field <code>JobRecord</code>.</td></tr>
+    <tr><th>What it hides</th><td>The precedence table: definition vs call vs environment vs fork mode, MCP trust, permission modes, memory tools, compact window, background policy. That part is genuinely deep and should stay.</td></tr>
+    <tr><th>Callers must know</th><td>Which of the three shapes a given option belongs to; that adding one option means editing <code>PlanAgent</code>, <code>JobPlan</code>, <code>WorkerSpecInput</code>, <code>JobRecord</code>, <code>planFromInput</code>, <code>recordFromPlan</code>, the <code>fire</code> spread, and the worker's <code>spec.x</code> read. The entry also assembles 28 context fields by hand.</td></tr>
+    <tr><th>Deletion test</th><td>Delete <code>JobPlan</code> and <code>WorkerSpecInput</code> and make <code>fire</code> + the worker consume the record's field names. The 28 copies in <code>recordFromPlan</code> and the 35 spreads in <code>fire</code> disappear; the precedence logic stays in one function. Names that leave the caller: <code>recordFromPlan</code>, <code>JobPlan</code>, <code>WorkerSpecInput</code>, <code>PlanContext</code>, and 15 <code>Plan*</code> type exports. Complexity concentrates in <code>planFromInput</code> rather than spreading across three shapes.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>one declaration per launch field</li>
+    <li>one place to add an option</li>
+    <li>28-field context → ~6 capabilities</li>
+    <li>15 dead type exports deleted</li>
+    <li>typecheck catches every drift</li>
+  </ul>
+  <div class="callout">No runtime behaviour changes: <code>planFromInput</code> keeps the precedence table; only the shape it returns and the mapping around it collapse. The 137 smoke checks exercise spawn, resume, and send through the entry.</div>
+</article>
+
+<!-- 2 -->
+<article class="card" id="c2">
+  <h3>2 · Give the tool surface a session</h3>
+  <div class="meta"><span class="badge b-strong">Strong</span><span class="badge b-spec">in-process</span></div>
+  <p class="files"><b>tools.ts</b> 37–76 (context), 85–706 (createTools) · <b>index.ts</b> 2537–2568 (wiring)</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — 30 loose collaborators</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Thirty context fields feeding a 622-line tool closure">
+        <g class="t small" fill="#68707d">
+          <text x="12" y="22">readJob</text><text x="12" y="36">writeJob</text><text x="12" y="50">readRecentJobs</text>
+          <text x="12" y="64">refreshJobs</text><text x="12" y="78">enqueueSignal</text><text x="12" y="92">safeDrain</text>
+          <text x="12" y="106">cancelJob</text><text x="12" y="120">registry</text><text x="12" y="134">ledger</text>
+          <text x="12" y="148">currentOwner</text><text x="12" y="162">ownerId</text><text x="12" y="176">rosterNames</text>
+          <text x="12" y="190">namedJob</text><text x="12" y="204">liveState</text><text x="12" y="218">appendLive</text>
+          <text x="12" y="232">… 15 more</text>
+        </g>
+        <g class="flow">
+          <path d="M100 18 L150 100"/><path d="M100 32 L150 100"/><path d="M100 46 L150 100"/>
+          <path d="M100 60 L150 100"/><path d="M100 74 L150 100"/><path d="M100 88 L150 100"/>
+          <path d="M100 102 L150 100"/><path d="M100 116 L150 100"/><path d="M100 130 L150 100"/>
+          <path d="M100 144 L150 100"/><path d="M100 158 L150 100"/><path d="M100 172 L150 100"/>
+          <path d="M100 186 L150 100"/><path d="M100 200 L150 100"/><path d="M100 214 L150 100"/>
+        </g>
+        <rect class="mod" x="150" y="34" width="210" height="132" rx="7"/>
+        <text class="boxhead" x="164" y="54">TOOL SURFACE</text>
+        <text class="t" x="164" y="76">createTools · 622 lines</text>
+        <text class="t small" x="164" y="94">13 tools + 5 aliases</text>
+        <text class="t small" x="164" y="110">handler bodies + schemas</text>
+        <text class="t small" x="164" y="126">2 sub-contexts (plan, spawn)</text>
+        <text class="t small" x="164" y="142">registration inline</text>
+        <text class="t red" x="150" y="196">the context is the interface: 30 fields</text>
+        <text class="t small" x="150" y="212">every handler reaches through it</text>
+      </svg>
+      <p class="note">Three public methods hide the handlers, but construction demands the whole entry.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — one session port</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Tool surface taking one session object with six ports">
+        <rect class="deep" x="40" y="28" width="390" height="120" rx="8"/>
+        <text class="boxhead" x="56" y="50" style="fill:#8fa3ba">TOOL SURFACE</text>
+        <text class="t inv" x="56" y="74">register() · outputText() · sendToRecord()</text>
+        <text class="t inv small" x="56" y="94">handlers, schemas, aliases, waits, transcripts</text>
+        <text class="t inv small" x="56" y="110">all private behind the same three methods</text>
+        <text class="t inv small" x="56" y="132">createTools(cmd, session, plan, spawn, io)</text>
+
+        <rect class="mod" x="40" y="172" width="390" height="46" rx="6"/>
+        <text class="boxhead" x="54" y="190">SESSION</text>
+        <text class="t" x="54" y="207">identity · jobs · roster · delivery · ledger · registry</text>
+        <path class="flow" d="M235 172 L235 150"/>
+        <text class="t" x="40" y="240">6 ports instead of 30 fields</text>
+        <text class="t small" x="40" y="256">the session owns the ordering rules; tools only ask</text>
+      </svg>
+      <p class="note">One port hides identity, job reads, the roster, and delivery behind six capabilities.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>The tool surface is deep in behaviour but shallow in construction: 30 fields and two sub-contexts must be handed in before one handler can run.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td><code>ToolsContext</code> with 30 readonly fields, <code>createTools(ctx)</code> returning <code>{register, outputText, sendToRecord}</code>. Registration adds <code>subagent_spawn</code>, <code>subagent_list</code>, <code>subagent_output</code>, <code>subagent_cancel</code>, <code>subagent_resume</code>, <code>subagent_agents</code>, <code>ListAgents</code>, <code>SubagentHandback</code>, <code>subagent_send</code>, <code>pubsub_send</code>, plus <code>pubsub_fire</code>, <code>pubsub_list</code>, <code>pubsub_cancel</code> aliases.</td></tr>
+    <tr><th>What it hides</th><td>The bounded wait loop, transcript JSONL parsing, log slicing, handback signal construction, alias registration, and the shape of each tool's schema. None of that leaks today: the three methods are a good interface.</td></tr>
+    <tr><th>Callers must know</th><td>Which collaborator each handler needs, that <code>sessionId</code> and <code>workerSpec</code> are late-bound functions, that <code>safeDrain</code> is the only drain the tools may call, and that <code>scanOutput</code>/<code>reportText</code> must both be supplied. The entry's wiring is a 31-line object literal.</td></tr>
+    <tr><th>Deletion test</th><td>Delete <code>createTools</code> and the 622 lines reappear in the entry, spreading handler knowledge across every command and panel. It earns its keep. Deepen by narrowing the constructor: names that leave the entry's wiring are <code>readJob</code>, <code>writeJob</code>, <code>readRecentJobs</code>, <code>refreshJobs</code>, <code>enqueueSignal</code>, <code>safeDrain</code>, <code>cancelJob</code>, <code>ledger</code>, <code>currentOwner</code>, <code>ownerId</code>, <code>rosterNames</code>, <code>namedJob</code>, <code>liveState</code>, <code>appendLive</code>, <code>listText</code>, <code>scanOutput</code>, <code>reportText</code>, <code>listAgentsVisible</code> (18 of 30), replaced by one <code>session</code>.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>context 30 → 6 ports</li>
+    <li>locality: ordering rules in session</li>
+    <li>tests build one fake session</li>
+    <li>handlers stay private</li>
+  </ul>
+</article>
+
+<!-- 3 -->
+<article class="card" id="c3">
+  <h3>3 · One record lifecycle, embedded</h3>
+  <div class="meta"><span class="badge b-worth">Worth exploring</span><span class="badge b-reject">bundle-literal constraint</span></div>
+  <p class="files"><b>index.ts</b> 295–1437 (<code>WORKER_SOURCE</code>, 1,143 lines) · <b>state.ts</b> 23–78 · <b>jobs.ts</b> 119–163 · <b>signals.ts</b> 1–119</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — two lifecycles</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Parent and worker each implement record write and settle">
+        <rect class="mod" x="18" y="24" width="198" height="126" rx="7"/>
+        <text class="boxhead" x="32" y="44">PARENT</text>
+        <text class="t" x="32" y="66">applyPatch</text>
+        <text class="t small" x="32" y="82">canTransition(from, to)</text>
+        <text class="t small" x="32" y="98">rejects a terminal edge</text>
+        <text class="t" x="32" y="120">jobStore.writeJob</text>
+        <text class="t small" x="32" y="136">tmp + rename</text>
+
+        <rect class="mod" x="254" y="24" width="198" height="126" rx="7"/>
+        <text class="boxhead" x="268" y="44">WORKER (string)</text>
+        <text class="t" x="268" y="66">writeRecord(patch)</text>
+        <text class="t small" x="268" y="82">forces state = 'canceled'</text>
+        <text class="t small" x="268" y="98">no transition table</text>
+        <text class="t" x="268" y="120">settle(state, …)</text>
+        <text class="t small" x="268" y="136">record + signal from facts</text>
+
+        <path class="leak" d="M216 76 L252 76"/>
+        <path class="leak" d="M216 92 L252 92"/>
+        <text class="t red" x="18" y="176">same job, same JSON file, two writers</text>
+        <text class="t red" x="18" y="194">same terminal rule, two spellings</text>
+        <text class="t red" x="18" y="212">settle derives the record and the signal twice</text>
+        <text class="t small" x="18" y="234">WORKER_SOURCE cannot import state.ts or jobs.ts</text>
+        <text class="t small" x="18" y="250">so it re-implements them as plain JavaScript</text>
+      </svg>
+      <p class="note">The one-file bundle makes the worker a string, so it grows its own copy of the lifecycle.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — one embeddable source</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="One embedded lifecycle source used by both parent and worker">
+        <rect class="deep" x="86" y="30" width="298" height="118" rx="8"/>
+        <text class="boxhead" x="102" y="52" style="fill:#8fa3ba">REFERENCE-FREE</text>
+        <text class="t inv" x="102" y="76">job lifecycle source</text>
+        <text class="t inv small" x="102" y="94">transition table · record write</text>
+        <text class="t inv small" x="102" y="110">settle facts · signal envelope</text>
+        <text class="t inv small" x="102" y="132">toString() → worker · import → parent</text>
+
+        <rect class="mod" x="20" y="184" width="170" height="44" rx="6"/>
+        <text class="t" x="34" y="202">parent</text>
+        <text class="t small" x="34" y="216">applyPatch / jobStore</text>
+        <rect class="mod" x="280" y="184" width="170" height="44" rx="6"/>
+        <text class="t" x="294" y="202">worker</text>
+        <text class="t small" x="294" y="216">writeRecord / settle</text>
+        <path class="flow" d="M170 182 L214 150"/>
+        <path class="flow" d="M300 182 L256 150"/>
+        <text class="t" x="20" y="252">1 rule table · 2 adapters · 0 drift</text>
+      </svg>
+      <p class="note">The worker keeps its one-file constraint; it stops owning a second lifecycle.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>The terminal-state rule and the “record and signal carry the same facts” rule are implemented in the parent and again inside the worker string.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td>None. The worker is an opaque 1,143-line template string with a 52-field JSON spec in its environment. Its whole surface is the files it writes.</td></tr>
+    <tr><th>What it hides</th><td>Process supervision, the ACP transport, fork stdio parsing, the live-message loop, permission handling, and the two content rules that <em>are</em> shared: state transitions and signal construction.</td></tr>
+    <tr><th>Callers must know</th><td>That two implementations exist and must stay in sync; that the worker's <code>writeRecord</code> force-writes <code>canceled</code> while the parent uses <code>canTransition</code>; that <code>settle</code> must not emit a second signal after <code>handbackAt</code>. A change to one rule is a two-file change with no typecheck across the string.</td></tr>
+    <tr><th>Deletion test</th><td>Delete the worker's <code>readRecord</code>, <code>writeRecord</code>, and <code>settle</code> copies. If the parent's rules can be embedded with <code>.toString()</code> the way <code>signalEnvelope</code> and <code>scanOutput</code> already are, complexity concentrates in one reference-free source and disappears from the worker. Names that leave the worker: <code>readRecord</code>, <code>writeRecord</code>, <code>settle</code>. <b>Risk:</b> the bodies must stay plain, reference-free JavaScript; only <code>node test/e2e.mjs</code> covers the real host, and it is not in CI.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>one terminal rule</li>
+    <li>one settle constructor</li>
+    <li>no string drift</li>
+    <li>leverage: 2 adapters, 1 rule table</li>
+  </ul>
+  <div class="callout">Does not contradict ADR-0002 or ADR-0003: the bundle stays one file, and the worker still receives source. It extends the existing <code>.toString()</code> seam. Deferred behind candidates 1–2 because its failure mode is only visible in e2e.</div>
+</article>
+
+<!-- 4 -->
+<article class="card" id="c4">
+  <h3>4 · Owner identity behind a module</h3>
+  <div class="meta"><span class="badge b-worth">Worth exploring</span><span class="badge b-spec">in-process</span></div>
+  <p class="files"><b>index.ts</b> 1757–1853 (owner), 2067–2093 (reconcile reads the token directly)</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — five names in the entry</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Owner token with five surrounding functions inside the entry">
+        <rect class="mod" x="18" y="18" width="434" height="196" rx="8"/>
+        <text class="boxhead" x="34" y="40">ENTRY · activate()</text>
+        <rect class="mod" x="152" y="74" width="164" height="58" rx="6"/>
+        <text class="t" x="166" y="94">ownerToken</text>
+        <text class="t small" x="166" y="110">saved? legacy read?</text>
+        <text class="t small" x="166" y="124">worker inherits?</text>
+
+        <text class="t" x="34" y="96">saveOwner()</text>
+        <text class="t" x="34" y="120">ownerId()</text>
+        <text class="t" x="34" y="144">currentOwner()</text>
+        <text class="t" x="34" y="168">ownerVerdict()</text>
+        <text class="t" x="34" y="192">reconcile reads it</text>
+        <path class="flow" d="M110 92 L150 96"/>
+        <path class="flow" d="M100 116 L150 106"/>
+        <path class="flow" d="M122 140 L150 122"/>
+        <path class="flow" d="M116 164 L150 134"/>
+        <path class="flow" d="M140 188 L180 134"/>
+        <text class="t red" x="34" y="232">ownerVerdict() returns 'pending' until ownerId() has run</text>
+        <text class="t small" x="34" y="250">an ordering rule no caller can see in the types</text>
+      </svg>
+      <p class="note">The token's lifecycle is an implicit precondition on every caller.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — one identity port</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Identity module with current and verdict ports">
+        <rect class="deep" x="96" y="30" width="278" height="118" rx="8"/>
+        <text class="boxhead" x="112" y="52" style="fill:#8fa3ba">IDENTITY</text>
+        <text class="t inv" x="112" y="76">createIdentity(session, workerSpec, workerMode)</text>
+        <text class="t inv small" x="112" y="96">mint once · persist once · read legacy once</text>
+        <text class="t inv small" x="112" y="112">pending is a state, not a caller mistake</text>
+        <text class="t inv small" x="112" y="134">current() · verdict(owner)</text>
+        <rect class="mod" x="40" y="184" width="150" height="44" rx="6"/>
+        <text class="t" x="54" y="202">tools / spawn</text>
+        <text class="t small" x="54" y="216">ask for the identity</text>
+        <rect class="mod" x="280" y="184" width="150" height="44" rx="6"/>
+        <text class="t" x="294" y="202">reconcile / drain</text>
+        <text class="t small" x="294" y="216">ask for the verdict</text>
+        <path class="flow" d="M150 182 L190 150"/>
+        <path class="flow" d="M320 182 L280 150"/>
+        <text class="t" x="40" y="252">6 entry names → 1 module + 2 methods</text>
+      </svg>
+      <p class="note">One module owns token minting, transcript persistence, and the pending verdict.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>Identity is four entry-local functions and a mutable token; the rule that a verdict is <code>pending</code> until the token is read is invisible to callers.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td>Four functions: <code>saveOwner(token)</code>, <code>ownerId()</code>, <code>currentOwner()</code>, <code>ownerVerdict(owner)</code>, plus the <code>ownerToken</code> variable that <code>reconcileJobs</code> compares directly.</td></tr>
+    <tr><th>What it hides</th><td>Minting, one-time transcript persistence, reading the current and 0.1.0 custom entry types, worker inheritance from the spec, and the orphan-vs-foreign rule.</td></tr>
+    <tr><th>Callers must know</th><td>Call <code>currentOwner()</code> (or <code>ownerId()</code>) before <code>ownerVerdict()</code>, or every signal looks <code>pending</code>. That a worker must not mint its own token. That reconcile compares the raw token, not the verdict.</td></tr>
+    <tr><th>Deletion test</th><td>Extract <code>createIdentity</code> behind <code>{current, verdict}</code>. Names that leave <code>index.ts</code>: <code>ownerToken</code>, <code>ownerSaved</code>, <code>saveOwner</code>, <code>ownerId</code>, <code>currentOwner</code>, <code>ownerVerdict</code> (6). The ordering rule moves inside the module, where it is testable with a fake session. Small capability, very low risk.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>locality: token rules in one place</li>
+    <li>pending becomes an invariant</li>
+    <li>tests use a fake session</li>
+    <li>6 entry names deleted</li>
+  </ul>
+</article>
+
+<!-- 5 -->
+<article class="card" id="c5">
+  <h3>5 · One roster module</h3>
+  <div class="meta"><span class="badge b-worth">Worth exploring</span><span class="badge b-spec">in-process</span></div>
+  <p class="files"><b>index.ts</b> 1964–2062 (live), 2020–2041 (rosterFor), 1985–2004 (names)</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — five scans, one record set</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Five functions each scanning the job records">
+        <rect class="mod" x="150" y="20" width="172" height="44" rx="6"/>
+        <text class="t" x="164" y="38">readRecentJobs</text>
+        <text class="t small" x="164" y="52">same records, five times</text>
+        <g class="t">
+          <text x="28" y="106">ownedNamedJobs</text>
+          <text x="28" y="134">rosterNames</text>
+          <text x="28" y="162">namedJob</text>
+          <text x="28" y="190">appendLive</text>
+          <text x="28" y="218">rosterFor</text>
+        </g>
+        <g class="flow">
+          <path d="M150 96 L160 60"/><path d="M210 126 L222 66"/><path d="M210 154 L236 66"/>
+          <path d="M190 182 L250 66"/><path d="M220 210 L262 66"/>
+        </g>
+        <text class="t red" x="150" y="246">owner filter and worker-roster gate repeated per caller</text>
+      </svg>
+      <p class="note">The roster rules live in the caller, so each new reader re-derives them.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — one roster</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="One roster module with names, lookup, append and snapshot">
+        <rect class="deep" x="58" y="26" width="354" height="120" rx="8"/>
+        <text class="boxhead" x="74" y="48" style="fill:#8fa3ba">ROSTER</text>
+        <text class="t inv" x="74" y="72">createRoster({jobs, runtime, workerSpec, controlRoot})</text>
+        <text class="t inv small" x="74" y="92">names() · namedJob(name) · append(id, from, message)</text>
+        <text class="t inv small" x="74" y="108">rosterFor(self) · ownedNamedJobs()</text>
+        <text class="t inv small" x="74" y="130">owner filter + worker gate decided once</text>
+        <rect class="mod" x="40" y="184" width="150" height="44" rx="6"/>
+        <text class="t" x="54" y="202">tools</text>
+        <text class="t small" x="54" y="216">send / ListAgents</text>
+        <rect class="mod" x="280" y="184" width="150" height="44" rx="6"/>
+        <text class="t" x="294" y="202">spawn</text>
+        <text class="t small" x="294" y="216">roster snapshot</text>
+        <path class="flow" d="M150 182 L192 148"/>
+        <path class="flow" d="M320 182 L278 148"/>
+        <text class="t" x="40" y="252">5 caller names → 1 module</text>
+      </svg>
+      <p class="note">Names, lookup, control queue, and snapshot share one owner filter.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>Five entry closures re-derive “which named jobs are mine” from the same record scan, and the worker branch is re-checked in each.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td><code>ownedNamedJobs()</code>, <code>rosterNames()</code>, <code>namedJob(name)</code>, <code>appendLive(id, from, message)</code>, <code>rosterFor(selfName)</code>. Each is called directly by tools, spawn, commands, or the panel.</td></tr>
+    <tr><th>What it hides</th><td>Almost nothing: the owner filter and the worker-roster gate are visible in each body. This is the shallow one.</td></tr>
+    <tr><th>Callers must know</th><td>That a worker must be gated by <code>workerSpec.rosterNames</code>; that <code>namedJob</code> prefers an alive record over a newer finished one; that <code>rosterFor</code> appends the parent's inherited view when nested. Three rules, three call sites.</td></tr>
+    <tr><th>Deletion test</th><td>Extract <code>createRoster</code>. Names that leave <code>index.ts</code>: <code>ownedNamedJobs</code>, <code>rosterNames</code>, <code>namedJob</code>, <code>appendLive</code>, <code>rosterFor</code> (5). If the extraction needs more than four inputs, it is two modules (names vs control queue); it does not.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>one owner filter</li>
+    <li>one live-vs-idle preference</li>
+    <li>5 names deleted</li>
+    <li>testable with a record list</li>
+  </ul>
+</article>
+
+<!-- 6 -->
+<article class="card" id="c6">
+  <h3>6 · Split claim from delivery</h3>
+  <div class="meta"><span class="badge b-worth">Worth exploring</span><span class="badge b-reject">reject for now</span></div>
+  <p class="files"><b>delivery.ts</b> 25–70 (<code>DeliveryDeps</code>), 86–504 (<code>createDelivery</code>)</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — 25 deps, 11 methods</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Twenty-five dependencies feeding a delivery box with eleven methods">
+        <g class="t small" fill="#68707d">
+          <text x="10" y="26">fs · inbox · claimed</text>
+          <text x="10" y="42">orphaned · controlRoot</text>
+          <text x="10" y="58">ledger · now · readJob</text>
+          <text x="10" y="74">writeJob · readRecentJobs</text>
+          <text x="10" y="90">finalizeWorktree · ownerVerdict</text>
+          <text x="10" y="106">workerMode · hasSession</text>
+          <text x="10" y="122">deliverAs · sendUserMessage</text>
+          <text x="10" y="138">showEntry · answerPending</text>
+          <text x="10" y="154">askedPermissions · jobs</text>
+          <text x="10" y="170">setJobs · sweepHooks</text>
+          <text x="10" y="186">updateStatus · markTick</text>
+          <text x="10" y="202">sweep</text>
+        </g>
+        <rect class="mod" x="206" y="34" width="228" height="160" rx="7"/>
+        <text class="boxhead" x="220" y="54">DELIVERY</text>
+        <text class="t small" x="220" y="74">drain · safeDrain · claimPending</text>
+        <text class="t small" x="220" y="90">settle · markDelivered · format</text>
+        <text class="t small" x="220" y="106">countPending · countOrphaned</text>
+        <text class="t small" x="220" y="122">refreshJobs · sweepClaimed</text>
+        <text class="t small" x="220" y="138">sweepOrphaned</text>
+        <text class="t red" x="220" y="164">11 methods, 3 callers</text>
+        <text class="t small" x="220" y="180">the interface is as wide as the wiring</text>
+        <text class="t red" x="10" y="232">claim/settle atomicity is the real invariant</text>
+        <text class="t small" x="10" y="250">splitting risks the one thing the module exists for</text>
+      </svg>
+      <p class="note">The module is deep in behaviour but its constructor and method list are both wide.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — two seams, one invariant</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Claim module with five dependencies and delivery module with the rest">
+        <rect class="deep" x="18" y="34" width="205" height="118" rx="8"/>
+        <text class="boxhead" x="32" y="56" style="fill:#8fa3ba">CLAIM</text>
+        <text class="t inv" x="32" y="78">fs · dirs · ledger · now</text>
+        <text class="t inv small" x="32" y="98">claim() · settle() · count()</text>
+        <text class="t inv small" x="32" y="116">atomic rename lives here</text>
+        <text class="t inv small" x="32" y="134">5 deps · 3 methods</text>
+
+        <rect class="mod" x="248" y="34" width="204" height="118" rx="6"/>
+        <text class="boxhead" x="262" y="56">PIPELINE</text>
+        <text class="t" x="262" y="78">format · drain · refresh</text>
+        <text class="t small" x="262" y="96">hooks · status · permissions</text>
+        <text class="t small" x="262" y="114">the rest of the deps</text>
+        <text class="t small" x="262" y="132">6 methods</text>
+
+        <path class="seam" d="M224 94 L246 94"/>
+        <text class="t amber" x="18" y="194">risk: a claim is only correct if settle shares its cursor</text>
+        <text class="t small" x="18" y="212">the split must keep one object owning both operations</text>
+        <text class="t small" x="18" y="228">otherwise a foreign signal can be lost</text>
+        <text class="t small" x="18" y="248">capability preserved, but the invariant is load-bearing</text>
+      </svg>
+      <p class="note">Splitting is only safe if the claim cursor and settle stay in one owner.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>Eleven methods and 25 dependencies for one job: the module owns both the atomic claim and three periodic jobs.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td><code>Delivery</code> with <code>drain</code>, <code>safeDrain</code>, <code>claimPending</code>, <code>settle</code>, <code>markDelivered</code>, <code>formatSignalMessage</code>, <code>countPending</code>, <code>countOrphaned</code>, <code>refreshJobs</code>, <code>sweepClaimed</code>, <code>sweepOrphaned</code>.</td></tr>
+    <tr><th>What it hides</th><td>The rename-as-claim protocol, the inbox cursor, duplicate-signal handling, ledger replay, quarantine, permission answering, and the jobs-cache signature. This is real depth; the method count is the friction.</td></tr>
+    <tr><th>Callers must know</th><td>That <code>settle</code> is public because the onStop path claims and settles outside <code>drain</code>; that <code>countPending</code> claims then holds; that <code>refreshJobs</code> runs hooks before the status line. Three ordering contracts spread over eleven methods.</td></tr>
+    <tr><th>Deletion test</th><td>Deleting <code>createDelivery</code> would re-spread the claim protocol into the entry and the onStop handler; it earns its keep. Deepening would split <code>claim/settle/count</code> from <code>format/drain/refresh</code>, but the atomic invariant spans both. Names that leave the caller: <code>claimPending</code>, <code>settle</code>, <code>markDelivered</code>, <code>countPending</code>, <code>countOrphaned</code>, <code>sweepClaimed</code>, <code>sweepOrphaned</code> (7) become one claim facade. <b>Rejected for now:</b> the risk is losing a signal, and smoke covers the happy path better than the races.</td></tr>
+  </table>
+  <ul class="wins">
+    <li>interface 11 → 6</li>
+    <li>deps 25 → 5 + rest</li>
+    <li>claim invariant named</li>
+  </ul>
+</article>
+
+<!-- 7 -->
+<article class="card" id="c7">
+  <h3>7 · Extract the task pane</h3>
+  <div class="meta"><span class="badge b-spec">Speculative</span><span class="badge b-reject">reject</span></div>
+  <p class="files"><b>index.ts</b> 2263–2431 (dashboard), 2255–2261 (selection state)</p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — UI state in the composition root</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Five pane closures and four state variables inside the entry">
+        <rect class="mod" x="18" y="20" width="434" height="190" rx="8"/>
+        <text class="boxhead" x="34" y="42">ENTRY</text>
+        <g class="t">
+          <text x="40" y="78">visibleTaskRows</text><text x="40" y="104">selectedTask</text>
+          <text x="40" y="130">selectTask</text><text x="40" y="156">dismissOrStopTask</text>
+          <text x="40" y="182">backgroundForegroundTask</text>
+        </g>
+        <g class="t small" fill="#68707d">
+          <text x="280" y="78">selectedTaskId</text><text x="280" y="104">agentViewOpen</text>
+          <text x="280" y="130">panelNotice</text><text x="280" y="156">dismissedTasks</text>
+          <text x="280" y="182">backgroundedForegrounds</text>
+        </g>
+        <text class="t red" x="34" y="228">170 lines of rendering + selection in the composition root</text>
+      </svg>
+      <p class="note">The entry knows node shapes, hotkeys, and selection semantics.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — a pane module</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="A pane module with a register method">
+        <rect class="mod" x="70" y="40" width="330" height="120" rx="8" stroke="#9aa1aa"/>
+        <text class="boxhead" x="86" y="62">TASK PANE · UI LEAF</text>
+        <text class="t" x="86" y="86">register()</text>
+        <text class="t small" x="86" y="104">render · select · dismiss · background</text>
+        <text class="t small" x="86" y="120">reads a job list, calls cancel/output</text>
+        <text class="t small" x="86" y="140">no identity, no delivery, no plan</text>
+        <text class="t grey" x="70" y="196">capability preserved</text>
+        <text class="t grey" x="70" y="214">but no caller stops knowing anything important</text>
+        <text class="t grey" x="70" y="232">it moves UI code; it does not deepen a seam</text>
+      </svg>
+      <p class="note">A clean extraction, but not a deepening: nothing conceptual concentrates.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>The composition root holds five pane closures and five UI state variables that no other module reads.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td>None; the pane is registered inline with <code>cmd.ui.pane({id: 'jobs', render})</code>, and its helpers are entry-local.</td></tr>
+    <tr><th>What it hides</th><td>The host's node shape, hotkey wiring, and a 4,000-character truncation. It hides UI detail, not domain rules.</td></tr>
+    <tr><th>Callers must know</th><td>Selection is by id, not index; a terminal row dismisses instead of cancels; Ctrl+B mutates the newest foreground record. The entry knows all of it because the pane lives there.</td></tr>
+    <tr><th>Deletion test</th><td>Extract <code>createTaskPane</code> and the names <code>visibleTaskRows</code>, <code>selectedTask</code>, <code>selectTask</code>, <code>dismissOrStopTask</code>, <code>backgroundForegroundTask</code> (5) plus five state variables leave the entry. But delete the new module and the same UI code simply reappears in the entry: no complexity is concentrated, because there was no shared rule to concentrate. <b>Reject.</b></td></tr>
+  </table>
+  <ul class="wins">
+    <li>entry shrinks, nothing deepens</li>
+  </ul>
+</article>
+
+<!-- 8 -->
+<article class="card" id="c8">
+  <h3>8 · Trim the re-export surface</h3>
+  <div class="meta"><span class="badge b-spec">Speculative</span><span class="badge b-reject">deletion, not deepening</span></div>
+  <p class="files"><b>index.ts</b> 140–276 · readers: <b>test/smoke.mjs</b>, <b>test/e2e.mjs</b>, <b>test/harness.mjs</b>, <b>test/bundle.mjs</b></p>
+
+  <div class="diagram">
+    <div class="panel">
+      <p class="cap">Before — 153 names, 3 readers</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="153 re-exported names fanning out to test files, with a large unused segment">
+        <rect class="mod" x="18" y="24" width="150" height="150" rx="7"/>
+        <text class="boxhead" x="32" y="46">ENTRY RE-EXPORTS</text>
+        <text class="t" x="32" y="70">153 names</text>
+        <text class="t small" x="32" y="88">76 values</text>
+        <text class="t small" x="32" y="106">77 types</text>
+        <rect x="32" y="124" width="118" height="12" fill="#d9d4c8"/>
+        <rect x="32" y="124" width="43" height="12" fill="#0f766e"/>
+        <text class="t small" x="32" y="152">56 read · 97 no reader</text>
+
+        <rect class="mod" x="300" y="36" width="150" height="32" rx="5"/>
+        <text class="t" x="312" y="56">smoke.mjs · 53</text>
+        <rect class="mod" x="300" y="82" width="150" height="32" rx="5"/>
+        <text class="t" x="312" y="102">e2e.mjs · 2</text>
+        <rect class="mod" x="300" y="128" width="150" height="32" rx="5"/>
+        <text class="t" x="312" y="148">harness.mjs · 1</text>
+        <g class="flow">
+          <path d="M168 60 L298 52"/><path d="M168 72 L298 98"/><path d="M168 84 L298 144"/>
+        </g>
+        <text class="t red" x="18" y="210">24 of the 76 value exports have no reader in any test</text>
+        <text class="t small" x="18" y="228">moveTaskSelection · taskPanelRows · tasksHintVisible</text>
+        <text class="t small" x="18" y="244">canonicalPermissionMode · resolvePermissionMode · …</text>
+      </svg>
+      <p class="note">The bundle advertises a public surface only four files use.</p>
+    </div>
+    <div class="panel">
+      <p class="cap">After — export what is read</p>
+      <svg viewBox="0 0 470 264" role="img" aria-label="Trimmed surface with 56 used names">
+        <rect class="deep" x="40" y="34" width="240" height="120" rx="8"/>
+        <text class="boxhead" x="56" y="56" style="fill:#8fa3ba">PUBLIC SURFACE</text>
+        <text class="t inv" x="56" y="80">56 names the readers use</text>
+        <text class="t inv small" x="56" y="100">+ the types those signatures name</text>
+        <text class="t inv small" x="56" y="118">everything else stays internal</text>
+        <text class="t inv small" x="56" y="140">no behaviour change</text>
+        <rect class="mod" x="316" y="52" width="120" height="84" rx="6"/>
+        <text class="t" x="330" y="74">test/</text>
+        <text class="t small" x="330" y="92">smoke · e2e</text>
+        <text class="t small" x="330" y="108">harness · bundle</text>
+        <path class="flow" d="M280 94 L314 94"/>
+        <text class="t grey" x="40" y="196">delete 24 value exports and 41 orphan types</text>
+        <text class="t grey" x="40" y="214">nothing reappears: no caller crosses that seam</text>
+        <text class="t grey" x="40" y="232">a pass-through surface, not a module</text>
+      </svg>
+      <p class="note">The deletion test says pass-through: removing it concentrates nothing.</p>
+    </div>
+  </div>
+
+  <p class="problem"><b>Problem</b>153 names are re-exported from the entry; four test files read 56, and 24 value exports have no reader at all.</p>
+  <table class="facts">
+    <tr><th>Interface today</th><td>One <code>export … from</code> block per module across <code>index.ts:140–276</code>: 153 unique names, 76 values and 77 types.</td></tr>
+    <tr><th>What it hides</th><td>Nothing. It is a pass-through of each module's surface.</td></tr>
+    <tr><th>Callers must know</th><td>Which name is public and which is internal. The host imports only the default export; tests import from the bundle. The re-export list is a de facto API with no version contract.</td></tr>
+    <tr><th>Deletion test</th><td>Delete the 24 unread value exports (<code>moveTaskSelection</code>, <code>taskPanelRows</code>, <code>tasksHintVisible</code>, <code>PERMISSION_MODE_LIST</code>, <code>canonicalPermissionMode</code>, <code>resolvePermissionMode</code>, <code>resolveTeamPolicy</code>, <code>reportText</code>, <code>gitStatusSnapshot</code>, <code>skillFileFor</code>, <code>listAgentsVisible</code>, <code>worktreeChanged</code>, <code>resolveAppendSystemPrompt</code>, <code>BACKGROUND_BUILTIN_TOOLS</code>, <code>EFFORT_LEVELS</code>, <code>SUBAGENT_TOOL_UNIVERSE</code>, <code>UNIVERSAL_TOOL_REMOVALS</code>, <code>toolNameOfSpecifier</code>, <code>AGENT_SCOPES</code>, <code>DESCRIPTION_LIMIT_TOKENS</code>, <code>parseCacheTtl</code>, <code>parseHooks</code>, <code>parseMcpServers</code>, <code>TEAM_TOOL_NAMES</code>). Nothing reappears in a caller: no one crossed that seam. <b>This is a trim, not a deepening.</b></td></tr>
+  </table>
+  <ul class="wins">
+    <li>24 dead values deleted</li>
+    <li>a truthful public surface</li>
+    <li>no behaviour change</li>
+  </ul>
+  <div class="callout">Worth doing as cleanup after the structural change, not as the architecture target: it removes a false interface but creates no new locality or leverage.</div>
+</article>
+
+<h2 id="considered">Considered, not proposed</h2>
+<p class="section-note">Places that look like candidates by size but do not pass the deletion test.</p>
+<table class="summary smalltable">
+  <tbody>
+    <tr><td>definitions.ts</td><td><b>Keep whole.</b> 1,221 lines, but the interface is one registry plus a handful of parsers; the YAML parser, builtins, and scope scan are one coherent implementation. Splitting would move declarations without concentrating a rule. The one real leak it feeds — <code>PlanAgent</code> restating <code>AgentDefinition</code> — is candidate 1.</td></tr>
+    <tr><td>spawn.ts</td><td><b>Keep the launcher, narrow the spec.</b> A 34-field <code>SpawnContext</code> is wide, but it is the worker launcher's genuine dependency set. The duplicated 52-field <code>WorkerSpecInput</code> is candidate 1; do not split <code>fire</code> separately.</td></tr>
+    <tr><td>startup.ts</td><td><b>Keep.</b> Eight exported functions for one consumer look wide, but each is a pure reader over an injected fs and the bundle is one implementation. Deleting the module would spread five filesystem walks across the entry.</td></tr>
+    <tr><td>index.ts:1441–3057</td><td><b>Not one target.</b> The entry body holds owner (candidate 4), live (candidate 5), and pane (candidate 7) groups; the rest is flags, hooks, commands, and lifecycle wiring. Treat it as a composition root, not a module to deepen wholesale.</td></tr>
+  </tbody>
+</table>
+
+<section id="top-recommendation">
+  <div class="topcard">
+    <h2>Top recommendation: One launch shape</h2>
+    <p><a href="#c1">Candidate 1</a> is the only target that deletes a type layer rather than narrowing one context. <code>JobPlan</code> (35 fields), <code>WorkerSpecInput</code> (52), and <code>JobRecord</code> (65) are three declarations of the same launch; <code>recordFromPlan</code> and 35 spreads in <code>fire</code> exist only to copy names between them. The precedence table in <code>planFromInput</code> is the real behaviour and stays untouched.</p>
+    <p>It beats the tool-surface candidate on risk: no concurrency, no process boundary, no string literal. The typechecker and 137 smoke checks cover every path it changes. It beats the worker/record seam on verifiability: that seam is deeper, but its only real test is e2e, outside CI. It beats owner identity, live roster, and the pane on capability preserved: those move 5–170 lines, while this removes a whole shape from every future agent option.</p>
+    <div class="why">
+      <div><b>Capability</b>Every spawn, resume, and send option survives; only the declaration count changes.</div>
+      <div><b>Risk</b>Medium-low: pure types plus two mechanical mappings, gated by tsc and smoke.</div>
+      <div><b>First move</b>Delete <code>WorkerSpecInput</code> and <code>recordFromPlan</code>; let <code>fire</code> add identity to the intent and derive the spec.</div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  Read-only scan · no source edited · revision 4 · reports/architecture-2026-10-26.html
+</footer>
+
+</main>
+</body>
+</html>
