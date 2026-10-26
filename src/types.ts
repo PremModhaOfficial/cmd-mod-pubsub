@@ -96,6 +96,25 @@ export interface PermissionRequest {
 	readonly options: PermissionRequestOption[];
 }
 
+// ---------------------------------------------------------------------------
+// The launch values
+//
+// The leaf shapes the one launch type and the durable record both name, declared
+// here so neither has to borrow a field type from the other.
+// ---------------------------------------------------------------------------
+
+/** One MCP server scoped to a launch. */
+export interface LaunchMcpServer {
+	name: string;
+	command?: string;
+	args?: string[];
+	env?: Record<string, string>;
+	url?: string;
+}
+
+/** The prompt-cache lifetime a launch may ask for. */
+export type LaunchCacheTtl = '5m' | '1h';
+
 export interface JobIdentity {
 	id: string;
 	/** The durable resume handle. Absent for a one-shot agent (Explore, Plan). */
