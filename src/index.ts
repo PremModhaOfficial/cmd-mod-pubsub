@@ -76,7 +76,6 @@ import {
 	LOST_GRACE_MS,
 	MANAGED_SETTINGS_DEFAULT,
 	MOD_PATH,
-	OUTPUT_MAX_CHARS_DEFAULT,
 	OWNER_TYPE,
 	OWNER_TYPE_LEGACY,
 	PANE_ROWS_MAX,
@@ -87,7 +86,6 @@ import {
 	RETENTION_SWEEP_INTERVAL_MS,
 	ROSTER_MAIN,
 	SUBAGENT_DIR_DEFAULT,
-	TASK_ROW_GRACE_MS,
 	TEAM_TOOL_NAMES,
 	WORKER_SPEC_ENV,
 } from './constants.ts';
@@ -148,10 +146,19 @@ import {recordFromPlan, sessionNameOf} from './plan.ts';
 import {createTools} from './tools.ts';
 import type {PlanContext} from './plan.ts';
 import {answerPendingPermission as answerPermission, failJob, fire} from './spawn.ts';
-import type {ForegroundResult, PermissionContext, SpawnContext, WorkerSpec} from './spawn.ts';
+import type {PermissionContext, SpawnContext, WorkerSpec} from './spawn.ts';
+import {mentionCandidates, moveTaskSelection, taskPanelRows, tasksHintVisible} from './panel.ts';
+import {foregroundOutcome} from './foreground.ts';
+import {reportText, scanOutput} from './output.ts';
 
 export {buildArgs, buildSpec, resolveMaxConcurrent, resolveMaxDepth, workerEnv} from './spawn.ts';
 export type {ForegroundResult, LimitEnv, WorkerSpec, WorkerSpecInput} from './spawn.ts';
+export {mentionCandidates, moveTaskSelection, taskPanelRows, taskRowVisible, tasksHintVisible} from './panel.ts';
+export type {TaskRowLike, TaskRowOptions} from './panel.ts';
+export {foregroundOutcome, hasAgentOutput} from './foreground.ts';
+export type {ForegroundJob} from './foreground.ts';
+export {reportText, scanOutput} from './output.ts';
+export type {ScanResult} from './output.ts';
 
 export type {
 	ChildHandle,
@@ -239,58 +246,6 @@ export {AGENT_API_ERROR, TEAM_TOOL_NAMES};
 // worker and the parent run one rule table (the same contract as signalEnvelope).
 // ---------------------------------------------------------------------------
 
-export interface ScanResult {
-	readonly text: string;
-	readonly matches: string[];
-	readonly marked: boolean;
-}
-
-export function scanOutput(text: string): ScanResult {
-	// Inline the marker and the rule names: this body is embedded in WORKER_SOURCE,
-	// so it cannot read module constants.
-	const marker = '[harness: subagent output matched instruction-shaped pattern(s): ';
-	const settings = [
-		['bypassPermissions', 'bypassPermissions permission setting'],
-		['--dangerously-skip-permissions', '--dangerously-skip-permissions permission setting'],
-	];
-	const matches: string[] = [];
-	let marked = false;
-	let out = String(text ?? '');
-	// A tag imitation is escaped, never removed: the text stays readable and can no
-	// longer be mistaken for host output.
-	out = out.replace(/<\/?system-reminder\b[^>]*>/gi, match => {
-		if (!matches.includes('system-reminder tag')) matches.push('system-reminder tag');
-		marked = true;
-		return '\\' + match;
-	});
-	// A role label only counts at the start of a line, after indentation.
-	out = out.replace(/^([ \t]*)(Human|Assistant):/gm, (_match, space: string, label: string) => {
-		const name = label + ': role label';
-		if (!matches.includes(name)) matches.push(name);
-		return space + '\\' + label + ':';
-	});
-	// A permission-setting mention is reported, not rewritten: rewriting a flag
-	// would hide what the subagent actually said.
-	for (const [needle, name] of settings) {
-		if (out.includes(needle) && !matches.includes(name)) {
-			matches.push(name);
-			marked = true;
-		}
-	}
-	if (marked) out = marker + matches.join(', ') + ']\n' + out;
-	return {text: out, matches, marked};
-}
-
-// The report the parent reads: the worker's own progress lines (`[tool] ...`) are
-// not part of it. They stay in the log for the task view; a tool call is never a
-// result the parent is asked to act on. Shell output is returned as written.
-export function reportText(text: string, kind: string): string {
-	const visible =
-		kind === 'agent'
-			? text.split('\n').filter(line => !/^\[tool[ \]]/.test(line)).join('\n')
-			: text;
-	return scanOutput(visible).text;
-}
 
 // The detached worker. Kept inline so the mod is one file with nothing to install.
 // The spec arrives in the environment: no shell interpolation, so a prompt or command
@@ -2512,146 +2467,6 @@ export function resolveTeamPolicy(input: TeamPolicyInput): TeamPolicy {
 	return {ok: true, background: false};
 }
 
-export interface ForegroundJob {
-	readonly state?: unknown;
-	readonly failureReason?: unknown;
-	readonly description?: unknown;
-	readonly id?: unknown;
-	readonly kind?: unknown;
-	/** A maxTurns or max_tokens stop: the result is partial and resumable. */
-	readonly partial?: unknown;
-}
-
-// A line that is only worker plumbing is not agent output. "Produced nothing, or
-// only tool calls" is decided here, once, for both the partial and the empty path.
-const PLUMBING_LINE = /^\s*\[(tool|permission|acp)\b/;
-
-export function hasAgentOutput(log: string): boolean {
-	for (const line of log.split('\n')) {
-		if (line.trim().length === 0) continue;
-		if (PLUMBING_LINE.test(line)) continue;
-		return true;
-	}
-	return false;
-}
-
-// The foreground result is the job's own result, shaped for a tool call: success
-// returns the output, a cut-off returns the partial output plus a note, and any
-// other failure returns the reason. Nothing is invented and nothing is dropped.
-export function foregroundOutcome(job: ForegroundJob, log: string): ForegroundResult {
-	const state = canonicalState(job.state);
-	const label = String(job.description ?? job.id ?? 'subagent');
-	const full = reportText(log, String(job.kind ?? 'agent')).trim();
-	// The tool result is the model's context, so the inline result is bounded like
-	// every other read. The full log stays at the job's log path.
-	const text = full.length > OUTPUT_MAX_CHARS_DEFAULT ? `…${full.slice(-OUTPUT_MAX_CHARS_DEFAULT)}` : full;
-	if (state === 'done') {
-		return {ok: true, partial: false, text: text.length > 0 ? text : `${label} finished with no output.`};
-	}
-	if (state === 'waiting-input') {
-		const followUp =
-			String(job.kind ?? 'agent') === 'command'
-				? `inspect it with subagent_output ${String(job.id)}`
-				: `resume it with subagent_resume ${String(job.id)}`;
-		return {
-			ok: true,
-			partial: true,
-			text: `${text.length > 0 ? `${text}\n\n` : ''}${label} stopped with a question; ${followUp}.`,
-		};
-	}
-	const reason =
-		typeof job.failureReason === 'string' && job.failureReason.length > 0 ? job.failureReason : `${label} ${state}`;
-	if (state === 'failed' && job.partial === true && hasAgentOutput(log)) {
-		// A maxTurns stop is a partial success: the text is the result, and the job
-		// keeps its agent id so a resume can continue it.
-		return {ok: true, partial: true, text: `${text}\n\n[partial: ${reason}]`};
-	}
-	if (state === 'failed' && reason.startsWith(AGENT_API_ERROR) && hasAgentOutput(log)) {
-		return {ok: true, partial: true, text: `${text}\n\n[cut off: ${reason}]`};
-	}
-	return {ok: false, error: reason};
-}
-
-// ---------------------------------------------------------------------------
-// Task rows and the agent panel
-//
-// A row is a job shaped for the task list. Success disappears immediately (the
-// result is already in the feed); failure and stop stay for 30 seconds so the
-// user can read why, and `x` clears one early. Everything here is pure so the
-// lifecycle is asserted without a timer.
-// ---------------------------------------------------------------------------
-
-export interface TaskRowLike {
-	readonly id?: unknown;
-	readonly state?: unknown;
-	readonly startedAt?: unknown;
-	readonly finishedAt?: unknown;
-}
-
-export interface TaskRowOptions {
-	readonly now: number;
-	/** Ids the user dismissed with `x`. */
-	readonly dismissed?: ReadonlySet<string>;
-}
-
-export function taskRowVisible(job: TaskRowLike, options: TaskRowOptions): boolean {
-	const id = String(job.id ?? '');
-	if (id.length > 0 && options.dismissed?.has(id) === true) return false;
-	const state = canonicalState(job.state);
-	if (state === 'done') return false;
-	if (state === 'failed' || state === 'canceled') {
-		const finishedAt = typeof job.finishedAt === 'number' ? job.finishedAt : undefined;
-		if (finishedAt === undefined) return true;
-		return options.now - finishedAt <= TASK_ROW_GRACE_MS;
-	}
-	return true;
-}
-
-export function taskPanelRows<T extends TaskRowLike>(jobs: readonly T[], options: TaskRowOptions): T[] {
-	return jobs.filter(job => taskRowVisible(job, options));
-}
-
-// Move the selection through the visible rows. With no selection, forward starts
-// at the first row and backward at the last; the ends clamp instead of wrapping, so
-// a held key cannot spin the selection.
-export function moveTaskSelection(rows: readonly TaskRowLike[], selectedId: string | undefined, delta: number): string | undefined {
-	if (rows.length === 0) return undefined;
-	const current = rows.findIndex(row => String(row.id ?? '') === selectedId);
-	if (current === -1) return String((delta < 0 ? rows[rows.length - 1] : rows[0])?.id ?? '');
-	const next = Math.min(rows.length - 1, Math.max(0, current + (delta < 0 ? -1 : 1)));
-	return String(rows[next]?.id ?? '');
-}
-
-// The @mention typeahead is a name list, not a spawn: every valid custom,
-// built-in, and plugin-scoped definition, plus every named agent in this session.
-// Sorted and de-duplicated so the list reads the same on every open.
-export function mentionCandidates(
-	definitions: readonly {readonly name?: string; readonly valid?: boolean}[],
-	namedAgents: readonly string[] = [],
-): string[] {
-	const names = new Set<string>();
-	for (const definition of definitions) {
-		const name = String(definition.name ?? '').trim();
-		if (name.length > 0 && definition.valid !== false) names.add(name);
-	}
-	for (const agent of namedAgents) {
-		const name = String(agent ?? '').trim();
-		if (name.length > 0) names.add(name);
-	}
-	return [...names].sort();
-}
-
-// The footer keeps a `/tasks` hint for the same 30 seconds a failed row stays (and
-// a moment after a success), so a vanished success is still discoverable.
-export function tasksHintVisible(jobs: readonly TaskRowLike[], now: number): boolean {
-	return jobs.some(job => {
-		const state = canonicalState(job.state);
-		const finishedAt = typeof job.finishedAt === 'number' ? job.finishedAt : undefined;
-		if (finishedAt === undefined) return false;
-		if (!isTerminalState(state)) return false;
-		return now - finishedAt <= TASK_ROW_GRACE_MS;
-	});
-}
 
 export default function (cmd: ModApi, overrides: RuntimeOverrides = {}): void {
 	const runtime = osRuntime(overrides);

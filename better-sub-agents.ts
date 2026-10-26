@@ -3532,7 +3532,57 @@ The reply arrives here as its own signal.`
 }
 __name(createTools, "createTools");
 
-// src/index.ts
+// src/panel.ts
+function taskRowVisible(job, options) {
+  const id = String(job.id ?? "");
+  if (id.length > 0 && options.dismissed?.has(id) === true) return false;
+  const state = canonicalState(job.state);
+  if (state === "done") return false;
+  if (state === "failed" || state === "canceled") {
+    const finishedAt = typeof job.finishedAt === "number" ? job.finishedAt : void 0;
+    if (finishedAt === void 0) return true;
+    return options.now - finishedAt <= TASK_ROW_GRACE_MS;
+  }
+  return true;
+}
+__name(taskRowVisible, "taskRowVisible");
+function taskPanelRows(jobs, options) {
+  return jobs.filter((job) => taskRowVisible(job, options));
+}
+__name(taskPanelRows, "taskPanelRows");
+function moveTaskSelection(rows, selectedId, delta) {
+  if (rows.length === 0) return void 0;
+  const current = rows.findIndex((row) => String(row.id ?? "") === selectedId);
+  if (current === -1) return String((delta < 0 ? rows[rows.length - 1] : rows[0])?.id ?? "");
+  const next = Math.min(rows.length - 1, Math.max(0, current + (delta < 0 ? -1 : 1)));
+  return String(rows[next]?.id ?? "");
+}
+__name(moveTaskSelection, "moveTaskSelection");
+function mentionCandidates(definitions, namedAgents = []) {
+  const names = /* @__PURE__ */ new Set();
+  for (const definition of definitions) {
+    const name = String(definition.name ?? "").trim();
+    if (name.length > 0 && definition.valid !== false) names.add(name);
+  }
+  for (const agent of namedAgents) {
+    const name = String(agent ?? "").trim();
+    if (name.length > 0) names.add(name);
+  }
+  return [...names].sort();
+}
+__name(mentionCandidates, "mentionCandidates");
+function tasksHintVisible(jobs, now) {
+  return jobs.some((job) => {
+    const state = canonicalState(job.state);
+    const finishedAt = typeof job.finishedAt === "number" ? job.finishedAt : void 0;
+    if (finishedAt === void 0) return false;
+    if (!isTerminalState(state)) return false;
+    return now - finishedAt <= TASK_ROW_GRACE_MS;
+  });
+}
+__name(tasksHintVisible, "tasksHintVisible");
+
+// src/output.ts
 function scanOutput(text) {
   const marker = "[harness: subagent output matched instruction-shaped pattern(s): ";
   const settings = [
@@ -3567,6 +3617,52 @@ function reportText(text, kind) {
   return scanOutput(visible).text;
 }
 __name(reportText, "reportText");
+
+// src/foreground.ts
+var PLUMBING_LINE = /^\s*\[(tool|permission|acp)\b/;
+function hasAgentOutput(log) {
+  for (const line of log.split("\n")) {
+    if (line.trim().length === 0) continue;
+    if (PLUMBING_LINE.test(line)) continue;
+    return true;
+  }
+  return false;
+}
+__name(hasAgentOutput, "hasAgentOutput");
+function foregroundOutcome(job, log) {
+  const state = canonicalState(job.state);
+  const label = String(job.description ?? job.id ?? "subagent");
+  const full = reportText(log, String(job.kind ?? "agent")).trim();
+  const text = full.length > OUTPUT_MAX_CHARS_DEFAULT ? `\u2026${full.slice(-OUTPUT_MAX_CHARS_DEFAULT)}` : full;
+  if (state === "done") {
+    return { ok: true, partial: false, text: text.length > 0 ? text : `${label} finished with no output.` };
+  }
+  if (state === "waiting-input") {
+    const followUp = String(job.kind ?? "agent") === "command" ? `inspect it with subagent_output ${String(job.id)}` : `resume it with subagent_resume ${String(job.id)}`;
+    return {
+      ok: true,
+      partial: true,
+      text: `${text.length > 0 ? `${text}
+
+` : ""}${label} stopped with a question; ${followUp}.`
+    };
+  }
+  const reason = typeof job.failureReason === "string" && job.failureReason.length > 0 ? job.failureReason : `${label} ${state}`;
+  if (state === "failed" && job.partial === true && hasAgentOutput(log)) {
+    return { ok: true, partial: true, text: `${text}
+
+[partial: ${reason}]` };
+  }
+  if (state === "failed" && reason.startsWith(AGENT_API_ERROR) && hasAgentOutput(log)) {
+    return { ok: true, partial: true, text: `${text}
+
+[cut off: ${reason}]` };
+  }
+  return { ok: false, error: reason };
+}
+__name(foregroundOutcome, "foregroundOutcome");
+
+// src/index.ts
 var WORKER_SOURCE = `
 const {spawn} = require('node:child_process');
 const fs = require('node:fs');
@@ -5386,96 +5482,6 @@ function resolveTeamPolicy(input) {
   return { ok: true, background: false };
 }
 __name(resolveTeamPolicy, "resolveTeamPolicy");
-var PLUMBING_LINE = /^\s*\[(tool|permission|acp)\b/;
-function hasAgentOutput(log) {
-  for (const line of log.split("\n")) {
-    if (line.trim().length === 0) continue;
-    if (PLUMBING_LINE.test(line)) continue;
-    return true;
-  }
-  return false;
-}
-__name(hasAgentOutput, "hasAgentOutput");
-function foregroundOutcome(job, log) {
-  const state = canonicalState(job.state);
-  const label = String(job.description ?? job.id ?? "subagent");
-  const full = reportText(log, String(job.kind ?? "agent")).trim();
-  const text = full.length > OUTPUT_MAX_CHARS_DEFAULT ? `\u2026${full.slice(-OUTPUT_MAX_CHARS_DEFAULT)}` : full;
-  if (state === "done") {
-    return { ok: true, partial: false, text: text.length > 0 ? text : `${label} finished with no output.` };
-  }
-  if (state === "waiting-input") {
-    const followUp = String(job.kind ?? "agent") === "command" ? `inspect it with subagent_output ${String(job.id)}` : `resume it with subagent_resume ${String(job.id)}`;
-    return {
-      ok: true,
-      partial: true,
-      text: `${text.length > 0 ? `${text}
-
-` : ""}${label} stopped with a question; ${followUp}.`
-    };
-  }
-  const reason = typeof job.failureReason === "string" && job.failureReason.length > 0 ? job.failureReason : `${label} ${state}`;
-  if (state === "failed" && job.partial === true && hasAgentOutput(log)) {
-    return { ok: true, partial: true, text: `${text}
-
-[partial: ${reason}]` };
-  }
-  if (state === "failed" && reason.startsWith(AGENT_API_ERROR) && hasAgentOutput(log)) {
-    return { ok: true, partial: true, text: `${text}
-
-[cut off: ${reason}]` };
-  }
-  return { ok: false, error: reason };
-}
-__name(foregroundOutcome, "foregroundOutcome");
-function taskRowVisible(job, options) {
-  const id = String(job.id ?? "");
-  if (id.length > 0 && options.dismissed?.has(id) === true) return false;
-  const state = canonicalState(job.state);
-  if (state === "done") return false;
-  if (state === "failed" || state === "canceled") {
-    const finishedAt = typeof job.finishedAt === "number" ? job.finishedAt : void 0;
-    if (finishedAt === void 0) return true;
-    return options.now - finishedAt <= TASK_ROW_GRACE_MS;
-  }
-  return true;
-}
-__name(taskRowVisible, "taskRowVisible");
-function taskPanelRows(jobs, options) {
-  return jobs.filter((job) => taskRowVisible(job, options));
-}
-__name(taskPanelRows, "taskPanelRows");
-function moveTaskSelection(rows, selectedId, delta) {
-  if (rows.length === 0) return void 0;
-  const current = rows.findIndex((row) => String(row.id ?? "") === selectedId);
-  if (current === -1) return String((delta < 0 ? rows[rows.length - 1] : rows[0])?.id ?? "");
-  const next = Math.min(rows.length - 1, Math.max(0, current + (delta < 0 ? -1 : 1)));
-  return String(rows[next]?.id ?? "");
-}
-__name(moveTaskSelection, "moveTaskSelection");
-function mentionCandidates(definitions, namedAgents = []) {
-  const names = /* @__PURE__ */ new Set();
-  for (const definition of definitions) {
-    const name = String(definition.name ?? "").trim();
-    if (name.length > 0 && definition.valid !== false) names.add(name);
-  }
-  for (const agent of namedAgents) {
-    const name = String(agent ?? "").trim();
-    if (name.length > 0) names.add(name);
-  }
-  return [...names].sort();
-}
-__name(mentionCandidates, "mentionCandidates");
-function tasksHintVisible(jobs, now) {
-  return jobs.some((job) => {
-    const state = canonicalState(job.state);
-    const finishedAt = typeof job.finishedAt === "number" ? job.finishedAt : void 0;
-    if (finishedAt === void 0) return false;
-    if (!isTerminalState(state)) return false;
-    return now - finishedAt <= TASK_ROW_GRACE_MS;
-  });
-}
-__name(tasksHintVisible, "tasksHintVisible");
 function index_default(cmd, overrides = {}) {
   const runtime = osRuntime(overrides);
   const spool = runtime.fs;
