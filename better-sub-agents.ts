@@ -15,7 +15,7 @@ import {
   writeFileSync
 } from "node:fs";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname4, isAbsolute as isAbsolute2, join as join12, resolve as resolve2 } from "node:path";
+import { dirname as dirname4, isAbsolute as isAbsolute3, join as join13, resolve as resolve2 } from "node:path";
 
 // src/constants.ts
 import { homedir } from "node:os";
@@ -3670,6 +3670,109 @@ function resolveTeamPolicy(input) {
 }
 __name(resolveTeamPolicy, "resolveTeamPolicy");
 
+// src/mcp.ts
+import { isAbsolute as isAbsolute2, join as join12 } from "node:path";
+function mcpServerConfigs(fs, dirs) {
+  const configs = {};
+  for (const dir of dirs.slice(0, 4)) {
+    if (typeof dir !== "string" || dir.length === 0) continue;
+    try {
+      const parsed = JSON.parse(fs.readFile(join12(dir, ".commandcode", "mcp.json")));
+      for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
+        if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
+        if (config === null || typeof config !== "object") continue;
+        const command = stringField(config.command);
+        const url = stringField(config.url);
+        const args = listField(config.args);
+        const env = stringMapField(config.env);
+        configs[name] = {
+          ...command !== void 0 ? { command } : {},
+          ...args !== void 0 ? { args } : {},
+          ...env !== void 0 ? { env } : {},
+          ...url !== void 0 ? { url } : {}
+        };
+      }
+    } catch {
+    }
+  }
+  return configs;
+}
+__name(mcpServerConfigs, "mcpServerConfigs");
+function mcpServerNames(fs, dirs) {
+  return Object.keys(mcpServerConfigs(fs, dirs));
+}
+__name(mcpServerNames, "mcpServerNames");
+function agentFolderTrusted(definition, roots) {
+  if (definition.scope === "plugin") return false;
+  const path = definition.sourcePath;
+  if (path === void 0 || path.length === 0) return true;
+  const absolute = isAbsolute2(path) ? path : join12(roots.cwd, path);
+  const trustedRoots = [
+    roots.cwd,
+    roots.home,
+    roots.managedDir ?? managedSettingsHome(roots.home),
+    ...roots.addDirs ?? []
+  ];
+  return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
+}
+__name(agentFolderTrusted, "agentFolderTrusted");
+function resolveAgentMcpServers(input = {}) {
+  const env = input.env ?? {};
+  const defined = input.defined ?? [];
+  const dropped = [];
+  if (input.definition?.scope === "plugin") {
+    for (const spec of defined) dropped.push({ name: spec.name, reason: "plugin definitions ignore mcpServers" });
+    return { servers: [], dropped };
+  }
+  const policy = mcpPolicy(env);
+  if (policy.bare) {
+    for (const spec of defined) dropped.push({ name: spec.name, reason: "bare mode disables MCP" });
+    return { servers: [], dropped };
+  }
+  const strict = policy.strict;
+  const allow = policy.allow;
+  const deny = policy.deny;
+  const trusted = input.trusted !== false;
+  const servers = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const spec of defined) {
+    const name = spec.name.trim();
+    if (name.length === 0 || seen.has(name)) continue;
+    const inline = spec.command !== void 0 || spec.url !== void 0;
+    let resolved;
+    if (inline) {
+      if (!trusted) {
+        dropped.push({ name, reason: "inline server outside a trusted folder" });
+        continue;
+      }
+      if (strict) {
+        dropped.push({ name, reason: "strict MCP config ignores inline servers" });
+        continue;
+      }
+      resolved = { ...spec, name };
+    } else {
+      const config = input.configured?.[name];
+      if (config === void 0) {
+        dropped.push({ name, reason: "not configured" });
+        continue;
+      }
+      resolved = { name, ...config };
+    }
+    if (deny.includes("*") || deny.includes(name)) {
+      dropped.push({ name, reason: "denied by the MCP policy" });
+      continue;
+    }
+    if (allow.length > 0 && !allow.includes("*") && !allow.includes(name)) {
+      dropped.push({ name, reason: "not in the MCP allow policy" });
+      continue;
+    }
+    seen.add(name);
+    servers.push(resolved);
+  }
+  return { servers, dropped };
+}
+__name(resolveAgentMcpServers, "resolveAgentMcpServers");
+
 // src/output.ts
 function scanOutput(text) {
   const marker = "[harness: subagent output matched instruction-shaped pattern(s): ";
@@ -5084,11 +5187,11 @@ function subdirectoryClaudeMd(fs, cwd, paths) {
   const seen = /* @__PURE__ */ new Set();
   const files = [];
   for (const path of paths) {
-    const absolute = isAbsolute2(path) ? path : join12(cwd, path);
+    const absolute = isAbsolute3(path) ? path : join13(cwd, path);
     let dir = dirname4(absolute);
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       if (dir === cwd || dir === dirname4(dir) || !dir.startsWith(cwd)) break;
-      const filePath = join12(dir, "CLAUDE.md");
+      const filePath = join13(dir, "CLAUDE.md");
       if (seen.has(filePath)) break;
       seen.add(filePath);
       const file = startupFile(fs, filePath);
@@ -5116,13 +5219,13 @@ function claudeMdHierarchy(options) {
     const user = startupFile(fs, policy.user);
     if (user !== void 0) claudeMd.push(user);
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const project = startupFile(fs, join12(dir, "CLAUDE.md"));
+      const project = startupFile(fs, join13(dir, "CLAUDE.md"));
       if (project !== void 0) claudeMd.push(project);
-      const local = startupFile(fs, join12(dir, "CLAUDE.local.md"));
+      const local = startupFile(fs, join13(dir, "CLAUDE.local.md"));
       if (local !== void 0) claudeMd.push(local);
     }
     for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-      const agents = startupFile(fs, join12(dir, "AGENTS.md"));
+      const agents = startupFile(fs, join13(dir, "AGENTS.md"));
       if (agents !== void 0) agentsMd.push(agents);
     }
   }
@@ -5134,11 +5237,11 @@ function skillFileFor(name, options) {
   if (name.length === 0) return void 0;
   const candidates = [];
   for (const dir of projectDirsUpward(options.cwd, options.fs)) {
-    candidates.push(join12(dir, ".commandcode", "skills", name, "SKILL.md"));
-    candidates.push(join12(dir, ".claude", "skills", name, "SKILL.md"));
+    candidates.push(join13(dir, ".commandcode", "skills", name, "SKILL.md"));
+    candidates.push(join13(dir, ".claude", "skills", name, "SKILL.md"));
   }
-  candidates.push(join12(options.home, ".commandcode", "skills", name, "SKILL.md"));
-  candidates.push(join12(options.home, ".claude", "skills", name, "SKILL.md"));
+  candidates.push(join13(options.home, ".commandcode", "skills", name, "SKILL.md"));
+  candidates.push(join13(options.home, ".claude", "skills", name, "SKILL.md"));
   for (const candidate of candidates) {
     if (readStartupFile(options.fs, candidate) !== void 0) return candidate;
   }
@@ -5146,8 +5249,8 @@ function skillFileFor(name, options) {
 }
 __name(skillFileFor, "skillFileFor");
 function memoryDirFor(scope, name, options) {
-  const root = scope === "user" ? join12(options.home, ".commandcode", "agent-memory") : scope === "project" ? join12(options.cwd, ".commandcode", "agent-memory") : join12(options.cwd, ".commandcode", "agent-memory-local");
-  return join12(root, name);
+  const root = scope === "user" ? join13(options.home, ".commandcode", "agent-memory") : scope === "project" ? join13(options.cwd, ".commandcode", "agent-memory") : join13(options.cwd, ".commandcode", "agent-memory-local");
+  return join13(root, name);
 }
 __name(memoryDirFor, "memoryDirFor");
 function readMemoryIndex(path, fs) {
@@ -5184,7 +5287,7 @@ function startupMemory(options) {
     options.fs.mkdir(dir);
   } catch {
   }
-  const path = join12(dir, MEMORY_INDEX_FILE);
+  const path = join13(dir, MEMORY_INDEX_FILE);
   const index = readMemoryIndex(path, options.fs);
   return { scope, dir, path, content: index.content, lines: index.lines, truncated: index.truncated };
 }
@@ -5384,106 +5487,6 @@ function resolveLaunch(input = {}) {
   };
 }
 __name(resolveLaunch, "resolveLaunch");
-function mcpServerConfigs(fs, dirs) {
-  const configs = {};
-  for (const dir of dirs.slice(0, 4)) {
-    if (typeof dir !== "string" || dir.length === 0) continue;
-    try {
-      const parsed = JSON.parse(fs.readFile(join12(dir, ".commandcode", "mcp.json")));
-      for (const [name, config] of Object.entries(parsed?.mcpServers ?? {})) {
-        if (name.length === 0 || config?.enabled === false || Object.hasOwn(configs, name)) continue;
-        if (config === null || typeof config !== "object") continue;
-        const command = stringField(config.command);
-        const url = stringField(config.url);
-        const args = listField(config.args);
-        const env = stringMapField(config.env);
-        configs[name] = {
-          ...command !== void 0 ? { command } : {},
-          ...args !== void 0 ? { args } : {},
-          ...env !== void 0 ? { env } : {},
-          ...url !== void 0 ? { url } : {}
-        };
-      }
-    } catch {
-    }
-  }
-  return configs;
-}
-__name(mcpServerConfigs, "mcpServerConfigs");
-function mcpServerNames(fs, dirs) {
-  return Object.keys(mcpServerConfigs(fs, dirs));
-}
-__name(mcpServerNames, "mcpServerNames");
-function agentFolderTrusted(definition, roots) {
-  if (definition.scope === "plugin") return false;
-  const path = definition.sourcePath;
-  if (path === void 0 || path.length === 0) return true;
-  const absolute = isAbsolute2(path) ? path : join12(roots.cwd, path);
-  const trustedRoots = [
-    roots.cwd,
-    roots.home,
-    roots.managedDir ?? managedSettingsHome(roots.home),
-    ...roots.addDirs ?? []
-  ];
-  return trustedRoots.some((root) => root.length > 0 && isInside(root, absolute));
-}
-__name(agentFolderTrusted, "agentFolderTrusted");
-function resolveAgentMcpServers(input = {}) {
-  const env = input.env ?? {};
-  const defined = input.defined ?? [];
-  const dropped = [];
-  if (input.definition?.scope === "plugin") {
-    for (const spec of defined) dropped.push({ name: spec.name, reason: "plugin definitions ignore mcpServers" });
-    return { servers: [], dropped };
-  }
-  const policy = mcpPolicy(env);
-  if (policy.bare) {
-    for (const spec of defined) dropped.push({ name: spec.name, reason: "bare mode disables MCP" });
-    return { servers: [], dropped };
-  }
-  const strict = policy.strict;
-  const allow = policy.allow;
-  const deny = policy.deny;
-  const trusted = input.trusted !== false;
-  const servers = [];
-  const seen = /* @__PURE__ */ new Set();
-  for (const spec of defined) {
-    const name = spec.name.trim();
-    if (name.length === 0 || seen.has(name)) continue;
-    const inline = spec.command !== void 0 || spec.url !== void 0;
-    let resolved;
-    if (inline) {
-      if (!trusted) {
-        dropped.push({ name, reason: "inline server outside a trusted folder" });
-        continue;
-      }
-      if (strict) {
-        dropped.push({ name, reason: "strict MCP config ignores inline servers" });
-        continue;
-      }
-      resolved = { ...spec, name };
-    } else {
-      const config = input.configured?.[name];
-      if (config === void 0) {
-        dropped.push({ name, reason: "not configured" });
-        continue;
-      }
-      resolved = { name, ...config };
-    }
-    if (deny.includes("*") || deny.includes(name)) {
-      dropped.push({ name, reason: "denied by the MCP policy" });
-      continue;
-    }
-    if (allow.length > 0 && !allow.includes("*") && !allow.includes(name)) {
-      dropped.push({ name, reason: "not in the MCP allow policy" });
-      continue;
-    }
-    seen.add(name);
-    servers.push(resolved);
-  }
-  return { servers, dropped };
-}
-__name(resolveAgentMcpServers, "resolveAgentMcpServers");
 function index_default(cmd, overrides = {}) {
   const runtime = osRuntime(overrides);
   const spool = runtime.fs;
@@ -5566,15 +5569,15 @@ function index_default(cmd, overrides = {}) {
     flag: optionValue(cmd, FORK_MODE_FLAG)
   });
   const forkModeEnabled = forkMode === "on";
-  const inboxDir = join12(root, "inbox");
-  const claimedDir = join12(root, "claimed");
-  const orphanedDir = join12(root, "orphaned");
-  const logsDir = join12(root, "logs");
-  const jobsDir = join12(root, "jobs");
-  const transcriptsDir = join12(root, "transcripts");
-  const worktreesDir = join12(root, "worktrees");
-  const controlRoot = join12(root, "control");
-  const ledgerPath = join12(root, "delivered.jsonl");
+  const inboxDir = join13(root, "inbox");
+  const claimedDir = join13(root, "claimed");
+  const orphanedDir = join13(root, "orphaned");
+  const logsDir = join13(root, "logs");
+  const jobsDir = join13(root, "jobs");
+  const transcriptsDir = join13(root, "transcripts");
+  const worktreesDir = join13(root, "worktrees");
+  const controlRoot = join13(root, "control");
+  const ledgerPath = join13(root, "delivered.jsonl");
   for (const dir of [root, inboxDir, claimedDir, orphanedDir, logsDir, jobsDir, transcriptsDir, worktreesDir, controlRoot]) {
     spool.mkdir(dir);
   }
@@ -5597,7 +5600,7 @@ function index_default(cmd, overrides = {}) {
     cli: { value: optionValue(cmd, CLI_AGENTS_OPTION), interactive: runtime.interactive === true },
     log: /* @__PURE__ */ __name((message) => {
       try {
-        spool.appendFile(join12(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
+        spool.appendFile(join13(root, AGENT_LOG_FILE), `[${new Date(runtime.now()).toISOString()}] ${message}
 `);
       } catch {
       }
@@ -5701,13 +5704,13 @@ function index_default(cmd, overrides = {}) {
     let current = runtime.cwd;
     for (let depth = 0; depth < STARTUP_WALK_DEPTH_MAX; depth += 1) {
       try {
-        const parsed = JSON.parse(spool.readFile(join12(current, ".commandcode", "hooks.json")));
+        const parsed = JSON.parse(spool.readFile(join13(current, ".commandcode", "hooks.json")));
         const found = hookList(parsed?.[event]);
         if (found !== void 0) rules.push(...found);
       } catch {
       }
       try {
-        spool.stat(join12(current, ".git"));
+        spool.stat(join13(current, ".git"));
         break;
       } catch {
       }
@@ -5899,10 +5902,10 @@ function index_default(cmd, overrides = {}) {
   }
   __name(namedJob, "namedJob");
   function appendLive(id, from, message) {
-    const dir = join12(controlRoot, id);
+    const dir = join13(controlRoot, id);
     try {
       spool.mkdir(dir);
-      spool.appendFile(join12(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
+      spool.appendFile(join13(dir, "send.jsonl"), `${JSON.stringify({ from, message, at: runtime.now() })}
 `);
       return true;
     } catch {
@@ -5934,9 +5937,9 @@ function index_default(cmd, overrides = {}) {
   function enqueueSignal(message) {
     try {
       const stamp = `${runtime.now()}-${message.id}-${runtime.pid}-${Math.random().toString(36).slice(2, 6)}.json`;
-      const tmp = join12(inboxDir, `.tmp-${stamp}`);
+      const tmp = join13(inboxDir, `.tmp-${stamp}`);
       spool.writeFile(tmp, JSON.stringify(message, null, 2));
-      spool.rename(tmp, join12(inboxDir, stamp));
+      spool.rename(tmp, join13(inboxDir, stamp));
     } catch {
     }
   }
@@ -6061,8 +6064,8 @@ function index_default(cmd, overrides = {}) {
     if (state !== void 0 && isTerminal(state)) {
       if (!liveState(job).alive) return { ok: false, message: `subagent: job ${id} is already ${state}` };
       try {
-        spool.mkdir(join12(controlRoot, id));
-        spool.writeFile(join12(controlRoot, id, "cancel"), "1");
+        spool.mkdir(join13(controlRoot, id));
+        spool.writeFile(join13(controlRoot, id, "cancel"), "1");
       } catch {
       }
       killPid(job.pid, "SIGTERM");
@@ -6598,7 +6601,7 @@ ${sent.ok ? String(sent.content?.[0]?.text ?? "") : String(sent.error ?? "")}` }
     handler: /* @__PURE__ */ __name(({ args }) => {
       const wanted = String(args ?? "").trim();
       if (wanted.length === 0) return { message: "add-dir: usage: /add-dir <path>" };
-      const dir = isAbsolute2(wanted) ? wanted : join12(cmd.cwd, wanted);
+      const dir = isAbsolute3(wanted) ? wanted : join13(cmd.cwd, wanted);
       if (!addDirs.includes(dir)) addDirs.push(dir);
       registry.refresh();
       const loaded = registry.entries().filter((entry) => entry.scope === "project" && isInside(dir, entry.sourcePath));
