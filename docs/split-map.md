@@ -1,9 +1,9 @@
 # Module split map
 
 Where every declaration lives, and the seams that keep the split safe. The
-line counts below are the `wc -l` of the tree at `56b6418`: 19 files under
-`src/`, of which 18 are TypeScript modules and one (`src/harness.d.ts`) is an
-ambient declaration, with the entry at 4,184 lines. They are a reading aid, not
+line counts below are the `wc -l` of the tree at `11f2d28`: 29 files under
+`src/`, of which 28 are TypeScript modules and one (`src/harness.d.ts`) is an
+ambient declaration, with the entry at 3,057 lines. They are a reading aid, not
 an API — re-scan after a commit instead of trusting an offset.
 
 ## Artifact and build
@@ -26,61 +26,58 @@ an API — re-scan after a commit instead of trusting an offset.
 
 | File | Lines | Role | Imports from |
 |---|---|---|---|
-| `src/index.ts` | 4184 | Composition root: the worker string, the runtime adapter, the startup context, model/MCP/permission resolution, task rows, limits, and `activate` | every leaf below |
+| `src/index.ts` | 3057 | Composition root: the header, the re-exported public surface, `WORKER_SOURCE`, and `activate` | every module below |
 | `src/types.ts` | 151 | Runtime seam: `Runtime`, `SpoolFs`, `CommandResult`, `ChildHandle`, and the record shapes (`JobIdentity`, `Signal`, `JobPatch`, `PermissionRequest`, `CompactBoundary`) | — (leaf of the DAG) |
 | `src/constants.ts` | 142 | Bounds, env names, option names, default directories, `TEAM_TOOL_NAMES`, `MOD_PATH` | node:os, node:path, node:url |
-| `src/state.ts` | 109 | The six job states, aliases, transitions, markers, colors, `jobStates` | — |
-| `src/append.ts` | 73 | `resolveAppendSystemPrompt`, `resolveAutoCompactWindow` over injected `fs` | `./types.ts` (type-only) |
-| `src/signals.ts` | 114 | `signalOf`, `signalEnvelope`, `patchOf`, and the `Claim`/`Ownership`/`Settled` vocabulary | `./state.ts`, `./types.ts` (type-only) |
-| `src/jobs.ts` | 156 | `JobRecord`, `createJobStore`: read, write, and scan `jobs/*.json` over injected `fs` + dir | `./types.ts` (type-only) |
-| `src/ledger.ts` | 96 | `createLedger` / `ledgerFactory`: the replay guard and its compaction over injected `fs` | `./types.ts` (type-only) |
-| `src/delivery.ts` | 372 | `createDelivery`: claim/settle the inbox, deliver signals, refresh the jobs cache | `./constants.ts`, `./state.ts`; `./jobs.ts`, `./ledger.ts`, `./signals.ts`, `./types.ts` (type-only) |
+| `src/runtime.ts` | 103 | The OS runtime adapter: `osSpoolFs`, `OS_RUNTIME`, `osRuntime`, the production `Runtime` over the real filesystem and child processes | node:fs, node:child_process, node:os; `./types.ts` (type-only) |
+| `src/state.ts` | 114 | The six job states, aliases, transitions, markers, colors, `jobStates` | — |
+| `src/output.ts` | 58 | Output scanning: `ScanResult`, `scanOutput`, `reportText`; `scanOutput` is embedded in `WORKER_SOURCE`, so its body stays reference-free | — |
+| `src/append.ts` | 73 | `resolveAppendSystemPrompt`, `resolveAutoCompactWindow` over injected `fs` | node:path; `./types.ts` (type-only) |
+| `src/panel.ts` | 82 | Task rows and the agent panel: `taskPanelRows`, `taskRowVisible`, `moveTaskSelection`, `mentionCandidates`, `tasksHintVisible` | `./constants.ts`, `./state.ts` |
+| `src/signals.ts` | 119 | `signalOf`, `signalEnvelope`, `patchOf`, and the `Claim`/`Ownership`/`Settled` vocabulary | `./state.ts`; `./types.ts` (type-only) |
+| `src/jobs.ts` | 164 | `JobRecord`, `createJobStore`: read, write, and scan `jobs/*.json` over injected `fs` + dir | node:path; `./types.ts` (type-only) |
+| `src/ledger.ts` | 129 | `createLedger` / `ledgerFactory`: the replay guard and its compaction over injected `fs` | `./types.ts` (type-only) |
+| `src/delivery.ts` | 504 | `createDelivery`: claim/settle the inbox, deliver signals, refresh the jobs cache | node:path; `./constants.ts`, `./state.ts`; `./jobs.ts`, `./ledger.ts`, `./signals.ts`, `./types.ts` (type-only) |
 | `src/tool-filter.ts` | 265 | The tool universe, the removals, the aliases, `filterTools`, `workerToolAllowed` | `./constants.ts` |
-| `src/worktree.ts` | 313 | The git seam, worktree create/change/finalize, isolation roots, `guardToolCall` | `./types.ts` (type-only) |
-| `src/worktree-lifecycle.ts` | 296 | The shared TTL sweeper and the worktree keep/remove decision for a finished job | `./constants.ts`, `./state.ts`, `./worktree.ts`; `./jobs.ts`, `./types.ts` (type-only) |
-| `src/definitions.ts` | 1221 | Agent definitions: the YAML frontmatter parser, the field parsers, the built-ins, and the registry that resolves a name to a definition | `./constants.ts`; `./types.ts` (type-only) |
-| `src/plan.ts` | 615 | The job plan: one resolution for a new job and one reconstruction from a finished record | `./constants.ts`; `./jobs.ts`, `./types.ts` (type-only) |
-| `src/spawn.ts` | 559 | The worker spec and argv, the concurrency limits, `fire`, `failJob`, and the re-export of the permission bridge | `./constants.ts`, `./state.ts`, `./signals.ts`, `./worktree.ts`, `./permission.ts`; `./types.ts`, `./jobs.ts`, `./plan.ts` (type-only) |
-| `src/permission.ts` | 76 | The permission bridge: put the worker's question to the human and write the answer back | `./types.ts` (type-only) |
-| `src/config.ts` | 294 | The configuration readers: one reader per documented setting, over the env record and the host options | `./constants.ts` |
-| `src/tools.ts` | 706 | The tool surface: the `subagent_*` tools, their handlers, and the `outputText`/`sendToRecord` readers the entry's panel and commands also use | `./constants.ts`, `./config.ts`, `./definitions.ts`, `./plan.ts`, `./signals.ts`, `./spawn.ts`, `./state.ts`, `./worktree.ts`; `./jobs.ts`, `./ledger.ts`, `./types.ts` (type-only) |
+| `src/worktree.ts` | 313 | The git seam, worktree create/change/finalize, isolation roots, `guardToolCall` | node:path; `./types.ts` (type-only) |
+| `src/worktree-lifecycle.ts` | 314 | The shared TTL sweeper and the worktree keep/remove decision for a finished job | node:path; `./constants.ts`, `./state.ts`, `./worktree.ts`; `./jobs.ts`, `./types.ts` (type-only) |
+| `src/definitions.ts` | 1221 | Agent definitions: the YAML frontmatter parser, the field parsers, the built-ins, and the registry that resolves a name to a definition | node:path; `./constants.ts`; `./types.ts` (type-only) |
+| `src/plan.ts` | 655 | The job plan: one resolution for a new job and one reconstruction from a finished record | node:path; `./constants.ts`, `./config.ts`; `./jobs.ts`, `./types.ts` (type-only) |
+| `src/spawn.ts` | 567 | The worker spec and argv, the concurrency limits, `fire`, `failJob`, and the re-export of the permission bridge | node:path; `./constants.ts`, `./state.ts`, `./signals.ts`, `./worktree.ts`, and the `./permission.ts` re-export; `./types.ts`, `./jobs.ts`, `./plan.ts` (type-only) |
+| `src/permission.ts` | 97 | The permission bridge: put the worker's question to the human and write the answer back | node:path; `./types.ts` (type-only) |
+| `src/config.ts` | 294 | The configuration readers: one reader per documented setting, over the env record and the host options | node:path; `./constants.ts` |
+| `src/hooks.ts` | 104 | Hook execution: `hookMatches`, `runHookRules`, over the injected `run` | `./types.ts`, `./definitions.ts` (type-only) |
+| `src/roster.ts` | 49 | The roster: `buildRoster`, `listAgentsVisible` | `./constants.ts` |
+| `src/policy.ts` | 189 | Permission modes and the execution policy: `canonicalPermissionMode`, `resolvePermissionMode`, `resolveExecutionPolicy`, `resolveForkMode`, `resolveTeamPolicy` | `./config.ts` |
+| `src/resolve.ts` | 136 | Model, effort, and launch resolution: `resolveModel`, `resolveEffort`, `resolveLaunch` | `./config.ts`, `./tool-filter.ts` |
+| `src/mcp.ts` | 162 | MCP config resolution: `mcpServerConfigs`, `agentFolderTrusted`, `resolveAgentMcpServers` | node:path; `./config.ts`, `./definitions.ts`, `./worktree.ts`; `./types.ts` (type-only) |
+| `src/startup.ts` | 380 | The startup context and agent memory: `claudeMdHierarchy`, `skillFileFor`, `memoryDirFor`, `buildStartupBundle`, `gitStatusSnapshot` | node:path; `./config.ts`, `./definitions.ts`; `./types.ts` (type-only) |
+| `src/foreground.ts` | 68 | The foreground outcome: `hasAgentOutput`, `foregroundOutcome`, what the caller sees when a run holds the turn open | `./constants.ts`, `./output.ts`, `./state.ts`; `./spawn.ts` (type-only) |
+| `src/tools.ts` | 705 | The tool surface: the `subagent_*` tools, their handlers, and the `outputText`/`sendToRecord` readers the entry's panel and commands also use | node:path; `./constants.ts`, `./config.ts`, `./plan.ts`, `./signals.ts`, `./spawn.ts`, `./state.ts`; `./definitions.ts`, `./jobs.ts`, `./ledger.ts`, `./types.ts` (type-only) |
 
 `src/harness.d.ts` (5 lines) is the ambient declaration for
 `@commandcode/harness`; it emits nothing and imports nothing.
 
 ## `src/index.ts`
 
-The entry is the only composition root. Everything above `activate` is a leaf:
-it takes its OS effects as parameters (`fs`, `run`, `now`, `env`, `cwd`) or as
-an explicit deps object, and touches no session state. Its groups:
+The entry is the only composition root: it imports each module above and
+re-exports its public names, then defines the worker string, then `activate`.
+Its groups:
 
-- the header, the node built-ins, and the local imports
-- the re-exported public surface (`Runtime`, `RuntimeOverrides`, `SpoolFs`
-  types, `signalEnvelope`, `jobStates`, `filterTools`, the worktree helpers,
-  `ledgerFactory`, `resolveAppendSystemPrompt`, `AGENT_API_ERROR`,
-  `TEAM_TOOL_NAMES`, …)
-- output scanning: `ScanResult`, `scanOutput`, `reportText`
-- `WORKER_SOURCE`: the detached worker as one template string; it embeds
-  `signalEnvelope.toString()`, `scanOutput.toString()`, and `AGENT_API_ERROR`
-- the runtime adapter: `osSpoolFs`, `OS_RUNTIME`, `osRuntime` — the only code
-  that names real `node:fs`, `node:child_process`, and `process`
-- hook execution: `hookMatches`, `runHookRules`
-- the startup context and agent memory: `claudeMdHierarchy`, `skillFileFor`,
-  `memoryDirFor`, `buildStartupBundle`, `gitStatusSnapshot`
-- the roster: `buildRoster`, `listAgentsVisible`
-- model, effort, and launch resolution: `resolveModel`, `resolveEffort`,
-  `resolveLaunch`
-- the MCP config: `mcpServerConfigs`, `agentFolderTrusted`,
-  `resolveAgentMcpServers`
-- the permission modes, the execution policy, the fork mode, and the team
-  policy
-- the foreground outcome: `hasAgentOutput`, `foregroundOutcome`
-- the task rows: `taskPanelRows`, `moveTaskSelection`, `mentionCandidates`
-- `activate`: the runtime/spool/git bootstrap, the identity and prompt, the
-  owner token, the job store and `createDelivery` wiring, the maintenance and
-  reconcile, the launch (`fire`, `startWorker`, the foreground settle), the
-  dashboard and the `createTools` wiring, the commands, the hooks, and the
-  timers
+- the header: the design note on the seam, the spool layout, the lifecycle, and
+  the ownership token
+- the node built-ins (`node:crypto`, `node:path`) and the local imports
+- the re-exported public surface: one `export … from` per module, so the host,
+  `test/e2e.mjs`, and `test/harness.mjs` import from the entry
+- the scanning contract comment and `WORKER_SOURCE`: the detached worker as one
+  template string; it embeds `signalEnvelope.toString()`,
+  `scanOutput.toString()`, and `AGENT_API_ERROR`
+- `activate` (the default export): the runtime/spool/git bootstrap, the flags
+  and options, the identity and prompt, the owner token, the job store and
+  `createDelivery` wiring, the worktree lifecycle, the permission handshake, the
+  startup bundle, the maintenance and reconcile, the launch (`fire`,
+  `startWorker`, the foreground settle), the dashboard and the `createTools`
+  wiring, the commands, the hooks, and the timers
 
 ## Seam rules
 
@@ -95,15 +92,18 @@ an explicit deps object, and touches no session state. Its groups:
 2. **No module imports `./index.ts`.** The entry depends on leaves, never the
    reverse. `scripts/check-imports.mjs` fails the gate if this is violated.
 3. **Imports point downward only, without runtime cycles.** The graph is a DAG:
-   `index → every leaf`; `delivery → {constants, state}`;
+   `index → every module below`; `delivery → {constants, state}`;
    `worktree-lifecycle → {constants, state, worktree}`;
-   `spawn → {constants, state, signals, worktree, permission}`;
-   `tools → {constants, config, definitions, plan, signals, spawn, state,
-   worktree}`; `plan → constants`; `definitions → constants`;
-   `config → constants`; `tool-filter → constants`; `signals → state`; the
-   rest are leaves. `types.ts` is a type-only leaf: import it with
-   `import type`. A new shared symbol goes in the lowest module that needs it,
-   not in the entry.
+   `spawn → {constants, state, signals, worktree}`;
+   `tools → {constants, config, plan, signals, spawn, state}`;
+   `plan → {constants, config}`; `definitions → constants`;
+   `config → constants`; `tool-filter → constants`; `signals → state`;
+   `panel → {constants, state}`; `foreground → {constants, output, state}`;
+   `policy → config`; `resolve → {config, tool-filter}`;
+   `mcp → {config, definitions, worktree}`; `startup → {config, definitions}`;
+   `roster → constants`; the rest are leaves. `types.ts` is a type-only leaf:
+   import it with `import type`. A new shared symbol goes in the lowest module
+   that needs it, not in the entry.
 4. **Every file is a module, never a script.** A file with no top-level
    `import` or `export` is a script: its declarations land in the global scope
    and every other file can use them without importing. That silently hides
@@ -121,5 +121,9 @@ an explicit deps object, and touches no session state. Its groups:
    `import.meta.url`, the template literal, the `require(...)` calls inside it,
    `process.pid`, or `node -e`.
 7. **Side effects arrive as arguments.** A leaf takes `fs`/`run`/`now`/`env`
-   or a deps object. Only the entry (via the runtime adapter) touches the real
-   OS.
+   or a deps object. Only `src/runtime.ts` imports `node:fs` or
+   `node:child_process`, and it is the only module with real `process` access;
+   the one exception in the entry is a bare `process.pid` in the permission
+   context, and every other `process` name there is inside `WORKER_SOURCE`.
+   `src/constants.ts` still imports `node:os`, `node:path`, and `node:url`, and
+   the other leaves import `node:path` alone, for pure path arithmetic.
