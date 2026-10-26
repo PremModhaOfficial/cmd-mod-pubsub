@@ -45,19 +45,7 @@
 // "Internals" in the README.
 
 import type {ModApi} from '@commandcode/harness';
-import {spawn, spawnSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
-import {
-	appendFileSync,
-	mkdirSync,
-	readdirSync,
-	readFileSync,
-	renameSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from 'node:fs';
-import {homedir} from 'node:os';
 import {dirname, isAbsolute, join, resolve} from 'node:path';
 import {
 	ADD_DIRS_OPTION,
@@ -90,8 +78,6 @@ import {
 	WORKER_SPEC_ENV,
 } from './constants.ts';
 import type {
-	ChildHandle,
-	CommandResult,
 	JobPatch,
 	Runtime,
 	RuntimeOverrides,
@@ -145,6 +131,8 @@ import {answerPendingPermission as answerPermission, failJob, fire} from './spaw
 import type {PermissionContext, SpawnContext, WorkerSpec} from './spawn.ts';
 import {mentionCandidates, moveTaskSelection, taskPanelRows, tasksHintVisible} from './panel.ts';
 import {canonicalPermissionMode, resolveExecutionPolicy, resolveForkMode, resolvePermissionMode, resolveTeamPolicy} from './policy.ts';
+import {osRuntime} from './runtime.ts';
+import {runHookRules} from './hooks.ts';
 import type {CanonicalPermissionMode} from './policy.ts';
 import {foregroundOutcome} from './foreground.ts';
 import {reportText, scanOutput} from './output.ts';
@@ -178,6 +166,8 @@ export {foregroundOutcome, hasAgentOutput} from './foreground.ts';
 export type {ForegroundJob} from './foreground.ts';
 export {reportText, scanOutput} from './output.ts';
 export type {ScanResult} from './output.ts';
+export {hookMatches, runHookRules} from './hooks.ts';
+export type {HookDetail, HookOutcome} from './hooks.ts';
 
 export type {
 	ChildHandle,
@@ -1413,197 +1403,7 @@ process.on('uncaughtException', err => {
 });
 `;
 
-function osSpoolFs(): SpoolFs {
-	return {
-		mkdir: dir => {
-			mkdirSync(dir, {recursive: true});
-		},
-		readdir: dir => readdirSync(dir),
-		readFile: file => readFileSync(file, 'utf8'),
-		writeFile: (file, data) => writeFileSync(file, data),
-		appendFile: (file, data) => appendFileSync(file, data),
-		rename: (from, to) => renameSync(from, to),
-		remove: file => {
-			rmSync(file, {force: true, recursive: true});
-		},
-		stat: file => {
-			const stats = statSync(file);
-			return {size: stats.size, mtimeMs: stats.mtimeMs};
-		},
-		exists: file => {
-			try {
-				return statSync(file).isDirectory();
-			} catch {
-				return false;
-			}
-		},
-	};
-}
 
-// The production adapter. Only this object is allowed to name node:fs,
-// node:child_process or process.
-const OS_RUNTIME: Runtime = {
-	now: () => Date.now(),
-	spawn: (command, args, options) => spawn(command, args, options as never) as unknown as ChildHandle,
-	kill: (pid, signal) => {
-		process.kill(pid, signal as never);
-	},
-	alive: pid => {
-		if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return false;
-		try {
-			process.kill(pid, 0);
-			return true;
-		} catch (error) {
-			return (error as {code?: string}).code === 'EPERM';
-		}
-	},
-	// The only wait in the mod, used by subagent_output's opt-in blocking read.
-	sleep: ms => new Promise<void>(resolve => setTimeout(resolve, ms)),
-	// The fallback for a host without `cmd.clock.after`, and the seam the tests drive.
-	later: (ms, fn) => {
-		const timer = setTimeout(fn, ms);
-		if (typeof timer === 'object' && timer !== null && 'unref' in timer && typeof timer.unref === 'function') timer.unref();
-	},
-	pid: process.pid,
-	execPath: process.execPath,
-	env: process.env,
-	cwd: process.cwd(),
-	home: homedir(),
-	interactive: process.stdin.isTTY === true,
-	fs: osSpoolFs(),
-	// One bounded command. Everything it returns is plain data, so a failed git (not a
-	// repository, no ref) is a value, never a throw here.
-	run: (command, args, options) => {
-		const result = spawnSync(command, args, {
-			cwd: options.cwd,
-			encoding: 'utf8',
-			timeout: options.timeoutMs ?? 2000,
-			maxBuffer: 64 * 1024,
-			...(options.env !== undefined ? {env: {...process.env, ...options.env}} : {}),
-		});
-		return {
-			ok: result.status === 0,
-			code: typeof result.status === 'number' ? result.status : 1,
-			stdout: String(result.stdout ?? ''),
-			stderr: String(result.stderr ?? result.error?.message ?? ''),
-		};
-	},
-};
-
-// The test adapter is the same interface with functions swapped out.
-function osRuntime(overrides: RuntimeOverrides = {}): Runtime {
-	return {
-		...OS_RUNTIME,
-		...overrides,
-		fs: {...OS_RUNTIME.fs, ...overrides.fs},
-	};
-}
-
-// ---------------------------------------------------------------------------
-// Hook execution
-//
-// A hook is a matcher and a command, run through the injected `run` with the
-// event, agent, tool, and payload in its environment. The rules are parsed with
-// the definition (`./definitions.ts`); this section only decides what a run means.
-// ---------------------------------------------------------------------------
-
-// A matcher is `*`, an exact tool name, a pipe list, a `/regex/`, or a glob such
-// as `mcp__server__*`. Tool names are case-insensitive, like the host's.
-export function hookMatches(matcher: string | undefined, toolName: string): boolean {
-	const pattern = (matcher ?? '').trim();
-	if (pattern.length === 0 || pattern === '*') return true;
-	if (pattern.length > 2 && pattern.startsWith('/') && pattern.endsWith('/')) {
-		try {
-			return new RegExp(pattern.slice(1, -1), 'i').test(toolName);
-		} catch {
-			return false;
-		}
-	}
-	const glob = (value: string): boolean => {
-		const escaped = value.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*');
-		return new RegExp(`^${escaped}$`, 'i').test(toolName);
-	};
-	return pattern.split('|').some(part => glob(part.trim()));
-}
-
-export interface HookDetail {
-	readonly event: 'PreToolUse' | 'PostToolUse' | 'SubagentStart' | 'SubagentStop';
-	readonly cwd: string;
-	readonly agent?: string;
-	readonly toolName?: string;
-	readonly input?: unknown;
-	readonly result?: unknown;
-}
-
-export interface HookOutcome {
-	/** A PreToolUse hook requested a block; the text becomes the tool result. */
-	block?: string;
-	/** A PostToolUse hook's message for the model. */
-	additionalContext?: string;
-	/** A SubagentStop hook requested another turn. */
-	continue?: boolean;
-	reason?: string;
-	/** How many commands actually ran. */
-	ran: number;
-}
-
-const HOOK_TIMEOUT_MS = 10_000;
-
-// The command-hook contract: exit 0 allows, exit 2 blocks (PreToolUse), feeds the
-// model (PostToolUse), or continues the run (SubagentStop), and any other exit is a
-// non-blocking failure. Every rule gets the event, agent, tool and payload in its
-// environment, so one script can serve all events.
-export function runHookRules(
-	run: Runtime['run'],
-	rules: readonly AgentHookRule[] | undefined,
-	detail: HookDetail,
-): HookOutcome {
-	const outcome: HookOutcome = {ran: 0};
-	if (run === undefined || rules === undefined || rules.length === 0) return outcome;
-	const contexts: string[] = [];
-	for (const rule of rules) {
-		if ((detail.event === 'PreToolUse' || detail.event === 'PostToolUse') && !hookMatches(rule.matcher, detail.toolName ?? '')) {
-			continue;
-		}
-		const env: Record<string, string> = {
-			BETTER_SUBAGENTS_HOOK_EVENT: detail.event,
-			BETTER_SUBAGENTS_HOOK_AGENT: detail.agent ?? '',
-			BETTER_SUBAGENTS_HOOK_TOOL_NAME: detail.toolName ?? '',
-			BETTER_SUBAGENTS_HOOK_TOOL_INPUT: JSON.stringify(detail.input ?? {}),
-			BETTER_SUBAGENTS_HOOK_RESULT: JSON.stringify(detail.result ?? null),
-			BETTER_SUBAGENTS_HOOK_CWD: detail.cwd,
-		};
-		let result: CommandResult;
-		try {
-			result = run('/bin/sh', ['-c', rule.command], {
-				cwd: detail.cwd,
-				timeoutMs: rule.timeoutMs ?? HOOK_TIMEOUT_MS,
-				env,
-			});
-		} catch {
-			continue;
-		}
-		outcome.ran += 1;
-		const code = typeof result.code === 'number' ? result.code : result.ok ? 0 : 1;
-		if (code !== 2) continue;
-		const message = (result.stderr || result.stdout || '').trim();
-		if (detail.event === 'PreToolUse') {
-			outcome.block = message.length > 0 ? message : 'Blocked by a PreToolUse hook.';
-			return outcome;
-		}
-		if (detail.event === 'PostToolUse') {
-			if (message.length > 0) contexts.push(message);
-			continue;
-		}
-		if (detail.event === 'SubagentStop') {
-			outcome.continue = true;
-			outcome.reason = message.length > 0 ? message : 'SubagentStop hook requested another turn.';
-			return outcome;
-		}
-	}
-	if (contexts.length > 0) outcome.additionalContext = contexts.join('\n\n');
-	return outcome;
-}
 
 // ---------------------------------------------------------------------------
 // Startup context and agent memory
