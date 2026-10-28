@@ -320,8 +320,10 @@ try {
 	ok(`timeout job killed and reported: jobs/${slowId}.json (${slowRecord.failureReason})`);
 
 	// 3b. a rejected model is reported, not a hang --------------------------
-	// ACP applies the model with session/set_config_option. A rejection must be
-	// logged and must not leave the job queued forever.
+	// ACP applies the model with session/set_config_option. A model outside the
+	// session's catalog is either refused by the request (logged) or skipped in
+	// favour of the inherited model (also logged). Either way the rejection must be
+	// visible and must not leave the job queued forever.
 	const apiFail = await toolOf(api, 'subagent_spawn').run({
 		input: {description: 'api failure', prompt: 'hi', model: 'definitely-not-a-model-xyz'},
 	});
@@ -335,7 +337,7 @@ try {
 	assert.match(
 		readFileSync(join(dir, 'logs', `${failId}.log`), 'utf8'),
 		/model not set|unknown model|not in the allowed catalog/i,
-		'the model rejection or documented fallback is in the log',
+		'the model rejection is in the log',
 	);
 	ok(`bad model reported and the job finished: jobs/${failId}.json (${failRecord.state})`);
 
